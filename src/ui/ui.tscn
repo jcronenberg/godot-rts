@@ -1,0 +1,14 @@
+[gd_scene format=3 uid="uid://5y8dvde6bmo"]
+
+[ext_resource type="Script" uid="uid://clqlkevaapqoh" path="res://src/ui/ui.gd" id="1_sp1ie"]
+
+[node name="UI" type="Control" unique_id=593541499]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_sp1ie")
+
+[connection signal="gui_input" from="." to="." method="_on_gui_input"]

@@ -1,0 +1,14 @@
+[package]
+name = "rts-lib"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+godot = "0.4.5"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "delaunay"
+harness = false

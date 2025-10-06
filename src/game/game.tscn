@@ -1,0 +1,22 @@
+[gd_scene format=3 uid="uid://bbljee0iyb346"]
+
+[ext_resource type="PackedScene" uid="uid://5y8dvde6bmo" path="res://src/ui/ui.tscn" id="1_qnjlk"]
+[ext_resource type="Script" uid="uid://brdrtvcbui3eq" path="res://src/game/polygon_2d.gd" id="2_s6lek"]
+
+[sub_resource type="NavigationPolygon" id="NavigationPolygon_qnjlk"]
+
+[node name="Game" type="Node2D" unique_id=795035528]
+
+[node name="CanvasLayer" type="CanvasLayer" parent="." unique_id=139132707]
+
+[node name="UI" parent="CanvasLayer" unique_id=501371815 instance=ExtResource("1_qnjlk")]
+
+[node name="NavigationRegion2D" type="NavigationRegion2D" parent="." unique_id=856920280]
+visible = false
+navigation_polygon = SubResource("NavigationPolygon_qnjlk")
+
+[node name="EdgeDrawPolygon2D" type="Polygon2D" parent="." unique_id=305091802]
+color = Color(0.24660903, 0.4683491, 1, 0.6117647)
+script = ExtResource("2_s6lek")
+outline_color = Color(0, 0.14117648, 1, 0.89411765)
+metadata/_custom_type_script = "uid://brdrtvcbui3eq"
