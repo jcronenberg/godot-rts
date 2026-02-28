@@ -95,101 +95,30 @@ fn bench_circle_points(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_worst_case(c: &mut Criterion) {
-    let mut group = c.benchmark_group("worst_case");
+fn bench_clustered_points(c: &mut Criterion) {
+    let mut group = c.benchmark_group("clustered_points");
 
-    for size in [20, 50, 100, 200].iter() {
-        let points = generate_circle_points(*size);
+    let centers = [
+        Vector2::new(100.0, 100.0),
+        Vector2::new(300.0, 100.0),
+        Vector2::new(500.0, 300.0),
+        Vector2::new(200.0, 400.0),
+        Vector2::new(400.0, 400.0),
+    ];
 
-        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, _| {
-            b.iter(|| {
-                let _ = CDT::triangulate(black_box(points.clone()));
-            });
-        });
-    }
-
-    group.finish();
-}
-
-fn bench_incremental_addition(c: &mut Criterion) {
-    let mut group = c.benchmark_group("incremental_addition");
-
-    let all_points = generate_random_points(100, 54321);
-
-    group.bench_function("batch_100", |b| {
-        b.iter(|| {
-            let _ = CDT::triangulate(black_box(all_points.clone()));
-        });
-    });
-
-    group.finish();
-}
-
-fn bench_point_distributions(c: &mut Criterion) {
-    let mut group = c.benchmark_group("point_distributions");
-    let size = 100;
-
-    group.bench_function("random", |b| {
-        let points = generate_random_points(size, 11111);
-        b.iter(|| {
-            let _ = CDT::triangulate(black_box(points.clone()));
-        });
-    });
-
-    group.bench_function("grid", |b| {
-        let points = generate_grid_points(10);
-        b.iter(|| {
-            let _ = CDT::triangulate(black_box(points.clone()));
-        });
-    });
-
-    group.bench_function("circle", |b| {
-        let points = generate_circle_points(size);
-        b.iter(|| {
-            let _ = CDT::triangulate(black_box(points.clone()));
-        });
-    });
-
-    group.bench_function("clustered", |b| {
-        let mut points = Vec::new();
-        let centers = [
-            Vector2::new(100.0, 100.0),
-            Vector2::new(300.0, 100.0),
-            Vector2::new(500.0, 300.0),
-            Vector2::new(200.0, 400.0),
-            Vector2::new(400.0, 400.0),
-        ];
-
-        for center in centers.iter() {
-            let cluster = generate_random_points(20, center.x as u64);
-            for p in cluster {
-                points.push(Vector2::new(
+    let points: Vec<Vector2> = centers
+        .iter()
+        .flat_map(|center| {
+            generate_random_points(20, center.x as u64).into_iter().map(|p| {
+                Vector2::new(
                     center.x + (p.x - 500.0) * 0.2,
                     center.y + (p.y - 500.0) * 0.2,
-                ));
-            }
-        }
+                )
+            })
+        })
+        .collect();
 
-        b.iter(|| {
-            let _ = CDT::triangulate(black_box(points.clone()));
-        });
-    });
-
-    group.finish();
-}
-
-fn bench_memory_patterns(c: &mut Criterion) {
-    let mut group = c.benchmark_group("memory_patterns");
-
-    group.bench_function("small_preallocated", |b| {
-        let points = generate_random_points(50, 77777);
-        b.iter(|| {
-            let _ = CDT::triangulate(black_box(points.clone()));
-        });
-    });
-
-    group.bench_function("large_preallocated", |b| {
-        let points = generate_random_points(500, 88888);
+    group.bench_function("5_clusters_20pts", |b| {
         b.iter(|| {
             let _ = CDT::triangulate(black_box(points.clone()));
         });
@@ -226,10 +155,7 @@ criterion_group!(
     bench_random_points,
     bench_grid_points,
     bench_circle_points,
-    bench_worst_case,
-    bench_incremental_addition,
-    bench_point_distributions,
-    bench_memory_patterns,
+    bench_clustered_points,
     bench_constrained,
 );
 
