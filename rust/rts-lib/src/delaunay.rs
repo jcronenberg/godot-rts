@@ -3,22 +3,27 @@ use godot::prelude::*;
 /// Sentinel value meaning "no half-edge" / "no vertex" / "no face".
 pub const NONE: u32 = u32::MAX;
 
+/// 8 bytes — no padding. `constrained` lives in CDT::he_constrained to keep this tight.
 #[derive(Debug, Clone)]
 struct HalfEdge {
-    origin: u32,       // vertex this half-edge starts from
-    twin: u32,         // opposite half-edge (NONE for boundary)
-    constrained: bool, // constraint edge — never flipped, blocks A* traversal
+    origin: u32, // vertex this half-edge starts from
+    twin: u32,   // opposite half-edge (NONE for boundary)
 }
 
 /// Constrained Delaunay Triangulation built on a half-edge (DCEL) data structure.
 ///
 /// Half-edges are stored in groups of 3 — one triple per face/triangle. This lets
 /// us derive `face` and `next` from the index instead of storing them.
+///
+/// `he_constrained` is a parallel array to `half_edges` tracking constraint flags.
+/// Kept separate so HalfEdge stays 8 bytes (vs 12 with an inline bool), improving
+/// cache utilization in the hot walking locator.
 #[derive(Debug, Clone)]
 pub struct CDT {
     points: Vec<Vector2>,
-    half_edges: Vec<HalfEdge>,  // always len % 3 == 0
-    vertex_half_edge: Vec<u32>, // one outgoing half-edge per vertex
+    half_edges: Vec<HalfEdge>,    // always len % 3 == 0
+    he_constrained: Vec<bool>,    // parallel to half_edges
+    vertex_half_edge: Vec<u32>,   // one outgoing half-edge per vertex
 }
 
 /// Face index for a half-edge.
@@ -30,15 +35,13 @@ fn face_of(he: u32) -> u32 {
 /// Next half-edge within the same face (CCW).
 #[inline(always)]
 fn next(he: u32) -> u32 {
-    let base = he / 3 * 3;
-    base + (he - base + 1) % 3
+    if he % 3 == 2 { he - 2 } else { he + 1 }
 }
 
 /// Previous half-edge within the same face (CCW).
 #[inline(always)]
 fn prev(he: u32) -> u32 {
-    let base = he / 3 * 3;
-    base + (he - base + 2) % 3
+    if he % 3 == 0 { he + 2 } else { he - 1 }
 }
 
 /// Orientation test: positive if CCW, negative if CW, zero if collinear.
@@ -56,6 +59,23 @@ fn in_circumcircle(a: Vector2, b: Vector2, c: Vector2, p: Vector2) -> bool {
         (b, c)
     };
 
+    let ax = a.x - p.x;
+    let ay = a.y - p.y;
+    let bx = b.x - p.x;
+    let by = b.y - p.y;
+    let cx = c.x - p.x;
+    let cy = c.y - p.y;
+
+    let det = (ax * ax + ay * ay) * (bx * cy - cx * by) - (bx * bx + by * by) * (ax * cy - cx * ay)
+        + (cx * cx + cy * cy) * (ax * by - bx * ay);
+
+    det > 0.0
+}
+
+/// Returns true if `p` is strictly inside the circumcircle of triangle (a, b, c).
+/// Assumes (a, b, c) are already in CCW order — skips the orientation check.
+#[inline]
+fn in_circumcircle_ccw(a: Vector2, b: Vector2, c: Vector2, p: Vector2) -> bool {
     let ax = a.x - p.x;
     let ay = a.y - p.y;
     let bx = b.x - p.x;
@@ -169,21 +189,10 @@ impl CDT {
     /// Allocate 3 half-edges for a new face. Returns the base index.
     fn alloc_face(&mut self, v0: u32, v1: u32, v2: u32) -> u32 {
         let base = self.half_edges.len() as u32;
-        self.half_edges.push(HalfEdge {
-            origin: v0,
-            twin: NONE,
-            constrained: false,
-        });
-        self.half_edges.push(HalfEdge {
-            origin: v1,
-            twin: NONE,
-            constrained: false,
-        });
-        self.half_edges.push(HalfEdge {
-            origin: v2,
-            twin: NONE,
-            constrained: false,
-        });
+        self.half_edges.push(HalfEdge { origin: v0, twin: NONE });
+        self.half_edges.push(HalfEdge { origin: v1, twin: NONE });
+        self.half_edges.push(HalfEdge { origin: v2, twin: NONE });
+        self.he_constrained.extend_from_slice(&[false, false, false]);
         base
     }
 
@@ -227,6 +236,7 @@ impl CDT {
         let mut cdt = CDT {
             points: Vec::new(), // will be set later
             half_edges: Vec::new(),
+            he_constrained: Vec::new(),
             vertex_half_edge: vec![NONE; n + 3],
         };
 
@@ -322,32 +332,23 @@ impl CDT {
         let twin1 = self.half_edges[he1 as usize].twin;
         let twin2 = self.half_edges[he2 as usize].twin;
 
-        let con0 = self.half_edges[he0 as usize].constrained;
-        let con1 = self.half_edges[he1 as usize].constrained;
-        let con2 = self.half_edges[he2 as usize].constrained;
+        let con0 = self.he_constrained[he0 as usize];
+        let con1 = self.he_constrained[he1 as usize];
+        let con2 = self.he_constrained[he2 as usize];
 
         // Reuse face f for triangle (v0, v1, v)
         // Overwrite in-place
-        self.half_edges[he0 as usize] = HalfEdge {
-            origin: v0,
-            twin: twin0,
-            constrained: con0,
-        };
-        self.half_edges[he1 as usize] = HalfEdge {
-            origin: v1,
-            twin: NONE, // will link below
-            constrained: false,
-        };
-        self.half_edges[he2 as usize] = HalfEdge {
-            origin: v,
-            twin: NONE, // will link below
-            constrained: false,
-        };
+        self.half_edges[he0 as usize] = HalfEdge { origin: v0, twin: twin0 };
+        self.he_constrained[he0 as usize] = con0;
+        self.half_edges[he1 as usize] = HalfEdge { origin: v1, twin: NONE };
+        self.he_constrained[he1 as usize] = false;
+        self.half_edges[he2 as usize] = HalfEdge { origin: v, twin: NONE };
+        self.he_constrained[he2 as usize] = false;
 
         // New face A: (v1, v2, v)
         let a_base = self.alloc_face(v1, v2, v);
         self.half_edges[a_base as usize].twin = twin1;
-        self.half_edges[a_base as usize].constrained = con1;
+        self.he_constrained[a_base as usize] = con1;
         if twin1 != NONE {
             self.half_edges[twin1 as usize].twin = a_base;
         }
@@ -355,7 +356,7 @@ impl CDT {
         // New face B: (v2, v0, v)
         let b_base = self.alloc_face(v2, v0, v);
         self.half_edges[b_base as usize].twin = twin2;
-        self.half_edges[b_base as usize].constrained = con2;
+        self.he_constrained[b_base as usize] = con2;
         if twin2 != NONE {
             self.half_edges[twin2 as usize].twin = b_base;
         }
@@ -400,8 +401,8 @@ impl CDT {
 
         let twin_bc = self.half_edges[he_bc as usize].twin;
         let twin_ca = self.half_edges[he_ca as usize].twin;
-        let con_bc = self.half_edges[he_bc as usize].constrained;
-        let con_ca = self.half_edges[he_ca as usize].constrained;
+        let con_bc = self.he_constrained[he_bc as usize];
+        let con_ca = self.he_constrained[he_ca as usize];
 
         // Face 2: triangle containing twin_edge
         // twin_edge: B->A, next: A->D, prev: D->B
@@ -413,10 +414,10 @@ impl CDT {
 
         let twin_ad = self.half_edges[he_ad as usize].twin;
         let twin_db = self.half_edges[he_db as usize].twin;
-        let con_ad = self.half_edges[he_ad as usize].constrained;
-        let con_db = self.half_edges[he_db as usize].constrained;
+        let con_ad = self.he_constrained[he_ad as usize];
+        let con_db = self.he_constrained[he_db as usize];
 
-        let con_edge = self.half_edges[he_ab as usize].constrained;
+        let con_edge = self.he_constrained[he_ab as usize];
 
         // After splitting edge A-B at V, we get 4 CCW triangles:
         //   T1: (C, A, V) at f1_base — reuse face of he_ab
@@ -428,44 +429,26 @@ impl CDT {
         let f2_base = face_of(he_ba) * 3;
 
         // T1: (C, A, V) — edges: C->A, A->V, V->C
-        self.half_edges[f1_base as usize] = HalfEdge {
-            origin: vertex_c,
-            twin: twin_ca,
-            constrained: con_ca,
-        };
+        self.half_edges[f1_base as usize] = HalfEdge { origin: vertex_c, twin: twin_ca };
+        self.he_constrained[f1_base as usize] = con_ca;
         if twin_ca != NONE {
             self.half_edges[twin_ca as usize].twin = f1_base;
         }
-        self.half_edges[(f1_base + 1) as usize] = HalfEdge {
-            origin: vertex_a,
-            twin: NONE, // A->V internal with T4
-            constrained: con_edge,
-        };
-        self.half_edges[(f1_base + 2) as usize] = HalfEdge {
-            origin: v,
-            twin: NONE, // V->C internal with T2
-            constrained: false,
-        };
+        self.half_edges[(f1_base + 1) as usize] = HalfEdge { origin: vertex_a, twin: NONE };
+        self.he_constrained[(f1_base + 1) as usize] = con_edge;
+        self.half_edges[(f1_base + 2) as usize] = HalfEdge { origin: v, twin: NONE };
+        self.he_constrained[(f1_base + 2) as usize] = false;
 
         // Reuse face of he_ba for T3: (D, B, V)
-        self.half_edges[f2_base as usize] = HalfEdge {
-            origin: vertex_d,
-            twin: twin_db,
-            constrained: con_db,
-        };
+        self.half_edges[f2_base as usize] = HalfEdge { origin: vertex_d, twin: twin_db };
+        self.he_constrained[f2_base as usize] = con_db;
         if twin_db != NONE {
             self.half_edges[twin_db as usize].twin = f2_base;
         }
-        self.half_edges[(f2_base + 1) as usize] = HalfEdge {
-            origin: vertex_b,
-            twin: NONE, // B->V internal with T2
-            constrained: con_edge,
-        };
-        self.half_edges[(f2_base + 2) as usize] = HalfEdge {
-            origin: v,
-            twin: NONE, // V->D internal with T4
-            constrained: false,
-        };
+        self.half_edges[(f2_base + 1) as usize] = HalfEdge { origin: vertex_b, twin: NONE };
+        self.he_constrained[(f2_base + 1) as usize] = con_edge;
+        self.half_edges[(f2_base + 2) as usize] = HalfEdge { origin: v, twin: NONE };
+        self.he_constrained[(f2_base + 2) as usize] = false;
 
         // New face T2: (C, V, B)
         let t2_base = self.alloc_face(vertex_c, v, vertex_b);
@@ -473,7 +456,7 @@ impl CDT {
         // V->B twin with T3's B->V (f2_base+1)
         // B->C twin with original twin_bc
         self.half_edges[(t2_base + 2) as usize].twin = twin_bc;
-        self.half_edges[(t2_base + 2) as usize].constrained = con_bc;
+        self.he_constrained[(t2_base + 2) as usize] = con_bc;
         if twin_bc != NONE {
             self.half_edges[twin_bc as usize].twin = t2_base + 2;
         }
@@ -486,7 +469,7 @@ impl CDT {
         // V->A twin with T1's A->V (f1_base+1)
         // A->D twin with original twin_ad
         self.half_edges[(t4_base + 2) as usize].twin = twin_ad;
-        self.half_edges[(t4_base + 2) as usize].constrained = con_ad;
+        self.he_constrained[(t4_base + 2) as usize] = con_ad;
         if twin_ad != NONE {
             self.half_edges[twin_ad as usize].twin = t4_base + 2;
         }
@@ -529,48 +512,30 @@ impl CDT {
         let twin_ad = self.half_edges[he_ad as usize].twin;
         let twin_db = self.half_edges[he_db as usize].twin;
 
-        let con_bc = self.half_edges[he_bc as usize].constrained;
-        let con_ca = self.half_edges[he_ca as usize].constrained;
-        let con_ad = self.half_edges[he_ad as usize].constrained;
-        let con_db = self.half_edges[he_db as usize].constrained;
+        let con_bc = self.he_constrained[he_bc as usize];
+        let con_ca = self.he_constrained[he_ca as usize];
+        let con_ad = self.he_constrained[he_ad as usize];
+        let con_db = self.he_constrained[he_db as usize];
 
         // Rewrite face of he_ab as (C, A, D) — CCW
         // Edges: C->A, A->D, D->C
         let f1_base = face_of(he_ab) * 3;
-        self.half_edges[f1_base as usize] = HalfEdge {
-            origin: vertex_c,
-            twin: twin_ca,
-            constrained: con_ca,
-        };
-        self.half_edges[(f1_base + 1) as usize] = HalfEdge {
-            origin: vertex_a,
-            twin: twin_ad,
-            constrained: con_ad,
-        };
-        self.half_edges[(f1_base + 2) as usize] = HalfEdge {
-            origin: vertex_d,
-            twin: NONE, // D->C, internal — linked below
-            constrained: false,
-        };
+        self.half_edges[f1_base as usize] = HalfEdge { origin: vertex_c, twin: twin_ca };
+        self.he_constrained[f1_base as usize] = con_ca;
+        self.half_edges[(f1_base + 1) as usize] = HalfEdge { origin: vertex_a, twin: twin_ad };
+        self.he_constrained[(f1_base + 1) as usize] = con_ad;
+        self.half_edges[(f1_base + 2) as usize] = HalfEdge { origin: vertex_d, twin: NONE };
+        self.he_constrained[(f1_base + 2) as usize] = false;
 
         // Rewrite face of he_ba as (D, B, C) — CCW
         // Edges: D->B, B->C, C->D
         let f2_base = face_of(he_ba) * 3;
-        self.half_edges[f2_base as usize] = HalfEdge {
-            origin: vertex_d,
-            twin: twin_db,
-            constrained: con_db,
-        };
-        self.half_edges[(f2_base + 1) as usize] = HalfEdge {
-            origin: vertex_b,
-            twin: twin_bc,
-            constrained: con_bc,
-        };
-        self.half_edges[(f2_base + 2) as usize] = HalfEdge {
-            origin: vertex_c,
-            twin: NONE, // C->D, internal — linked below
-            constrained: false,
-        };
+        self.half_edges[f2_base as usize] = HalfEdge { origin: vertex_d, twin: twin_db };
+        self.he_constrained[f2_base as usize] = con_db;
+        self.half_edges[(f2_base + 1) as usize] = HalfEdge { origin: vertex_b, twin: twin_bc };
+        self.he_constrained[(f2_base + 1) as usize] = con_bc;
+        self.half_edges[(f2_base + 2) as usize] = HalfEdge { origin: vertex_c, twin: NONE };
+        self.he_constrained[(f2_base + 2) as usize] = false;
 
         // Internal twin: D->C (f1_base+2) <-> C->D (f2_base+2)
         self.link_twins(f1_base + 2, f2_base + 2);
@@ -604,7 +569,7 @@ impl CDT {
             return;
         }
 
-        if self.half_edges[he_id as usize].constrained {
+        if self.he_constrained[he_id as usize] {
             return;
         }
 
@@ -619,7 +584,7 @@ impl CDT {
         let pv = self.point(v);
         let pd = self.point(vertex_d);
 
-        if in_circumcircle(pa, pb, pv, pd) {
+        if in_circumcircle_ccw(pa, pb, pv, pd) {
             self.flip_edge(he_id);
 
             // After flip: face1 = (C,A,D), face2 = (D,B,C) where C = v.
@@ -782,10 +747,10 @@ impl CDT {
 
         // If edge already exists, just mark it constrained
         if let Some(he) = self.find_half_edge(v0, v1) {
-            self.half_edges[he as usize].constrained = true;
+            self.he_constrained[he as usize] = true;
             let twin = self.half_edges[he as usize].twin;
             if twin != NONE {
-                self.half_edges[twin as usize].constrained = true;
+                self.he_constrained[twin as usize] = true;
             }
             return;
         }
@@ -966,7 +931,7 @@ impl CDT {
             if twin == NONE {
                 continue;
             }
-            if self.half_edges[he as usize].constrained {
+            if self.he_constrained[he as usize] {
                 godot_error!(
                     "Cannot insert constraint ({}-{}): it intersects existing constraint ({}-{})",
                     v0, v1, a, b
@@ -1021,10 +986,10 @@ impl CDT {
             );
             return;
         };
-        self.half_edges[constraint_he as usize].constrained = true;
+        self.he_constrained[constraint_he as usize] = true;
         let twin = self.half_edges[constraint_he as usize].twin;
         if twin != NONE {
-            self.half_edges[twin as usize].constrained = true;
+            self.he_constrained[twin as usize] = true;
         }
 
         // Re-legalize non-constrained edges near the constraint
@@ -1034,7 +999,7 @@ impl CDT {
             let base = f * 3;
             for j in 0..3u32 {
                 let he = base + j;
-                if self.half_edges[he as usize].constrained {
+                if self.he_constrained[he as usize] {
                     continue;
                 }
                 let twin = self.half_edges[he as usize].twin;
@@ -1087,8 +1052,9 @@ impl CDT {
             }
         }
 
-        // Build new half_edges array
+        // Build new half_edges array (and parallel constrained vec)
         let mut new_half_edges = Vec::with_capacity(new_he_idx as usize);
+        let mut new_he_constrained = Vec::with_capacity(new_he_idx as usize);
         for f in 0..num_faces {
             if !face_alive[f as usize] {
                 continue;
@@ -1101,11 +1067,8 @@ impl CDT {
                 } else {
                     NONE
                 };
-                new_half_edges.push(HalfEdge {
-                    origin: he.origin,
-                    twin: new_twin,
-                    constrained: he.constrained,
-                });
+                new_half_edges.push(HalfEdge { origin: he.origin, twin: new_twin });
+                new_he_constrained.push(self.he_constrained[old_idx]);
             }
         }
 
@@ -1128,6 +1091,7 @@ impl CDT {
         }
 
         self.half_edges = new_half_edges;
+        self.he_constrained = new_he_constrained;
         self.vertex_half_edge = new_vhe;
         self.points.truncate(n as usize);
     }
@@ -1164,7 +1128,7 @@ impl CDT {
         for j in 0..3u32 {
             let he = base + j;
             let twin = self.half_edges[he as usize].twin;
-            if twin != NONE && !self.half_edges[he as usize].constrained {
+            if twin != NONE && !self.he_constrained[he as usize] {
                 neighbors.push(face_of(twin));
             }
         }
@@ -1644,13 +1608,13 @@ mod tests {
         // Verify the constraint edges are marked as constrained
         if let Some(he) = cdt.find_half_edge(0, 4).or(cdt.find_half_edge(4, 0)) {
             assert!(
-                cdt.half_edges[he as usize].constrained,
+                cdt.he_constrained[he as usize],
                 "Edge 0-4 should be constrained"
             );
         }
         if let Some(he) = cdt.find_half_edge(4, 8).or(cdt.find_half_edge(8, 4)) {
             assert!(
-                cdt.half_edges[he as usize].constrained,
+                cdt.he_constrained[he as usize],
                 "Edge 4-8 should be constrained"
             );
         }
