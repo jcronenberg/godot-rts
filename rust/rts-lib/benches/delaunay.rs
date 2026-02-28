@@ -49,7 +49,7 @@ fn generate_circle_points(count: usize) -> Vec<Vector2> {
 fn bench_random_points(c: &mut Criterion) {
     let mut group = c.benchmark_group("random_points");
 
-    for size in [10, 50, 100, 200, 500, 1000].iter() {
+    for size in [100, 200, 500, 1000, 10000].iter() {
         let points = generate_random_points(*size, 12345);
 
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, _| {
@@ -65,7 +65,7 @@ fn bench_random_points(c: &mut Criterion) {
 fn bench_grid_points(c: &mut Criterion) {
     let mut group = c.benchmark_group("grid_points");
 
-    for size in [5, 10, 15, 20, 30].iter() {
+    for size in [10, 15, 20, 30].iter() {
         let points = generate_grid_points(*size);
         let total = size * size;
 
@@ -82,7 +82,7 @@ fn bench_grid_points(c: &mut Criterion) {
 fn bench_circle_points(c: &mut Criterion) {
     let mut group = c.benchmark_group("circle_points");
 
-    for size in [10, 50, 100, 200, 500].iter() {
+    for size in [100, 200, 500].iter() {
         let points = generate_circle_points(*size);
 
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, _| {
@@ -127,6 +127,31 @@ fn bench_clustered_points(c: &mut Criterion) {
     group.finish();
 }
 
+/// Traverse every face's neighbors on a pre-built CDT.
+/// Construction cost is excluded — measures only graph traversal.
+fn bench_graph_traversal(c: &mut Criterion) {
+    let mut group = c.benchmark_group("graph_traversal");
+
+    for &size in &[100usize, 500, 1000, 10000] {
+        let points = generate_random_points(size, 42424);
+        let cdt = CDT::triangulate(points);
+
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
+            b.iter(|| {
+                let mut acc = 0u32;
+                for f in 0..cdt.num_faces() {
+                    for n in cdt.face_neighbors(black_box(f)) {
+                        acc = acc.wrapping_add(n);
+                    }
+                }
+                black_box(acc)
+            });
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_constrained(c: &mut Criterion) {
     let mut group = c.benchmark_group("constrained");
 
@@ -157,6 +182,7 @@ criterion_group!(
     bench_circle_points,
     bench_clustered_points,
     bench_constrained,
+    bench_graph_traversal,
 );
 
 criterion_main!(benches);

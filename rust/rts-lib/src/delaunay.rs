@@ -101,6 +101,49 @@ fn is_point_in_triangle(pt: Vector2, p0: Vector2, p1: Vector2, p2: Vector2) -> b
     !(has_neg && has_pos)
 }
 
+/// Spread a 16-bit integer into 32 bits with a zero between each bit.
+/// Used to compute Morton codes (Z-order curve).
+#[inline]
+fn spread_bits_16(x: u32) -> u32 {
+    let mut x = x & 0x0000_ffff;
+    x = (x | (x << 8)) & 0x00ff_00ff;
+    x = (x | (x << 4)) & 0x0f0f_0f0f;
+    x = (x | (x << 2)) & 0x3333_3333;
+    x = (x | (x << 1)) & 0x5555_5555;
+    x
+}
+
+/// Sort points by Morton code (Z-order curve) for spatial coherence.
+///
+/// Points with adjacent Morton codes are spatially nearby, so inserting in
+/// this order keeps consecutive insertions close together. This reduces the
+/// walking locator from O(n) per point (O(n²) total) to O(1) amortized,
+/// giving O(n log n) overall instead of O(n²) for random inputs.
+fn sort_spatially(mut points: Vec<Vector2>) -> Vec<Vector2> {
+    if points.len() < 2 {
+        return points;
+    }
+
+    let (mut min_x, mut max_x, mut min_y, mut max_y) =
+        (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY);
+    for p in &points {
+        min_x = min_x.min(p.x);
+        max_x = max_x.max(p.x);
+        min_y = min_y.min(p.y);
+        max_y = max_y.max(p.y);
+    }
+    let range_x = (max_x - min_x).max(f32::EPSILON);
+    let range_y = (max_y - min_y).max(f32::EPSILON);
+
+    points.sort_unstable_by_key(|p| {
+        let nx = ((p.x - min_x) / range_x * 65535.0) as u32;
+        let ny = ((p.y - min_y) / range_y * 65535.0) as u32;
+        spread_bits_16(nx) | (spread_bits_16(ny) << 1)
+    });
+
+    points
+}
+
 /// Returns true if open segments (a,b) and (c,d) properly intersect
 /// (endpoints touching does not count).
 fn segments_intersect_proper(a: Vector2, b: Vector2, c: Vector2, d: Vector2) -> bool {
@@ -601,8 +644,11 @@ impl CDT {
 
     /// Build a CDT from points and immediately remove the super-triangle.
     /// Use `from_points` instead if you need to insert constraints before removal.
+    ///
+    /// Points are sorted by Morton code (Z-order) before insertion so the walking
+    /// locator stays O(1) amortized — giving O(n log n) total instead of O(n²).
     pub fn triangulate(points: Vec<Vector2>) -> CDT {
-        let mut cdt = CDT::from_points(points);
+        let mut cdt = CDT::from_points(sort_spatially(points));
         cdt.remove_super_triangle();
         cdt
     }
@@ -1386,15 +1432,16 @@ mod tests {
         );
         assert_eq!(d.num_vertices(), 5);
 
-        // Center point (index 4) should appear in all 4 triangles
-        let mut count = 0;
+        // Center point should appear in all 4 triangles.
+        // Spatial sort may reorder indices, so find it by frequency instead.
+        let mut vertex_freq = vec![0u32; d.num_vertices() as usize];
         for f in 0..d.num_triangles() {
-            let verts = d.face_vertices(f);
-            if verts.contains(&4) {
-                count += 1;
+            for v in d.face_vertices(f) {
+                vertex_freq[v as usize] += 1;
             }
         }
-        assert_eq!(count, 4, "Center point should be in 4 triangles");
+        let max_freq = vertex_freq.iter().copied().max().unwrap_or(0);
+        assert_eq!(max_freq, 4, "Center point should be in 4 triangles");
     }
 
     #[test]
