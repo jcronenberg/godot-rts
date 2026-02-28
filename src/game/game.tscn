@@ -2,7 +2,6 @@
 
 [ext_resource type="PackedScene" uid="uid://5y8dvde6bmo" path="res://src/ui/ui.tscn" id="1_qnjlk"]
 [ext_resource type="Script" uid="uid://brdrtvcbui3eq" path="res://src/game/polygon_2d.gd" id="2_s6lek"]
-[ext_resource type="Script" uid="uid://c6bshac87n8m2" path="res://src/delaunay_editor_node.gd" id="3_kgj8g"]
 
 [sub_resource type="NavigationPolygon" id="NavigationPolygon_qnjlk"]
 
@@ -16,14 +15,7 @@
 navigation_polygon = SubResource("NavigationPolygon_qnjlk")
 
 [node name="EdgeDrawPolygon2D" type="Polygon2D" parent="." unique_id=305091802]
-visible = false
 color = Color(0.24660903, 0.4683491, 1, 0.6117647)
 script = ExtResource("2_s6lek")
 outline_color = Color(0, 0.14117648, 1, 0.89411765)
 metadata/_custom_type_script = "uid://brdrtvcbui3eq"
-
-[node name="DelaunayEditorNode" type="Node2D" parent="." unique_id=1001490887]
-script = ExtResource("3_kgj8g")
-points = PackedVector2Array(9.499084, 8.256683, 6.54541, 1071.9999, 1912.9089, 1074.7272, 1908.3635, 6.5453186, 167.27515, 325.8579, 196.64478, 105.92761, 1688.3635, 109.27261, 1673.8728, 973.6688, 186.54535, 974.7272, 160.445, 452.89838, 272.22015, 258.79282, 283.79034, 848.04895, 439.1623, 848.8755, 1469.7407, 890.19775, 1481.393, 719.9566, 1513.8181, 285.6362, 385.15643, 252.09247, 598.3636, 258.3635, 583.81805, 665.6362, 1268.7273, 702.4591, 411.88953, 395.15646, 1296.9105, 360.21866, 713.8655, 342.83286, 700.2052, 598.0315, 1179.5564, 630.9403, 1193.8376, 422.93167, 815.69653, 407.40866, 806.5757, 547.8373, 1103.0035, 568.32764, 1107.1016, 482.951, 887.85425, 474.07184)
-constraints = PackedInt32Array(4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 18, 19, 12, 20, 16, 17, 17, 15, 19, 21, 21, 22, 22, 23, 23, 24, 24, 25, 25, 26, 26, 27, 27, 28, 28, 29, 29, 30)
-metadata/_custom_type_script = "uid://c6bshac87n8m2"
