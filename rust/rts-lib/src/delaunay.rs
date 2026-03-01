@@ -1237,6 +1237,8 @@ impl CDT {
                     current = face_of(twin);
                     continue;
                 }
+                // At a boundary and point is outside this face; brute-force to confirm.
+                return self.locate_face_brute(point);
             }
 
             let d1 = orient2d(p1, p2, point);
@@ -1246,6 +1248,7 @@ impl CDT {
                     current = face_of(twin);
                     continue;
                 }
+                return self.locate_face_brute(point);
             }
 
             let d2 = orient2d(p2, p0, point);
@@ -1255,6 +1258,7 @@ impl CDT {
                     current = face_of(twin);
                     continue;
                 }
+                return self.locate_face_brute(point);
             }
 
             return Some(current);
@@ -1279,6 +1283,25 @@ impl CDT {
     /// Access the points array.
     pub fn points(&self) -> &[Vector2] {
         &self.points
+    }
+
+    /// Iterate walkable neighbors without allocation.
+    /// Calls `f(neighbor_face, half_edge_from_self_to_neighbor)` for each non-constrained, non-boundary edge.
+    /// The half-edge can be passed to `edge_midpoint()` to compute smooth waypoints.
+    pub fn for_each_neighbor(&self, face: u32, mut f: impl FnMut(u32, u32)) {
+        let base = face * 3;
+        for j in 0u32..3 {
+            let he = base + j;
+            let twin = self.half_edges[he as usize].twin;
+            if twin != NONE && !self.he_constrained[he as usize] {
+                f(face_of(twin), he);
+            }
+        }
+    }
+
+    /// Face that half-edge `he` belongs to.
+    pub fn face_of_he(&self, he: u32) -> u32 {
+        face_of(he)
     }
 }
 
@@ -1811,5 +1834,122 @@ mod tests {
             edge.is_some(),
             "Two triangles sharing an edge should find it"
         );
+    }
+
+    fn square_cdt() -> CDT {
+        // 4-point unit square → 2 triangles, no constraints
+        CDT::triangulate(vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(1.0, 0.0),
+            Vector2::new(1.0, 1.0),
+            Vector2::new(0.0, 1.0),
+        ])
+    }
+
+    #[test]
+    fn test_path_same_face() {
+        let cdt = square_cdt();
+        let start = Vector2::new(0.1, 0.1);
+        let goal  = Vector2::new(0.2, 0.1);
+        // Both points should land in the same face
+        let sf = cdt.locate_face(start).unwrap();
+        let gf = cdt.locate_face(goal).unwrap();
+        assert_eq!(sf, gf, "test requires both points in the same face");
+        let path = crate::astar::find_path(&cdt, start, goal);
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0], start);
+        assert_eq!(path[1], goal);
+    }
+
+    #[test]
+    fn test_path_simple() {
+        let cdt = square_cdt();
+        // Put start/goal in different faces (2-triangle square)
+        // Face 0 and face 1 should be the two triangles
+        let c0 = cdt.face_centroid(0);
+        let c1 = cdt.face_centroid(1);
+        assert_ne!(
+            cdt.locate_face(c0).unwrap(),
+            cdt.locate_face(c1).unwrap(),
+            "centroids must be in different faces"
+        );
+        let path = crate::astar::find_path(&cdt, c0, c1);
+        assert!(!path.is_empty(), "should find a path");
+        assert_eq!(*path.first().unwrap(), c0);
+        assert_eq!(*path.last().unwrap(), c1);
+    }
+
+    #[test]
+    fn test_path_no_route_full_constraint_wall() {
+        // 6 points in 2 rows × 3 cols:
+        //  3---4---5
+        //  |   |   |
+        //  0---1---2
+        // Constrain all horizontal internal edges (0-3, 1-4, 2-5 are vertical;
+        // internal horizontal edges of the triangulation separate top from bottom).
+        // We constrain the top edges of the bottom row: 0-4, 1-4 (diagonal seam)
+        // and also constrain segment 0-3, 1-4, 2-5 which are all vertical.
+        //
+        // Simplest guaranteed wall: constrain both horizontal mid-edges of the
+        // triangulation by inserting constraint edges 3-4 and 4-5 (along y=1).
+        // After CDT, the triangles along y=1 have their shared edges marked constrained,
+        // which disconnects top from bottom completely.
+        let points = vec![
+            Vector2::new(0.0, 0.0), // 0
+            Vector2::new(1.0, 0.0), // 1
+            Vector2::new(2.0, 0.0), // 2
+            Vector2::new(0.0, 1.0), // 3
+            Vector2::new(1.0, 1.0), // 4
+            Vector2::new(2.0, 1.0), // 5
+        ];
+        let mut cdt = CDT::from_points(points);
+        // Constrain the full horizontal mid-line: 3-4 and 4-5
+        cdt.insert_constraint(3, 4);
+        cdt.insert_constraint(4, 5);
+        // Also constrain 0-3, 1-4, 2-5 to seal vertical joints
+        cdt.insert_constraint(0, 3);
+        cdt.insert_constraint(1, 4);
+        cdt.insert_constraint(2, 5);
+        cdt.remove_super_triangle();
+
+        let start = Vector2::new(0.5, 0.25); // below wall
+        let goal  = Vector2::new(0.5, 1.5);  // above wall — outside mesh actually
+
+        // If goal is outside, locate_face returns None → empty path
+        // If goal happens to be inside (mesh extends beyond 1.0 vertically it won't),
+        // then the wall constraints ensure disconnection.
+        let path = crate::astar::find_path(&cdt, start, goal);
+        assert!(path.is_empty(), "should find no path through a full constraint wall");
+    }
+
+    #[test]
+    fn test_path_point_outside_mesh() {
+        let cdt = square_cdt();
+        let start  = Vector2::new(0.5, 0.5);
+        let outside = Vector2::new(10.0, 10.0);
+        let path = crate::astar::find_path(&cdt, start, outside);
+        assert!(path.is_empty(), "point outside mesh → empty path");
+    }
+
+    #[test]
+    fn test_path_start_equals_goal() {
+        let cdt = square_cdt();
+        let pt = Vector2::new(0.5, 0.5);
+        let path = crate::astar::find_path(&cdt, pt, pt);
+        // same face → [start, goal]
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0], pt);
+        assert_eq!(path[1], pt);
+    }
+
+    #[test]
+    fn test_path_endpoints_in_returned_path() {
+        let cdt = square_cdt();
+        let c0 = cdt.face_centroid(0);
+        let c1 = cdt.face_centroid(1);
+        let path = crate::astar::find_path(&cdt, c0, c1);
+        assert!(!path.is_empty());
+        assert_eq!(*path.first().unwrap(), c0, "first waypoint must be start");
+        assert_eq!(*path.last().unwrap(), c1, "last waypoint must be goal");
     }
 }

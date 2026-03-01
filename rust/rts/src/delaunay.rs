@@ -94,4 +94,18 @@ impl DelaunayTriangulator {
             None => 0,
         }
     }
+
+    #[func]
+    pub fn find_path(&self, start: Vector2, goal: Vector2) -> PackedVector2Array {
+        let Some(cdt) = &self.cdt else {
+            godot_warn!("No triangulation result; call triangulate() first");
+            return PackedVector2Array::new();
+        };
+        let path = rts_lib::astar::find_path(cdt, start, goal);
+        let mut result = PackedVector2Array::new();
+        for pt in &path {
+            result.push(*pt);
+        }
+        result
+    }
 }

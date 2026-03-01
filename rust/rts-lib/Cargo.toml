@@ -12,3 +12,7 @@ criterion = "0.5"
 [[bench]]
 name = "delaunay"
 harness = false
+
+[[bench]]
+name = "astar"
+harness = false
