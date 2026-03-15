@@ -1,8 +1,8 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use godot::prelude::Vector2;
 use crate::delaunay::{CDT, NONE};
+use godot::prelude::Vector2;
 
 // ── scratch buffer ────────────────────────────────────────────────────────────
 
@@ -16,29 +16,31 @@ use crate::delaunay::{CDT, NONE};
 /// allocation: "invalidation" is a single counter increment rather than a
 /// memset of the g-score and came-from arrays.
 pub struct AStarScratch {
-    g_score:      Vec<f32>,
+    g_score: Vec<f32>,
     came_from_he: Vec<u32>,
     /// `generation[f] == current_gen` iff face `f` was touched this search.
-    generation:   Vec<u32>,
-    current_gen:  u32,
-    heap:         BinaryHeap<Reverse<(u32, u32, u32)>>,
+    generation: Vec<u32>,
+    current_gen: u32,
+    heap: BinaryHeap<Reverse<(u32, u32, u32)>>,
     /// Centroid cache — rebuilt only when `num_faces` changes.
-    centroids:    Vec<Vector2>,
+    centroids: Vec<Vector2>,
 }
 
 impl Default for AStarScratch {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AStarScratch {
     pub fn new() -> Self {
         Self {
-            g_score:      Vec::new(),
+            g_score: Vec::new(),
             came_from_he: Vec::new(),
-            generation:   Vec::new(),
-            current_gen:  1,
-            heap:         BinaryHeap::new(),
-            centroids:    Vec::new(),
+            generation: Vec::new(),
+            current_gen: 1,
+            heap: BinaryHeap::new(),
+            centroids: Vec::new(),
         }
     }
 
@@ -80,13 +82,19 @@ impl AStarScratch {
 /// Returns `[start, edge_midpoint, …, goal]`.
 /// Empty vec if either point is outside the mesh or no path exists.
 pub fn find_path_with_scratch(
-    cdt:     &CDT,
-    start:   Vector2,
-    goal:    Vector2,
+    cdt: &CDT,
+    start: Vector2,
+    goal: Vector2,
     scratch: &mut AStarScratch,
 ) -> Vec<Vector2> {
-    let start_face = match cdt.locate_face(start) { Some(f) => f, None => return Vec::new() };
-    let goal_face  = match cdt.locate_face(goal)  { Some(f) => f, None => return Vec::new() };
+    let start_face = match cdt.locate_face(start) {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
+    let goal_face = match cdt.locate_face(goal) {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
 
     if start_face == goal_face {
         return vec![start, goal];
@@ -96,12 +104,14 @@ pub fn find_path_with_scratch(
     let epoch = scratch.current_gen;
 
     // Seed the start face.
-    scratch.generation  [start_face as usize] = epoch;
-    scratch.g_score     [start_face as usize] = 0.0;
+    scratch.generation[start_face as usize] = epoch;
+    scratch.g_score[start_face as usize] = 0.0;
     scratch.came_from_he[start_face as usize] = NONE;
 
-    let h0 = dist(scratch.centroids[start_face as usize],
-                  scratch.centroids[goal_face  as usize]);
+    let h0 = dist(
+        scratch.centroids[start_face as usize],
+        scratch.centroids[goal_face as usize],
+    );
     scratch.heap.push(Reverse((h0.to_bits(), 0u32, start_face)));
 
     while let Some(Reverse((_, g_bits, current))) = scratch.heap.pop() {
@@ -111,27 +121,34 @@ pub fn find_path_with_scratch(
         } else {
             f32::INFINITY
         };
-        if g_bits != g_cur.to_bits() { continue; }
-        if current == goal_face { break; }
+        if g_bits != g_cur.to_bits() {
+            continue;
+        }
+        if current == goal_face {
+            break;
+        }
 
         let c_cur = scratch.centroids[current as usize];
 
         cdt.for_each_neighbor(current, |nb, he| {
             // All fields accessed here are distinct — Rust allows disjoint
             // field borrows through &mut even within a closure.
-            let c_nb = scratch.centroids[nb as usize];           // Copy → borrow ends
-            let tg   = g_cur + dist(c_cur, c_nb);
-            let g_nb = if scratch.generation[nb as usize] == epoch { // Copy → borrow ends
+            let c_nb = scratch.centroids[nb as usize]; // Copy → borrow ends
+            let tg = g_cur + dist(c_cur, c_nb);
+            let g_nb = if scratch.generation[nb as usize] == epoch {
+                // Copy → borrow ends
                 scratch.g_score[nb as usize]
             } else {
                 f32::INFINITY
             };
             if tg < g_nb {
-                scratch.generation  [nb as usize] = epoch;
-                scratch.g_score     [nb as usize] = tg;
+                scratch.generation[nb as usize] = epoch;
+                scratch.g_score[nb as usize] = tg;
                 scratch.came_from_he[nb as usize] = he;
                 let f_val = tg + dist(c_nb, goal);
-                scratch.heap.push(Reverse((f_val.to_bits(), tg.to_bits(), nb)));
+                scratch
+                    .heap
+                    .push(Reverse((f_val.to_bits(), tg.to_bits(), nb)));
             }
         });
     }
@@ -143,7 +160,7 @@ pub fn find_path_with_scratch(
 
     // Reconstruct: walk came_from_he goal→start, collect edge midpoints.
     let mut mids = Vec::new();
-    let mut cur  = goal_face;
+    let mut cur = goal_face;
     while cur != start_face {
         let he = scratch.came_from_he[cur as usize];
         mids.push(cdt.edge_midpoint(he));
@@ -165,8 +182,14 @@ pub fn find_path_with_scratch(
 /// Simple entry point for one-off queries.  For repeated queries on the same
 /// CDT prefer `find_path_with_scratch` to avoid per-call allocation.
 pub fn find_path(cdt: &CDT, start: Vector2, goal: Vector2) -> Vec<Vector2> {
-    let start_face = match cdt.locate_face(start) { Some(f) => f, None => return Vec::new() };
-    let goal_face  = match cdt.locate_face(goal)  { Some(f) => f, None => return Vec::new() };
+    let start_face = match cdt.locate_face(start) {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
+    let goal_face = match cdt.locate_face(goal) {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
 
     if start_face == goal_face {
         return vec![start, goal];
@@ -175,27 +198,33 @@ pub fn find_path(cdt: &CDT, start: Vector2, goal: Vector2) -> Vec<Vector2> {
     let n = cdt.num_faces() as usize;
 
     let centroids: Vec<Vector2> = (0..n as u32).map(|f| cdt.face_centroid(f)).collect();
-    let mut g_score:    Vec<f32> = vec![f32::INFINITY; n];
+    let mut g_score: Vec<f32> = vec![f32::INFINITY; n];
     let mut came_from_he: Vec<u32> = vec![NONE; n];
-    let mut heap: BinaryHeap<Reverse<(u32, u32, u32)>> =
-        BinaryHeap::with_capacity(n / 4 + 8);
+    let mut heap: BinaryHeap<Reverse<(u32, u32, u32)>> = BinaryHeap::with_capacity(n / 4 + 8);
 
     g_score[start_face as usize] = 0.0;
-    let h0 = dist(centroids[start_face as usize], centroids[goal_face as usize]);
+    let h0 = dist(
+        centroids[start_face as usize],
+        centroids[goal_face as usize],
+    );
     heap.push(Reverse((h0.to_bits(), 0u32, start_face)));
 
     while let Some(Reverse((_, g_bits, current))) = heap.pop() {
-        if g_bits != g_score[current as usize].to_bits() { continue; }
-        if current == goal_face { break; }
+        if g_bits != g_score[current as usize].to_bits() {
+            continue;
+        }
+        if current == goal_face {
+            break;
+        }
 
         let g_cur = g_score[current as usize];
         let c_cur = centroids[current as usize];
 
         cdt.for_each_neighbor(current, |nb, he| {
             let c_nb = centroids[nb as usize];
-            let tg   = g_cur + dist(c_cur, c_nb);
+            let tg = g_cur + dist(c_cur, c_nb);
             if tg < g_score[nb as usize] {
-                g_score[nb as usize]      = tg;
+                g_score[nb as usize] = tg;
                 came_from_he[nb as usize] = he;
                 let f = tg + dist(c_nb, goal);
                 heap.push(Reverse((f.to_bits(), tg.to_bits(), nb)));
@@ -203,10 +232,12 @@ pub fn find_path(cdt: &CDT, start: Vector2, goal: Vector2) -> Vec<Vector2> {
         });
     }
 
-    if came_from_he[goal_face as usize] == NONE { return Vec::new(); }
+    if came_from_he[goal_face as usize] == NONE {
+        return Vec::new();
+    }
 
     let mut mids = Vec::new();
-    let mut cur  = goal_face;
+    let mut cur = goal_face;
     while cur != start_face {
         let he = came_from_he[cur as usize];
         mids.push(cdt.edge_midpoint(he));

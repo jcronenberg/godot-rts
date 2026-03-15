@@ -21,14 +21,14 @@ struct HalfEdge {
 #[derive(Debug, Clone)]
 pub struct CDT {
     points: Vec<Vector2>,
-    half_edges: Vec<HalfEdge>,    // always len % 3 == 0
-    he_constrained: Vec<bool>,    // parallel to half_edges
-    vertex_half_edge: Vec<u32>,   // one outgoing half-edge per vertex
-    grid_cells: Vec<u32>,         // flat grid, each cell stores one face index or NONE
+    half_edges: Vec<HalfEdge>,  // always len % 3 == 0
+    he_constrained: Vec<bool>,  // parallel to half_edges
+    vertex_half_edge: Vec<u32>, // one outgoing half-edge per vertex
+    grid_cells: Vec<u32>,       // flat grid, each cell stores one face index or NONE
     grid_cols: u32,
     grid_rows: u32,
-    grid_origin: Vector2,         // bounding box min corner
-    grid_cell_size: Vector2,      // per-cell dimensions
+    grid_origin: Vector2,    // bounding box min corner
+    grid_cell_size: Vector2, // per-cell dimensions
 }
 
 /// Face index for a half-edge.
@@ -129,8 +129,12 @@ fn sort_spatially(mut points: Vec<Vector2>) -> Vec<Vector2> {
         return points;
     }
 
-    let (mut min_x, mut max_x, mut min_y, mut max_y) =
-        (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY);
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = (
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    );
     for p in &points {
         min_x = min_x.min(p.x);
         max_x = max_x.max(p.x);
@@ -237,10 +241,20 @@ impl CDT {
     /// Allocate 3 half-edges for a new face. Returns the base index.
     fn alloc_face(&mut self, v0: u32, v1: u32, v2: u32) -> u32 {
         let base = self.half_edges.len() as u32;
-        self.half_edges.push(HalfEdge { origin: v0, twin: NONE });
-        self.half_edges.push(HalfEdge { origin: v1, twin: NONE });
-        self.half_edges.push(HalfEdge { origin: v2, twin: NONE });
-        self.he_constrained.extend_from_slice(&[false, false, false]);
+        self.half_edges.push(HalfEdge {
+            origin: v0,
+            twin: NONE,
+        });
+        self.half_edges.push(HalfEdge {
+            origin: v1,
+            twin: NONE,
+        });
+        self.half_edges.push(HalfEdge {
+            origin: v2,
+            twin: NONE,
+        });
+        self.he_constrained
+            .extend_from_slice(&[false, false, false]);
         base
     }
 
@@ -391,11 +405,20 @@ impl CDT {
 
         // Reuse face f for triangle (v0, v1, v)
         // Overwrite in-place
-        self.half_edges[he0 as usize] = HalfEdge { origin: v0, twin: twin0 };
+        self.half_edges[he0 as usize] = HalfEdge {
+            origin: v0,
+            twin: twin0,
+        };
         self.he_constrained[he0 as usize] = con0;
-        self.half_edges[he1 as usize] = HalfEdge { origin: v1, twin: NONE };
+        self.half_edges[he1 as usize] = HalfEdge {
+            origin: v1,
+            twin: NONE,
+        };
         self.he_constrained[he1 as usize] = false;
-        self.half_edges[he2 as usize] = HalfEdge { origin: v, twin: NONE };
+        self.half_edges[he2 as usize] = HalfEdge {
+            origin: v,
+            twin: NONE,
+        };
         self.he_constrained[he2 as usize] = false;
 
         // New face A: (v1, v2, v)
@@ -482,25 +505,43 @@ impl CDT {
         let f2_base = face_of(he_ba) * 3;
 
         // T1: (C, A, V) — edges: C->A, A->V, V->C
-        self.half_edges[f1_base as usize] = HalfEdge { origin: vertex_c, twin: twin_ca };
+        self.half_edges[f1_base as usize] = HalfEdge {
+            origin: vertex_c,
+            twin: twin_ca,
+        };
         self.he_constrained[f1_base as usize] = con_ca;
         if twin_ca != NONE {
             self.half_edges[twin_ca as usize].twin = f1_base;
         }
-        self.half_edges[(f1_base + 1) as usize] = HalfEdge { origin: vertex_a, twin: NONE };
+        self.half_edges[(f1_base + 1) as usize] = HalfEdge {
+            origin: vertex_a,
+            twin: NONE,
+        };
         self.he_constrained[(f1_base + 1) as usize] = con_edge;
-        self.half_edges[(f1_base + 2) as usize] = HalfEdge { origin: v, twin: NONE };
+        self.half_edges[(f1_base + 2) as usize] = HalfEdge {
+            origin: v,
+            twin: NONE,
+        };
         self.he_constrained[(f1_base + 2) as usize] = false;
 
         // Reuse face of he_ba for T3: (D, B, V)
-        self.half_edges[f2_base as usize] = HalfEdge { origin: vertex_d, twin: twin_db };
+        self.half_edges[f2_base as usize] = HalfEdge {
+            origin: vertex_d,
+            twin: twin_db,
+        };
         self.he_constrained[f2_base as usize] = con_db;
         if twin_db != NONE {
             self.half_edges[twin_db as usize].twin = f2_base;
         }
-        self.half_edges[(f2_base + 1) as usize] = HalfEdge { origin: vertex_b, twin: NONE };
+        self.half_edges[(f2_base + 1) as usize] = HalfEdge {
+            origin: vertex_b,
+            twin: NONE,
+        };
         self.he_constrained[(f2_base + 1) as usize] = con_edge;
-        self.half_edges[(f2_base + 2) as usize] = HalfEdge { origin: v, twin: NONE };
+        self.half_edges[(f2_base + 2) as usize] = HalfEdge {
+            origin: v,
+            twin: NONE,
+        };
         self.he_constrained[(f2_base + 2) as usize] = false;
 
         // New face T2: (C, V, B)
@@ -573,21 +614,39 @@ impl CDT {
         // Rewrite face of he_ab as (C, A, D) — CCW
         // Edges: C->A, A->D, D->C
         let f1_base = face_of(he_ab) * 3;
-        self.half_edges[f1_base as usize] = HalfEdge { origin: vertex_c, twin: twin_ca };
+        self.half_edges[f1_base as usize] = HalfEdge {
+            origin: vertex_c,
+            twin: twin_ca,
+        };
         self.he_constrained[f1_base as usize] = con_ca;
-        self.half_edges[(f1_base + 1) as usize] = HalfEdge { origin: vertex_a, twin: twin_ad };
+        self.half_edges[(f1_base + 1) as usize] = HalfEdge {
+            origin: vertex_a,
+            twin: twin_ad,
+        };
         self.he_constrained[(f1_base + 1) as usize] = con_ad;
-        self.half_edges[(f1_base + 2) as usize] = HalfEdge { origin: vertex_d, twin: NONE };
+        self.half_edges[(f1_base + 2) as usize] = HalfEdge {
+            origin: vertex_d,
+            twin: NONE,
+        };
         self.he_constrained[(f1_base + 2) as usize] = false;
 
         // Rewrite face of he_ba as (D, B, C) — CCW
         // Edges: D->B, B->C, C->D
         let f2_base = face_of(he_ba) * 3;
-        self.half_edges[f2_base as usize] = HalfEdge { origin: vertex_d, twin: twin_db };
+        self.half_edges[f2_base as usize] = HalfEdge {
+            origin: vertex_d,
+            twin: twin_db,
+        };
         self.he_constrained[f2_base as usize] = con_db;
-        self.half_edges[(f2_base + 1) as usize] = HalfEdge { origin: vertex_b, twin: twin_bc };
+        self.half_edges[(f2_base + 1) as usize] = HalfEdge {
+            origin: vertex_b,
+            twin: twin_bc,
+        };
         self.he_constrained[(f2_base + 1) as usize] = con_bc;
-        self.half_edges[(f2_base + 2) as usize] = HalfEdge { origin: vertex_c, twin: NONE };
+        self.half_edges[(f2_base + 2) as usize] = HalfEdge {
+            origin: vertex_c,
+            twin: NONE,
+        };
         self.he_constrained[(f2_base + 2) as usize] = false;
 
         // Internal twin: D->C (f1_base+2) <-> C->D (f2_base+2)
@@ -992,7 +1051,10 @@ impl CDT {
             if self.he_constrained[he as usize] {
                 godot_error!(
                     "Cannot insert constraint ({}-{}): it intersects existing constraint ({}-{})",
-                    v0, v1, a, b
+                    v0,
+                    v1,
+                    a,
+                    b
                 );
                 return;
             }
@@ -1023,8 +1085,14 @@ impl CDT {
             // that pointed into these faces).
             let f1_base = face_of(he) * 3;
             let f2_base = face_of(twin_before) * 3;
-            for &check in &[f1_base, f1_base + 1, f1_base + 2,
-                            f2_base, f2_base + 1, f2_base + 2] {
+            for &check in &[
+                f1_base,
+                f1_base + 1,
+                f1_base + 2,
+                f2_base,
+                f2_base + 1,
+                f2_base + 2,
+            ] {
                 let ca = self.origin(check);
                 let cb = self.dest(check);
                 if (ca == v0 && cb == v1) || (ca == v1 && cb == v0) {
@@ -1040,7 +1108,8 @@ impl CDT {
         let Some(constraint_he) = self.find_half_edge(v0, v1) else {
             godot_error!(
                 "Failed to insert constraint ({}-{}): edge not found after flipping",
-                v0, v1
+                v0,
+                v1
             );
             return;
         };
@@ -1126,7 +1195,10 @@ impl CDT {
                 } else {
                     NONE
                 };
-                new_half_edges.push(HalfEdge { origin: he.origin, twin: new_twin });
+                new_half_edges.push(HalfEdge {
+                    origin: he.origin,
+                    twin: new_twin,
+                });
                 new_he_constrained.push(self.he_constrained[old_idx]);
             }
         }
@@ -1236,15 +1308,25 @@ impl CDT {
         let mut max_x = f32::NEG_INFINITY;
         let mut max_y = f32::NEG_INFINITY;
         for p in &self.points {
-            if p.x < min_x { min_x = p.x; }
-            if p.y < min_y { min_y = p.y; }
-            if p.x > max_x { max_x = p.x; }
-            if p.y > max_y { max_y = p.y; }
+            if p.x < min_x {
+                min_x = p.x;
+            }
+            if p.y < min_y {
+                min_y = p.y;
+            }
+            if p.x > max_x {
+                max_x = p.x;
+            }
+            if p.y > max_y {
+                max_y = p.y;
+            }
         }
 
         let pad = ((max_x - min_x).max(max_y - min_y)) * 0.001 + 1e-6;
-        min_x -= pad; min_y -= pad;
-        max_x += pad; max_y += pad;
+        min_x -= pad;
+        min_y -= pad;
+        max_x += pad;
+        max_y += pad;
 
         let resolution = (num_faces as f32).sqrt();
         let aspect = ((max_x - min_x) / (max_y - min_y)).clamp(0.1, 10.0);
@@ -1273,19 +1355,27 @@ impl CDT {
             let start = r * cols as usize;
             let end = start + cols as usize;
             for i in (start + 1)..end {
-                if cells[i] == NONE { cells[i] = cells[i - 1]; }
+                if cells[i] == NONE {
+                    cells[i] = cells[i - 1];
+                }
             }
             for i in (start..end - 1).rev() {
-                if cells[i] == NONE { cells[i] = cells[i + 1]; }
+                if cells[i] == NONE {
+                    cells[i] = cells[i + 1];
+                }
             }
         }
         let (cols, rows) = (cols as usize, rows as usize);
         for c in 0..cols {
             for r in 1..rows {
-                if cells[r * cols + c] == NONE { cells[r * cols + c] = cells[(r - 1) * cols + c]; }
+                if cells[r * cols + c] == NONE {
+                    cells[r * cols + c] = cells[(r - 1) * cols + c];
+                }
             }
             for r in (0..rows - 1).rev() {
-                if cells[r * cols + c] == NONE { cells[r * cols + c] = cells[(r + 1) * cols + c]; }
+                if cells[r * cols + c] == NONE {
+                    cells[r * cols + c] = cells[(r + 1) * cols + c];
+                }
             }
         }
 
@@ -1309,7 +1399,10 @@ impl CDT {
         let col = col.clamp(0, self.grid_cols as i32 - 1) as u32;
         let row = row.clamp(0, self.grid_rows as i32 - 1) as u32;
         let face = self.grid_cells[(row * self.grid_cols + col) as usize];
-        debug_assert!(face != NONE, "grid cell ({col},{row}) is NONE after build_grid_index");
+        debug_assert!(
+            face != NONE,
+            "grid cell ({col},{row}) is NONE after build_grid_index"
+        );
         if face == NONE { 0 } else { face }
     }
 
@@ -1737,7 +1830,10 @@ mod tests {
         ];
         let d = CDT::triangulate(points);
         // triangulate() calls build_grid_index() internally
-        assert!(!d.grid_cells.is_empty(), "grid should be populated after triangulate");
+        assert!(
+            !d.grid_cells.is_empty(),
+            "grid should be populated after triangulate"
+        );
         assert!(d.grid_cols > 0);
         assert!(d.grid_rows > 0);
         // No cell should be NONE after the fill pass
@@ -1766,7 +1862,11 @@ mod tests {
         ];
         for q in queries {
             let f = d.grid_lookup(q);
-            assert!(f < num_faces, "grid_lookup should return a valid face index for {:?}", q);
+            assert!(
+                f < num_faces,
+                "grid_lookup should return a valid face index for {:?}",
+                q
+            );
         }
     }
 
@@ -1788,7 +1888,11 @@ mod tests {
             Vector2::new(-1.0, 1.0),
         ] {
             let f = d.grid_lookup(q);
-            assert!(f < num_faces, "grid_lookup should clamp and return valid face for {:?}", q);
+            assert!(
+                f < num_faces,
+                "grid_lookup should clamp and return valid face for {:?}",
+                q
+            );
         }
     }
 
@@ -1804,7 +1908,11 @@ mod tests {
         for f in 0..d.num_faces() {
             let c = d.face_centroid(f);
             let found = d.locate_face(c);
-            assert!(found.is_some(), "centroid of face {} should be locatable", f);
+            assert!(
+                found.is_some(),
+                "centroid of face {} should be locatable",
+                f
+            );
             // The found face should actually contain the centroid.
             let found_face = found.unwrap();
             let verts = d.face_vertices(found_face);
@@ -1814,7 +1922,9 @@ mod tests {
             assert!(
                 is_point_in_triangle(c, p0, p1, p2),
                 "located face {} does not contain centroid of face {} at {:?}",
-                found_face, f, c
+                found_face,
+                f,
+                c
             );
         }
     }
@@ -1830,7 +1940,11 @@ mod tests {
         let mut d = CDT::triangulate(points);
         // Manually clear the grid to simulate no grid.
         d.grid_cells.clear();
-        assert_eq!(d.grid_lookup(Vector2::new(0.2, 0.2)), 0, "empty grid should fall back to face 0");
+        assert_eq!(
+            d.grid_lookup(Vector2::new(0.2, 0.2)),
+            0,
+            "empty grid should fall back to face 0"
+        );
     }
 
     #[test]
@@ -1864,7 +1978,10 @@ mod tests {
                 assert!(
                     (centroid_row - cell_row).abs() <= 1,
                     "cell ({},{}) seeded by face {} whose centroid row {} is far away",
-                    c, r, face, centroid_row
+                    c,
+                    r,
+                    face,
+                    centroid_row
                 );
             }
         }
@@ -1880,7 +1997,8 @@ mod tests {
         assert!(
             d.grid_cols > d.grid_rows,
             "wide domain should have more columns ({}) than rows ({})",
-            d.grid_cols, d.grid_rows
+            d.grid_cols,
+            d.grid_rows
         );
     }
 
@@ -1894,7 +2012,8 @@ mod tests {
         assert!(
             d.grid_rows > d.grid_cols,
             "tall domain should have more rows ({}) than columns ({})",
-            d.grid_rows, d.grid_cols
+            d.grid_rows,
+            d.grid_cols
         );
     }
 
@@ -2086,9 +2205,11 @@ mod tests {
         cdt.insert_constraint(2, 3);
         cdt.remove_super_triangle();
 
-        let has_edge =
-            cdt.find_half_edge(2, 3).is_some() || cdt.find_half_edge(3, 2).is_some();
-        assert!(has_edge, "Constrained edge 2-3 must exist in the final triangulation");
+        let has_edge = cdt.find_half_edge(2, 3).is_some() || cdt.find_half_edge(3, 2).is_some();
+        assert!(
+            has_edge,
+            "Constrained edge 2-3 must exist in the final triangulation"
+        );
     }
 
     #[test]
@@ -2124,7 +2245,7 @@ mod tests {
     fn test_path_same_face() {
         let cdt = square_cdt();
         let start = Vector2::new(0.1, 0.1);
-        let goal  = Vector2::new(0.2, 0.1);
+        let goal = Vector2::new(0.2, 0.1);
         // Both points should land in the same face
         let sf = cdt.locate_face(start).unwrap();
         let gf = cdt.locate_face(goal).unwrap();
@@ -2187,19 +2308,22 @@ mod tests {
         cdt.remove_super_triangle();
 
         let start = Vector2::new(0.5, 0.25); // below wall
-        let goal  = Vector2::new(0.5, 1.5);  // above wall — outside mesh actually
+        let goal = Vector2::new(0.5, 1.5); // above wall — outside mesh actually
 
         // If goal is outside, locate_face returns None → empty path
         // If goal happens to be inside (mesh extends beyond 1.0 vertically it won't),
         // then the wall constraints ensure disconnection.
         let path = crate::astar::find_path(&cdt, start, goal);
-        assert!(path.is_empty(), "should find no path through a full constraint wall");
+        assert!(
+            path.is_empty(),
+            "should find no path through a full constraint wall"
+        );
     }
 
     #[test]
     fn test_path_point_outside_mesh() {
         let cdt = square_cdt();
-        let start  = Vector2::new(0.5, 0.5);
+        let start = Vector2::new(0.5, 0.5);
         let outside = Vector2::new(10.0, 10.0);
         let path = crate::astar::find_path(&cdt, start, outside);
         assert!(path.is_empty(), "point outside mesh → empty path");

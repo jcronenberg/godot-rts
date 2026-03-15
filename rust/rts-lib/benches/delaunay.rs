@@ -109,12 +109,14 @@ fn bench_clustered_points(c: &mut Criterion) {
     let points: Vec<Vector2> = centers
         .iter()
         .flat_map(|center| {
-            generate_random_points(20, center.x as u64).into_iter().map(|p| {
-                Vector2::new(
-                    center.x + (p.x - 500.0) * 0.2,
-                    center.y + (p.y - 500.0) * 0.2,
-                )
-            })
+            generate_random_points(20, center.x as u64)
+                .into_iter()
+                .map(|p| {
+                    Vector2::new(
+                        center.x + (p.x - 500.0) * 0.2,
+                        center.y + (p.y - 500.0) * 0.2,
+                    )
+                })
         })
         .collect();
 
