@@ -127,6 +127,36 @@ fn bench_clustered_points(c: &mut Criterion) {
     group.finish();
 }
 
+/// Query locate_face for random points on a pre-built CDT.
+/// Construction cost is excluded — measures only point location.
+fn bench_locate_face(c: &mut Criterion) {
+    let mut group = c.benchmark_group("locate_face");
+
+    for &size in &[100usize, 500, 1000, 10000] {
+        let points = generate_random_points(size, 42);
+        let cdt = CDT::triangulate(points);
+
+        // Fixed query set (seed 99) reused across all CDT sizes so comparisons are apples-to-apples.
+        // generate_random_points always produces points in [0,1000)x[0,1000) regardless of count,
+        // so queries fall within the same domain as the CDT at every size.
+        let query_points = generate_random_points(1000, 99);
+
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
+            b.iter(|| {
+                let mut found = 0u32;
+                for &pt in &query_points {
+                    if cdt.locate_face(black_box(pt)).is_some() {
+                        found = found.wrapping_add(1);
+                    }
+                }
+                black_box(found)
+            });
+        });
+    }
+
+    group.finish();
+}
+
 /// Traverse every face's neighbors on a pre-built CDT.
 /// Construction cost is excluded — measures only graph traversal.
 fn bench_graph_traversal(c: &mut Criterion) {
@@ -182,6 +212,7 @@ criterion_group!(
     bench_circle_points,
     bench_clustered_points,
     bench_constrained,
+    bench_locate_face,
     bench_graph_traversal,
 );
 

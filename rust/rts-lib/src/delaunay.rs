@@ -24,6 +24,11 @@ pub struct CDT {
     half_edges: Vec<HalfEdge>,    // always len % 3 == 0
     he_constrained: Vec<bool>,    // parallel to half_edges
     vertex_half_edge: Vec<u32>,   // one outgoing half-edge per vertex
+    grid_cells: Vec<u32>,         // flat grid, each cell stores one face index or NONE
+    grid_cols: u32,
+    grid_rows: u32,
+    grid_origin: Vector2,         // bounding box min corner
+    grid_cell_size: Vector2,      // per-cell dimensions
 }
 
 /// Face index for a half-edge.
@@ -281,6 +286,11 @@ impl CDT {
             half_edges: Vec::new(),
             he_constrained: Vec::new(),
             vertex_half_edge: vec![NONE; n + 3],
+            grid_cells: Vec::new(),
+            grid_cols: 0,
+            grid_rows: 0,
+            grid_origin: Vector2::ZERO,
+            grid_cell_size: Vector2::ZERO,
         };
 
         // Face 0: the super-triangle (CCW)
@@ -650,6 +660,7 @@ impl CDT {
     pub fn triangulate(points: Vec<Vector2>) -> CDT {
         let mut cdt = CDT::from_points(sort_spatially(points));
         cdt.remove_super_triangle();
+        cdt.build_grid_index();
         cdt
     }
 
@@ -790,6 +801,7 @@ impl CDT {
         if v0 == v1 {
             return;
         }
+        self.grid_cells.clear(); // topology changes; rebuild with build_grid_index if needed
 
         // If edge already exists, just mark it constrained
         if let Some(he) = self.find_half_edge(v0, v1) {
@@ -1070,6 +1082,7 @@ impl CDT {
 
     /// Remove super-triangle faces and compact the DCEL arrays.
     pub fn remove_super_triangle(&mut self) {
+        self.grid_cells.clear(); // face indices change after compaction
         let n = self.points.len() as u32 - 3; // number of real vertices
         let sv0 = n;
 
@@ -1210,14 +1223,103 @@ impl CDT {
         None
     }
 
+    /// Build a grid index for fast `locate_face` seeding. Call after `remove_super_triangle`.
+    /// Invalidated by `insert_constraint` — rebuild once after batched insertions.
+    pub fn build_grid_index(&mut self) {
+        let num_faces = self.num_faces();
+        if num_faces == 0 {
+            return;
+        }
+
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for p in &self.points {
+            if p.x < min_x { min_x = p.x; }
+            if p.y < min_y { min_y = p.y; }
+            if p.x > max_x { max_x = p.x; }
+            if p.y > max_y { max_y = p.y; }
+        }
+
+        let pad = ((max_x - min_x).max(max_y - min_y)) * 0.001 + 1e-6;
+        min_x -= pad; min_y -= pad;
+        max_x += pad; max_y += pad;
+
+        let resolution = (num_faces as f32).sqrt();
+        let aspect = ((max_x - min_x) / (max_y - min_y)).clamp(0.1, 10.0);
+        let cols = ((resolution * aspect.sqrt()).round() as u32).clamp(1, 256);
+        let rows = ((resolution / aspect.sqrt()).round() as u32).clamp(1, 256);
+
+        let cell_w = (max_x - min_x) / cols as f32;
+        let cell_h = (max_y - min_y) / rows as f32;
+
+        let mut cells = vec![NONE; cols as usize * rows as usize];
+
+        for f in 0..num_faces {
+            let c = self.face_centroid(f);
+            let col = ((c.x - min_x) / cell_w) as i32;
+            let row = ((c.y - min_y) / cell_h) as i32;
+            if col >= 0 && col < cols as i32 && row >= 0 && row < rows as i32 {
+                let idx = (row as u32 * cols + col as u32) as usize;
+                if cells[idx] == NONE {
+                    cells[idx] = f;
+                }
+            }
+        }
+
+        // Fill empty cells: row pass first (stays within row), then column pass.
+        for r in 0..rows as usize {
+            let start = r * cols as usize;
+            let end = start + cols as usize;
+            for i in (start + 1)..end {
+                if cells[i] == NONE { cells[i] = cells[i - 1]; }
+            }
+            for i in (start..end - 1).rev() {
+                if cells[i] == NONE { cells[i] = cells[i + 1]; }
+            }
+        }
+        let (cols, rows) = (cols as usize, rows as usize);
+        for c in 0..cols {
+            for r in 1..rows {
+                if cells[r * cols + c] == NONE { cells[r * cols + c] = cells[(r - 1) * cols + c]; }
+            }
+            for r in (0..rows - 1).rev() {
+                if cells[r * cols + c] == NONE { cells[r * cols + c] = cells[(r + 1) * cols + c]; }
+            }
+        }
+
+        self.grid_cells = cells;
+        self.grid_cols = cols as u32;
+        self.grid_rows = rows as u32;
+        self.grid_origin = Vector2::new(min_x, min_y);
+        self.grid_cell_size = Vector2::new(cell_w, cell_h);
+    }
+
+    #[inline]
+    fn grid_lookup(&self, point: Vector2) -> u32 {
+        if self.grid_cells.is_empty()
+            || self.grid_cell_size.x == 0.0
+            || self.grid_cell_size.y == 0.0
+        {
+            return 0;
+        }
+        let col = ((point.x - self.grid_origin.x) / self.grid_cell_size.x) as i32;
+        let row = ((point.y - self.grid_origin.y) / self.grid_cell_size.y) as i32;
+        let col = col.clamp(0, self.grid_cols as i32 - 1) as u32;
+        let row = row.clamp(0, self.grid_rows as i32 - 1) as u32;
+        let face = self.grid_cells[(row * self.grid_cols + col) as usize];
+        debug_assert!(face != NONE, "grid cell ({col},{row}) is NONE after build_grid_index");
+        if face == NONE { 0 } else { face }
+    }
+
     /// Find the face containing the given point.
     pub fn locate_face(&self, point: Vector2) -> Option<u32> {
         if self.half_edges.is_empty() {
             return None;
         }
         let num_faces = self.num_faces();
-        // Start from face 0 and walk
-        let mut current = 0u32;
+        let mut current = self.grid_lookup(point);
         let max_iters = self.half_edges.len();
 
         for _ in 0..max_iters {
@@ -1622,6 +1724,178 @@ mod tests {
         // A point clearly inside the domain
         let f = d.locate_face(Vector2::new(0.5, 0.5));
         assert!(f.is_some(), "Should find face containing (0.5, 0.5)");
+    }
+
+    #[test]
+    fn test_build_grid_index_populates_grid() {
+        let points = vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(4.0, 0.0),
+            Vector2::new(4.0, 4.0),
+            Vector2::new(0.0, 4.0),
+            Vector2::new(2.0, 2.0),
+        ];
+        let d = CDT::triangulate(points);
+        // triangulate() calls build_grid_index() internally
+        assert!(!d.grid_cells.is_empty(), "grid should be populated after triangulate");
+        assert!(d.grid_cols > 0);
+        assert!(d.grid_rows > 0);
+        // No cell should be NONE after the fill pass
+        for &cell in &d.grid_cells {
+            assert_ne!(cell, NONE, "all cells should be filled after scanline pass");
+        }
+    }
+
+    #[test]
+    fn test_grid_lookup_returns_valid_face() {
+        let points = vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(4.0, 0.0),
+            Vector2::new(4.0, 4.0),
+            Vector2::new(0.0, 4.0),
+            Vector2::new(2.0, 2.0),
+        ];
+        let d = CDT::triangulate(points);
+        let num_faces = d.num_faces();
+        // Query several points and verify returned faces are within range
+        let queries = [
+            Vector2::new(1.0, 1.0),
+            Vector2::new(3.0, 3.0),
+            Vector2::new(0.5, 3.5),
+            Vector2::new(3.5, 0.5),
+        ];
+        for q in queries {
+            let f = d.grid_lookup(q);
+            assert!(f < num_faces, "grid_lookup should return a valid face index for {:?}", q);
+        }
+    }
+
+    #[test]
+    fn test_grid_lookup_clamps_outside_points() {
+        let points = vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(2.0, 0.0),
+            Vector2::new(2.0, 2.0),
+            Vector2::new(0.0, 2.0),
+            Vector2::new(1.0, 1.0),
+        ];
+        let d = CDT::triangulate(points);
+        let num_faces = d.num_faces();
+        // Points well outside the bounding box should still return a valid face (clamped).
+        for q in [
+            Vector2::new(-100.0, -100.0),
+            Vector2::new(100.0, 100.0),
+            Vector2::new(-1.0, 1.0),
+        ] {
+            let f = d.grid_lookup(q);
+            assert!(f < num_faces, "grid_lookup should clamp and return valid face for {:?}", q);
+        }
+    }
+
+    #[test]
+    fn test_locate_face_correctness_with_grid() {
+        // Verify locate_face still returns the correct face now that it uses grid_lookup.
+        let points: Vec<Vector2> = (0..5)
+            .flat_map(|y| (0..5).map(move |x| Vector2::new(x as f32, y as f32)))
+            .collect();
+        let d = CDT::triangulate(points);
+
+        // Every centroid should locate back to its own face.
+        for f in 0..d.num_faces() {
+            let c = d.face_centroid(f);
+            let found = d.locate_face(c);
+            assert!(found.is_some(), "centroid of face {} should be locatable", f);
+            // The found face should actually contain the centroid.
+            let found_face = found.unwrap();
+            let verts = d.face_vertices(found_face);
+            let p0 = d.points()[verts[0] as usize];
+            let p1 = d.points()[verts[1] as usize];
+            let p2 = d.points()[verts[2] as usize];
+            assert!(
+                is_point_in_triangle(c, p0, p1, p2),
+                "located face {} does not contain centroid of face {} at {:?}",
+                found_face, f, c
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_grid_index_fallback() {
+        // A CDT with no grid built should fall back to face 0 from grid_lookup.
+        let points = vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(1.0, 0.0),
+            Vector2::new(0.0, 1.0),
+        ];
+        let mut d = CDT::triangulate(points);
+        // Manually clear the grid to simulate no grid.
+        d.grid_cells.clear();
+        assert_eq!(d.grid_lookup(Vector2::new(0.2, 0.2)), 0, "empty grid should fall back to face 0");
+    }
+
+    #[test]
+    fn test_grid_scanline_fill_does_not_cross_row_boundary() {
+        // Build a mesh whose centroids only populate the right half of each row,
+        // leaving the left half of every row empty. Before the fix, the forward
+        // scanline would propagate the last cell of row N into the first cell of
+        // row N+1, so a query into the top-left corner of any row would receive a
+        // seed face from the bottom-right of the previous row.
+        //
+        // We verify this by checking that every cell in the grid points to a face
+        // whose centroid is in the same row as the cell (or an adjacent row), not
+        // from a completely different part of the mesh.
+        let points: Vec<Vector2> = (0..10)
+            .flat_map(|y| (0..10).map(move |x| Vector2::new(x as f32, y as f32)))
+            .collect();
+        let d = CDT::triangulate(points);
+
+        let cols = d.grid_cols as usize;
+        let rows = d.grid_rows as usize;
+
+        for r in 0..rows {
+            for c in 0..cols {
+                let face = d.grid_cells[r * cols + c];
+                assert_ne!(face, NONE, "cell ({},{}) should be filled", c, r);
+
+                // The face's centroid y should map to a row within 1 of the cell's row.
+                let centroid = d.face_centroid(face);
+                let centroid_row = ((centroid.y - d.grid_origin.y) / d.grid_cell_size.y) as i32;
+                let cell_row = r as i32;
+                assert!(
+                    (centroid_row - cell_row).abs() <= 1,
+                    "cell ({},{}) seeded by face {} whose centroid row {} is far away",
+                    c, r, face, centroid_row
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_grid_aspect_ratio_wide_domain() {
+        // A 4:1 wide domain should produce more columns than rows.
+        let points: Vec<Vector2> = (0..5)
+            .flat_map(|y| (0..20).map(move |x| Vector2::new(x as f32 * 4.0, y as f32)))
+            .collect();
+        let d = CDT::triangulate(points);
+        assert!(
+            d.grid_cols > d.grid_rows,
+            "wide domain should have more columns ({}) than rows ({})",
+            d.grid_cols, d.grid_rows
+        );
+    }
+
+    #[test]
+    fn test_grid_aspect_ratio_tall_domain() {
+        // A 1:4 tall domain should produce more rows than columns.
+        let points: Vec<Vector2> = (0..20)
+            .flat_map(|y| (0..5).map(move |x| Vector2::new(x as f32, y as f32 * 4.0)))
+            .collect();
+        let d = CDT::triangulate(points);
+        assert!(
+            d.grid_rows > d.grid_cols,
+            "tall domain should have more rows ({}) than columns ({})",
+            d.grid_rows, d.grid_cols
+        );
     }
 
     #[test]
