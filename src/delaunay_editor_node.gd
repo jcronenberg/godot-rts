@@ -8,6 +8,11 @@ extends Node2D
 @export var constraint_color: Color = Color(1.0, 0.0, 0.0)
 @export_group("")
 
+@export_group("JSON")
+@export_tool_button("Save to JSON") var _save_btn: Callable = _save_to_json
+@export_tool_button("Load from JSON") var _load_btn: Callable = _load_from_json
+@export_group("")
+
 @export var points: PackedVector2Array = []:
 	set(value):
 		points = value
@@ -21,9 +26,20 @@ var _triangles: Array[PackedInt32Array] = []
 var _triangulator: DelaunayTriangulator = DelaunayTriangulator.new()
 var _pending_constraint_start: int = -1 # User adding constraint tracking
 var _mouse_pos: Vector2 = Vector2.ZERO
+var _save_dialog: EditorFileDialog = null
+var _load_dialog: EditorFileDialog = null
 
 const SNAP_RADIUS: float = 10.0
 const POINT_RADIUS: float = 2.0
+
+
+func _exit_tree() -> void:
+	if _save_dialog:
+		_save_dialog.queue_free()
+		_save_dialog = null
+	if _load_dialog:
+		_load_dialog.queue_free()
+		_load_dialog = null
 
 
 func vp_to_local() -> Vector2:
@@ -123,6 +139,62 @@ func clear_all() -> void:
 	_triangles.clear()
 	_pending_constraint_start = -1
 	queue_redraw()
+
+
+func _save_to_json() -> void:
+	if _save_dialog == null:
+		_save_dialog = EditorFileDialog.new()
+		_save_dialog.file_mode = EditorFileDialog.FILE_MODE_SAVE_FILE
+		_save_dialog.access = EditorFileDialog.ACCESS_FILESYSTEM
+		_save_dialog.add_filter("*.json", "JSON Map Files")
+		_save_dialog.file_selected.connect(_on_save_file_selected)
+		EditorInterface.get_base_control().add_child(_save_dialog)
+	_save_dialog.popup_centered_ratio(0.5)
+
+
+func _load_from_json() -> void:
+	if _load_dialog == null:
+		_load_dialog = EditorFileDialog.new()
+		_load_dialog.file_mode = EditorFileDialog.FILE_MODE_OPEN_FILE
+		_load_dialog.access = EditorFileDialog.ACCESS_FILESYSTEM
+		_load_dialog.add_filter("*.json", "JSON Map Files")
+		_load_dialog.file_selected.connect(_on_load_file_selected)
+		EditorInterface.get_base_control().add_child(_load_dialog)
+	_load_dialog.popup_centered_ratio(0.5)
+
+
+func _on_save_file_selected(path: String) -> void:
+	var data := {
+		"points": Array(points).map(func(p: Vector2) -> Array: return [p.x, p.y]),
+		"constraints": Array(constraints),
+	}
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	if file == null:
+		push_error("DelaunayEditorNode: could not open file for writing: " + path)
+		return
+	file.store_string(JSON.stringify(data, "\t"))
+	file.close()
+
+
+func _on_load_file_selected(path: String) -> void:
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null:
+		push_error("DelaunayEditorNode: could not open file for reading: " + path)
+		return
+	var data = JSON.parse_string(file.get_as_text())
+	file.close()
+	if data == null:
+		push_error("DelaunayEditorNode: failed to parse JSON: " + path)
+		return
+	var new_points := PackedVector2Array()
+	for p in data.get("points", []):
+		new_points.append(Vector2(float(p[0]), float(p[1])))
+	var new_constraints := PackedInt32Array()
+	for c in data.get("constraints", []):
+		new_constraints.append(int(c))
+	points = new_points
+	constraints = new_constraints
+	notify_property_list_changed()
 
 
 func _draw() -> void:
