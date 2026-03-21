@@ -1504,6 +1504,34 @@ impl CDT {
 mod tests {
     use super::*;
 
+    #[derive(serde::Deserialize)]
+    struct MapData {
+        points: Vec<[f32; 2]>,
+        constraints: Vec<u32>,
+    }
+
+    fn load_test_map(name: &str) -> (Vec<Vector2>, Vec<(u32, u32)>) {
+        let path = format!("{}/../test_maps/{}.json", env!("CARGO_MANIFEST_DIR"), name);
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to read {}: {}", path, e));
+        let data: MapData = serde_json::from_str(&content)
+            .unwrap_or_else(|e| panic!("Failed to parse {}: {}", path, e));
+        let points = data
+            .points
+            .iter()
+            .map(|[x, y]| Vector2::new(*x, *y))
+            .collect();
+        let chunks = data.constraints.chunks_exact(2);
+        assert!(
+            chunks.remainder().is_empty(),
+            "constraints in {} has odd length {}",
+            path,
+            data.constraints.len()
+        );
+        let constraints = chunks.map(|c| (c[0], c[1])).collect();
+        (points, constraints)
+    }
+
     #[test]
     fn test_orient2d_ccw() {
         let a = Vector2::new(0.0, 0.0);
@@ -1677,15 +1705,7 @@ mod tests {
 
     #[test]
     fn test_random_points() {
-        let points = vec![
-            Vector2::new(100.0, 200.0),
-            Vector2::new(300.0, 150.0),
-            Vector2::new(250.0, 400.0),
-            Vector2::new(450.0, 300.0),
-            Vector2::new(200.0, 350.0),
-            Vector2::new(350.0, 250.0),
-        ];
-
+        let (points, _) = load_test_map("random_6_points");
         let d = CDT::triangulate(points);
         assert_eq!(d.num_vertices(), 6);
         assert!(
@@ -1741,12 +1761,7 @@ mod tests {
 
     #[test]
     fn test_large_coordinate_values() {
-        let points = vec![
-            Vector2::new(871.0, 601.0),
-            Vector2::new(566.0, 842.0),
-            Vector2::new(1027.0, 1109.0),
-        ];
-
+        let (points, _) = load_test_map("large_coordinates");
         let d = CDT::triangulate(points);
         assert_eq!(d.num_triangles(), 1);
         assert_eq!(d.num_vertices(), 3);
@@ -2019,17 +2034,12 @@ mod tests {
 
     #[test]
     fn test_constraint_existing_edge() {
-        let points = vec![
-            Vector2::new(0.0, 0.0),
-            Vector2::new(2.0, 0.0),
-            Vector2::new(2.0, 2.0),
-            Vector2::new(0.0, 2.0),
-            Vector2::new(1.0, 1.0),
-        ];
-
+        let (points, constraints) = load_test_map("constraint_existing_edge");
         let mut cdt = CDT::from_points(points);
         // Insert a constraint that already exists as a triangulation edge
-        cdt.insert_constraint(0, 4);
+        for (a, b) in constraints {
+            cdt.insert_constraint(a, b);
+        }
         cdt.remove_super_triangle();
 
         // Should still have valid triangulation
@@ -2039,20 +2049,11 @@ mod tests {
     #[test]
     fn test_constraint_crossing_edges() {
         // Create a grid of points and insert a diagonal constraint
-        let points = vec![
-            Vector2::new(0.0, 0.0),
-            Vector2::new(2.0, 0.0),
-            Vector2::new(4.0, 0.0),
-            Vector2::new(0.0, 2.0),
-            Vector2::new(2.0, 2.0),
-            Vector2::new(4.0, 2.0),
-            Vector2::new(0.0, 4.0),
-            Vector2::new(2.0, 4.0),
-            Vector2::new(4.0, 4.0),
-        ];
-
+        let (points, constraints) = load_test_map("constraint_crossing_edges");
         let mut cdt = CDT::from_points(points);
-        cdt.insert_constraint(0, 8); // diagonal from (0,0) to (4,4)
+        for (a, b) in constraints {
+            cdt.insert_constraint(a, b);
+        } // diagonal from (0,0) to (4,4)
         cdt.remove_super_triangle();
 
         // The diagonal passes through vertex 4 at (2,2), so the constraint is split
@@ -2192,17 +2193,11 @@ mod tests {
 
     #[test]
     fn test_constraint_edge_preserved() {
-        let points = vec![
-            Vector2::new(1225.0, 534.0),
-            Vector2::new(1207.0, 1046.0),
-            Vector2::new(1566.0, 794.0),
-            Vector2::new(960.0, 780.0),
-            Vector2::new(1148.0, 733.0),
-            Vector2::new(1285.0, 746.0),
-        ];
-
+        let (points, constraints) = load_test_map("constraint_edge_preserved");
         let mut cdt = CDT::from_points(points);
-        cdt.insert_constraint(2, 3);
+        for (a, b) in constraints {
+            cdt.insert_constraint(a, b);
+        }
         cdt.remove_super_triangle();
 
         let has_edge = cdt.find_half_edge(2, 3).is_some() || cdt.find_half_edge(3, 2).is_some();
@@ -2232,13 +2227,8 @@ mod tests {
     }
 
     fn square_cdt() -> CDT {
-        // 4-point unit square → 2 triangles, no constraints
-        CDT::triangulate(vec![
-            Vector2::new(0.0, 0.0),
-            Vector2::new(1.0, 0.0),
-            Vector2::new(1.0, 1.0),
-            Vector2::new(0.0, 1.0),
-        ])
+        let (points, _) = load_test_map("square");
+        CDT::triangulate(points)
     }
 
     #[test]
@@ -2280,31 +2270,12 @@ mod tests {
         //  3---4---5
         //  |   |   |
         //  0---1---2
-        // Constrain all horizontal internal edges (0-3, 1-4, 2-5 are vertical;
-        // internal horizontal edges of the triangulation separate top from bottom).
-        // We constrain the top edges of the bottom row: 0-4, 1-4 (diagonal seam)
-        // and also constrain segment 0-3, 1-4, 2-5 which are all vertical.
-        //
-        // Simplest guaranteed wall: constrain both horizontal mid-edges of the
-        // triangulation by inserting constraint edges 3-4 and 4-5 (along y=1).
-        // After CDT, the triangles along y=1 have their shared edges marked constrained,
-        // which disconnects top from bottom completely.
-        let points = vec![
-            Vector2::new(0.0, 0.0), // 0
-            Vector2::new(1.0, 0.0), // 1
-            Vector2::new(2.0, 0.0), // 2
-            Vector2::new(0.0, 1.0), // 3
-            Vector2::new(1.0, 1.0), // 4
-            Vector2::new(2.0, 1.0), // 5
-        ];
+        // Constraints form a full horizontal wall separating top from bottom.
+        let (points, constraints) = load_test_map("wall_no_route");
         let mut cdt = CDT::from_points(points);
-        // Constrain the full horizontal mid-line: 3-4 and 4-5
-        cdt.insert_constraint(3, 4);
-        cdt.insert_constraint(4, 5);
-        // Also constrain 0-3, 1-4, 2-5 to seal vertical joints
-        cdt.insert_constraint(0, 3);
-        cdt.insert_constraint(1, 4);
-        cdt.insert_constraint(2, 5);
+        for (a, b) in constraints {
+            cdt.insert_constraint(a, b);
+        }
         cdt.remove_super_triangle();
 
         let start = Vector2::new(0.5, 0.25); // below wall
