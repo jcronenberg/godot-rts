@@ -1,7 +1,73 @@
 use godot::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Sentinel value meaning "no half-edge" / "no vertex" / "no face".
 pub const NONE: u32 = u32::MAX;
+
+/// Process-global source of CDT version tokens. Each construction or mutation
+/// draws a fresh, never-repeating value so that caches keyed on `CDT::version()`
+/// (e.g. the pathfinder's centroid cache) reliably detect *any* change —
+/// including a rebuild that happens to land on the same face count. Starts at 1
+/// so the default `0` in a fresh cache never matches a real version.
+static CDT_VERSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_cdt_version() -> u64 {
+    CDT_VERSION_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// One constrained edge incident to a portal endpoint, reduced to the scalars
+/// needed to evaluate how far along the portal the agent centre must sit to
+/// clear that edge, for any radius. Lets `portal_max_radius` binary-search
+/// without re-walking the vertex ring on every step.
+///
+/// `dot`/`len`/`cross` are taken against the portal direction at the endpoint;
+/// see [`CDT::gather_walls`]. `t_bound` reproduces the three distance regimes of
+/// [`CDT::portal_valid_range`] exactly.
+struct WallBound {
+    dot: f32,
+    len: f32,
+    cross: f32,
+}
+
+impl WallBound {
+    /// Minimum portal parameter offset (from the endpoint) at which the agent
+    /// centre stays `>= r` from this wall. `ab_len`/`ab_len2` are the portal
+    /// length and its square.
+    #[inline]
+    fn t_bound(&self, r: f32, ab_len: f32, ab_len2: f32) -> f32 {
+        wall_t_bound(self.dot, self.len, self.cross, r, ab_len, ab_len2)
+    }
+}
+
+/// Smallest portal-parameter offset from an endpoint at which an agent of radius
+/// `r` clears one constraint edge, that edge reduced to `(dot, len, cross)`
+/// against the portal direction (see [`CDT::for_each_constrained_wall`]).
+/// `ab_len`/`ab_len2` are the portal length and its square.
+///
+/// Implements the three distance regimes referenced throughout the width code:
+///   1. `dot <= 0` — wall extends backward; distance grows as `t·|AB|`.
+///   2. perpendicular foot on the wall segment — `distance = t·|cross|/|wall|`.
+///   3. foot past the far endpoint — solve `|Q − C| = r` (upper root).
+#[inline]
+fn wall_t_bound(dot: f32, len: f32, cross: f32, r: f32, ab_len: f32, ab_len2: f32) -> f32 {
+    if dot <= 0.0 {
+        return r / ab_len;
+    }
+    if dot * r <= len * cross {
+        if cross > 1e-10 {
+            r * len / cross
+        } else {
+            r / ab_len
+        }
+    } else {
+        let disc = ab_len2 * r * r - cross * cross;
+        if disc >= 0.0 {
+            (dot + disc.sqrt()) / ab_len2
+        } else {
+            r / ab_len
+        }
+    }
+}
 
 /// 8 bytes — no padding. `constrained` lives in CDT::he_constrained to keep this tight.
 #[derive(Debug, Clone)]
@@ -29,6 +95,13 @@ pub struct CDT {
     grid_rows: u32,
     grid_origin: Vector2,    // bounding box min corner
     grid_cell_size: Vector2, // per-cell dimensions
+    /// `edge_max_radius[he]` = largest agent radius for which `portal_valid_range(he, r)`
+    /// is non-empty — i.e. the exact passability threshold the funnel later enforces.
+    /// Populated by `compute_widths()`; empty (all f32::INFINITY via accessor) before that.
+    edge_max_radius: Vec<f32>,
+    /// Globally-unique token identifying this triangulation's current geometry.
+    /// Bumped on every structural mutation so external caches can detect changes.
+    version: u64,
 }
 
 /// Face index for a half-edge.
@@ -55,26 +128,14 @@ fn orient2d(a: Vector2, b: Vector2, c: Vector2) -> f32 {
     (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
 }
 
-/// Returns true if `p` is strictly inside the circumcircle of CCW triangle (a, b, c).
+/// Returns true if `p` is strictly inside the circumcircle of triangle (a, b, c),
+/// for either winding. Orders the triangle CCW, then defers to the winding-free test.
 fn in_circumcircle(a: Vector2, b: Vector2, c: Vector2, p: Vector2) -> bool {
-    // Ensure CCW winding for the determinant
-    let (b, c) = if orient2d(a, b, c) < 0.0 {
-        (c, b)
+    if orient2d(a, b, c) < 0.0 {
+        in_circumcircle_ccw(a, c, b, p)
     } else {
-        (b, c)
-    };
-
-    let ax = a.x - p.x;
-    let ay = a.y - p.y;
-    let bx = b.x - p.x;
-    let by = b.y - p.y;
-    let cx = c.x - p.x;
-    let cy = c.y - p.y;
-
-    let det = (ax * ax + ay * ay) * (bx * cy - cx * by) - (bx * bx + by * by) * (ax * cy - cx * ay)
-        + (cx * cx + cy * cy) * (ax * by - bx * ay);
-
-    det > 0.0
+        in_circumcircle_ccw(a, b, c, p)
+    }
 }
 
 /// Returns true if `p` is strictly inside the circumcircle of triangle (a, b, c).
@@ -305,6 +366,8 @@ impl CDT {
             grid_rows: 0,
             grid_origin: Vector2::ZERO,
             grid_cell_size: Vector2::ZERO,
+            edge_max_radius: Vec::new(),
+            version: next_cdt_version(),
         };
 
         // Face 0: the super-triangle (CCW)
@@ -812,47 +875,13 @@ impl CDT {
 
     /// Find the half-edge from vertex `v0` to vertex `v1`, if it exists.
     fn find_half_edge(&self, v0: u32, v1: u32) -> Option<u32> {
-        let start = self.vertex_half_edge[v0 as usize];
-        if start == NONE {
-            return None;
-        }
-
-        // Walk around the vertex star of v0
-        let mut he = start;
-        loop {
-            if self.dest(he) == v1 {
-                return Some(he);
+        let mut found = None;
+        self.for_outgoing_he(v0, |he| {
+            if found.is_none() && self.dest(he) == v1 {
+                found = Some(he);
             }
-            // Move to next outgoing edge from v0: prev(twin(he))
-            let p = prev(he);
-            let t = self.half_edges[p as usize].twin;
-            if t == NONE {
-                // Hit boundary, try walking the other direction
-                break;
-            }
-            he = t;
-            if he == start {
-                break;
-            }
-        }
-
-        // Also try walking clockwise from start
-        let mut he = start;
-        loop {
-            let t = self.half_edges[he as usize].twin;
-            if t == NONE {
-                break;
-            }
-            he = next(t);
-            if he == start {
-                break;
-            }
-            if self.dest(he) == v1 {
-                return Some(he);
-            }
-        }
-
-        None
+        });
+        found
     }
 
     /// Insert constraint edge between vertices `v0` and `v1`.
@@ -860,6 +889,7 @@ impl CDT {
         if v0 == v1 {
             return;
         }
+        self.version = next_cdt_version(); // geometry/topology changes
         self.grid_cells.clear(); // topology changes; rebuild with build_grid_index if needed
 
         // If edge already exists, just mark it constrained
@@ -907,78 +937,27 @@ impl CDT {
         // Collect crossing edges
         let mut crossing: Vec<u32> = Vec::new();
 
-        // Walk from v0 toward v1, collecting half-edges that cross segment (v0,v1)
-        // Start by finding the face adjacent to v0 through which the segment exits
-        let start_he = self.vertex_half_edge[v0 as usize];
-        assert!(start_he != NONE);
-
-        // Find the outgoing half-edge from v0 such that the segment (v0,v1) passes
-        // through the face on the left of that half-edge
+        // Find the outgoing half-edge from v0 whose face the segment (v0,v1)
+        // exits through, i.e. whose opposite edge the segment properly crosses.
+        // `for_outgoing_he` sweeps v0's whole fan (both directions on a boundary).
+        assert!(self.vertex_half_edge[v0 as usize] != NONE);
         let mut exit_he: Option<u32> = None;
-
-        // Walk around v0's fan to find which face the segment exits through.
-        // Check both CW and CCW directions to handle boundary fans.
-        let mut he = start_he;
-        let mut first = true;
-        loop {
-            if !first && he == start_he {
-                break;
+        self.for_outgoing_he(v0, |he| {
+            if exit_he.is_some() {
+                return;
             }
-            first = false;
-
             let n = next(he);
-
             let d_dest = orient2d(p0, p1, self.point(self.dest(he)));
             let d_next_dest = orient2d(p0, p1, self.point(self.dest(n)));
-
-            // The segment crosses the opposite edge if the two vertices are on opposite sides
+            // The opposite edge `n` is crossed when its endpoints straddle the segment.
             if d_dest * d_next_dest < 0.0 {
-                let opp_edge = n;
-                let ea = self.point(self.origin(opp_edge));
-                let eb = self.point(self.dest(opp_edge));
+                let ea = self.point(self.origin(n));
+                let eb = self.point(self.dest(n));
                 if segments_intersect_proper(p0, p1, ea, eb) {
-                    exit_he = Some(opp_edge);
-                    break;
+                    exit_he = Some(n);
                 }
             }
-
-            // Move to next face around v0 (CW direction)
-            let p = prev(he);
-            let t = self.half_edges[p as usize].twin;
-            if t == NONE {
-                break;
-            }
-            he = t;
-        }
-
-        // Try the other direction (CCW) if not found
-        if exit_he.is_none() {
-            let mut he = start_he;
-            loop {
-                let t = self.half_edges[he as usize].twin;
-                if t == NONE {
-                    break;
-                }
-                he = next(t);
-                if he == start_he {
-                    break;
-                }
-
-                let n = next(he);
-                let d_dest = orient2d(p0, p1, self.point(self.dest(he)));
-                let d_next_dest = orient2d(p0, p1, self.point(self.dest(n)));
-
-                if d_dest * d_next_dest < 0.0 {
-                    let opp_edge = n;
-                    let ea = self.point(self.origin(opp_edge));
-                    let eb = self.point(self.dest(opp_edge));
-                    if segments_intersect_proper(p0, p1, ea, eb) {
-                        exit_he = Some(opp_edge);
-                        break;
-                    }
-                }
-            }
-        }
+        });
 
         let Some(first_crossing) = exit_he else {
             return;
@@ -1151,6 +1130,7 @@ impl CDT {
 
     /// Remove super-triangle faces and compact the DCEL arrays.
     pub fn remove_super_triangle(&mut self) {
+        self.version = next_cdt_version(); // face indices change after compaction
         self.grid_cells.clear(); // face indices change after compaction
         let n = self.points.len() as u32 - 3; // number of real vertices
         let sv0 = n;
@@ -1230,6 +1210,16 @@ impl CDT {
     /// Number of faces (triangles) in the triangulation.
     pub fn num_faces(&self) -> u32 {
         self.half_edges.len() as u32 / 3
+    }
+
+    /// Globally-unique token for this triangulation's current geometry.
+    ///
+    /// Changes on every structural mutation (and differs between any two
+    /// separately-built CDTs), so external caches can invalidate by comparing
+    /// against the version they were built for. See [`next_cdt_version`].
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Alias for `num_faces`.
@@ -1498,39 +1488,247 @@ impl CDT {
     pub fn face_of_he(&self, he: u32) -> u32 {
         face_of(he)
     }
+
+    /// Origin vertex index of half-edge `he`.
+    pub fn he_origin(&self, he: u32) -> u32 {
+        self.origin(he)
+    }
+
+    /// Destination vertex index of half-edge `he`.
+    pub fn he_dest(&self, he: u32) -> u32 {
+        self.dest(he)
+    }
+
+    /// Whether half-edge `he` is constrained.
+    pub fn he_is_constrained(&self, he: u32) -> bool {
+        self.he_constrained
+            .get(he as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Call `f(he)` for every outgoing half-edge from vertex `v`.
+    /// Handles boundary vertices by walking both CCW and CW.
+    fn for_outgoing_he(&self, v: u32, mut f: impl FnMut(u32)) {
+        let start = self.vertex_half_edge[v as usize];
+        if start == NONE {
+            return;
+        }
+
+        // CCW walk: next outgoing = twin(prev(current))
+        let mut he = start;
+        loop {
+            f(he);
+            let p = prev(he);
+            let t = self.half_edges[p as usize].twin;
+            if t == NONE {
+                break;
+            }
+            he = t;
+            if he == start {
+                return; // completed full loop — no boundary
+            }
+        }
+
+        // Reached a boundary going CCW. Also walk CW: next outgoing = next(twin(current))
+        he = start;
+        loop {
+            let t = self.half_edges[he as usize].twin;
+            if t == NONE {
+                break;
+            }
+            he = next(t);
+            if he == start {
+                break;
+            }
+            f(he);
+        }
+    }
+
+    /// For each constraint edge incident to vertex `v`, invoke `f(dot, len, cross)`
+    /// — the three scalars [`wall_t_bound`] consumes — measured against direction
+    /// `(dir_x, dir_y)` from `v`, where `c` is the edge's far endpoint:
+    ///   `dot = dir·(c−v)`,  `len = |c−v|`,  `cross = |(c−v) × dir|`.
+    /// Walks the vertex ring exactly once and allocates nothing.
+    fn for_each_constrained_wall(
+        &self,
+        v: u32,
+        dir_x: f32,
+        dir_y: f32,
+        mut f: impl FnMut(f32, f32, f32),
+    ) {
+        let pv = self.points[v as usize];
+        self.for_outgoing_he(v, |out_he| {
+            if !self.he_constrained[out_he as usize] {
+                return;
+            }
+            let pc = self.points[self.dest(out_he) as usize];
+            let cx = pc.x - pv.x;
+            let cy = pc.y - pv.y;
+            f(
+                dir_x * cx + dir_y * cy,
+                (cx * cx + cy * cy).sqrt(),
+                (cx * dir_y - cy * dir_x).abs(),
+            );
+        });
+    }
+
+    /// Compute the valid parameter range [t_lo, t_hi] on portal half-edge `he`
+    /// for an agent of the given `radius`. The agent centre at `Q(t) = A + t*(B-A)`
+    /// (A = origin, B = dest of `he`) must stay ≥ `radius` away from every
+    /// constraint *segment* incident to A or B.
+    ///
+    /// Each incident wall contributes a minimum clearance offset from its endpoint
+    /// via [`wall_t_bound`]; the binding constraint is the max of those at A and
+    /// the min (mirrored) at B. Returns `(1.0, 0.0)` when no valid position exists.
+    pub fn portal_valid_range(&self, he: u32, radius: f32) -> (f32, f32) {
+        let a_idx = self.origin(he);
+        let b_idx = self.dest(he);
+        let pa = self.points[a_idx as usize];
+        let pb = self.points[b_idx as usize];
+        let ab_x = pb.x - pa.x;
+        let ab_y = pb.y - pa.y;
+        let ab_len2 = ab_x * ab_x + ab_y * ab_y;
+        if ab_len2 < 1e-20 {
+            return (1.0, 0.0);
+        }
+        let ab_len = ab_len2.sqrt();
+
+        let mut t_lo = 0.0f32;
+        self.for_each_constrained_wall(a_idx, ab_x, ab_y, |dot, len, cross| {
+            t_lo = t_lo.max(wall_t_bound(dot, len, cross, radius, ab_len, ab_len2));
+        });
+        // At B parameterise t' = 1 − t, measuring walls against BA = −AB.
+        let mut t_hi = 1.0f32;
+        self.for_each_constrained_wall(b_idx, -ab_x, -ab_y, |dot, len, cross| {
+            t_hi = t_hi.min(1.0 - wall_t_bound(dot, len, cross, radius, ab_len, ab_len2));
+        });
+
+        (t_lo, t_hi)
+    }
+
+    /// Gather the constrained edges incident to vertex `v`, each reduced to the
+    /// three scalars (`dot`, `len`, `cross`) that `WallBound::t_bound` needs to
+    /// evaluate its t-contribution for any radius, measured against direction
+    /// `(dir_x, dir_y)` from `v`.  Walks the vertex ring exactly once.
+    fn gather_walls(&self, v: u32, dir_x: f32, dir_y: f32, out: &mut Vec<WallBound>) {
+        out.clear();
+        self.for_each_constrained_wall(v, dir_x, dir_y, |dot, len, cross| {
+            out.push(WallBound { dot, len, cross });
+        });
+    }
+
+    /// Maximum agent radius that can pass through portal half-edge `he`.
+    ///
+    /// Binary-searches for the largest `r` such that the portal's agent-valid
+    /// range is non-empty — consistent with all three distance regimes handled
+    /// by [`portal_valid_range`] (backward wall, perpendicular foot, short-wall
+    /// quadratic).  Returns `f32::INFINITY` when neither endpoint has
+    /// constrained edges (traversable at any agent size).
+    ///
+    /// For batch precomputation prefer [`compute_widths`], which reuses the wall
+    /// buffers across half-edges; this single-shot accessor allocates them.
+    pub fn portal_max_radius(&self, he: u32) -> f32 {
+        let mut a_walls = Vec::new();
+        let mut b_walls = Vec::new();
+        self.portal_max_radius_buf(he, &mut a_walls, &mut b_walls)
+    }
+
+    /// [`portal_max_radius`] using caller-provided scratch buffers so a batch
+    /// caller pays the wall-gathering walk once per endpoint, not once per
+    /// binary-search step.
+    fn portal_max_radius_buf(
+        &self,
+        he: u32,
+        a_walls: &mut Vec<WallBound>,
+        b_walls: &mut Vec<WallBound>,
+    ) -> f32 {
+        let a_idx = self.origin(he);
+        let b_idx = self.dest(he);
+        let pa = self.points[a_idx as usize];
+        let pb = self.points[b_idx as usize];
+        let ab_x = pb.x - pa.x;
+        let ab_y = pb.y - pa.y;
+
+        // Gather each endpoint's constrained edges once. Directions match
+        // `portal_valid_range`: AB at A, BA at B.
+        self.gather_walls(a_idx, ab_x, ab_y, a_walls);
+        self.gather_walls(b_idx, -ab_x, -ab_y, b_walls);
+
+        // No wall to clear → freely traversable at any size.
+        if a_walls.is_empty() && b_walls.is_empty() {
+            return f32::INFINITY;
+        }
+
+        let ab_len2 = ab_x * ab_x + ab_y * ab_y;
+        if ab_len2 < 1e-20 {
+            return 0.0; // degenerate portal
+        }
+        let ab_len = ab_len2.sqrt();
+
+        // Upper bound: radius |AB| would force the centre to A or B (t=0/1),
+        // always excluded when any constraint is present. `lo` only ever holds
+        // feasible radii, so it converges to the true max from below.
+        let mut lo = 0.0f32;
+        let mut hi = ab_len;
+        for _ in 0..32 {
+            let mid = (lo + hi) * 0.5;
+            let mut t_lo = 0.0f32;
+            for w in a_walls.iter() {
+                t_lo = t_lo.max(w.t_bound(mid, ab_len, ab_len2));
+            }
+            let mut t_hi = 1.0f32;
+            for w in b_walls.iter() {
+                t_hi = t_hi.min(1.0 - w.t_bound(mid, ab_len, ab_len2));
+            }
+            if t_lo <= t_hi {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-portal passability precomputation
+    // -----------------------------------------------------------------------
+
+    /// Pre-compute the per-half-edge passability table ([`portal_radius`]).
+    ///
+    /// Call this once after [`build_grid_index`]. Afterwards [`portal_radius`]
+    /// returns O(1) results, so the pathfinders never recompute
+    /// `portal_valid_range` during the A* hot loop.
+    pub fn compute_widths(&mut self) {
+        let num_he = self.half_edges.len() as u32;
+        let mut radii = Vec::with_capacity(num_he as usize);
+        // Reused across all half-edges so the wall-gathering ring walk happens
+        // once per endpoint instead of once per binary-search step.
+        let mut a_walls = Vec::new();
+        let mut b_walls = Vec::new();
+        for he in 0..num_he {
+            radii.push(self.portal_max_radius_buf(he, &mut a_walls, &mut b_walls));
+        }
+        self.edge_max_radius = radii;
+    }
+
+    /// Largest agent radius that can cross portal half-edge `he` (precomputed
+    /// [`portal_max_radius`]). An agent of `radius` may use the portal iff
+    /// `radius <= portal_radius(he)`.
+    ///
+    /// Returns `f32::INFINITY` if [`compute_widths`] has not been called yet.
+    pub fn portal_radius(&self, he: u32) -> f32 {
+        self.edge_max_radius
+            .get(he as usize)
+            .copied()
+            .unwrap_or(f32::INFINITY)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(serde::Deserialize)]
-    struct MapData {
-        points: Vec<[f32; 2]>,
-        constraints: Vec<u32>,
-    }
-
-    fn load_test_map(name: &str) -> (Vec<Vector2>, Vec<(u32, u32)>) {
-        let path = format!("{}/../test_maps/{}.json", env!("CARGO_MANIFEST_DIR"), name);
-        let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to read {}: {}", path, e));
-        let data: MapData = serde_json::from_str(&content)
-            .unwrap_or_else(|e| panic!("Failed to parse {}: {}", path, e));
-        let points = data
-            .points
-            .iter()
-            .map(|[x, y]| Vector2::new(*x, *y))
-            .collect();
-        let chunks = data.constraints.chunks_exact(2);
-        assert!(
-            chunks.remainder().is_empty(),
-            "constraints in {} has odd length {}",
-            path,
-            data.constraints.len()
-        );
-        let constraints = chunks.map(|c| (c[0], c[1])).collect();
-        (points, constraints)
-    }
+    use crate::test_utils::load_raw;
 
     #[test]
     fn test_orient2d_ccw() {
@@ -1705,7 +1903,7 @@ mod tests {
 
     #[test]
     fn test_random_points() {
-        let (points, _) = load_test_map("random_6_points");
+        let (points, _) = load_raw("random_6_points");
         let d = CDT::triangulate(points);
         assert_eq!(d.num_vertices(), 6);
         assert!(
@@ -1761,7 +1959,7 @@ mod tests {
 
     #[test]
     fn test_large_coordinate_values() {
-        let (points, _) = load_test_map("large_coordinates");
+        let (points, _) = load_raw("large_coordinates");
         let d = CDT::triangulate(points);
         assert_eq!(d.num_triangles(), 1);
         assert_eq!(d.num_vertices(), 3);
@@ -2034,7 +2232,7 @@ mod tests {
 
     #[test]
     fn test_constraint_existing_edge() {
-        let (points, constraints) = load_test_map("constraint_existing_edge");
+        let (points, constraints) = load_raw("constraint_existing_edge");
         let mut cdt = CDT::from_points(points);
         // Insert a constraint that already exists as a triangulation edge
         for (a, b) in constraints {
@@ -2049,7 +2247,7 @@ mod tests {
     #[test]
     fn test_constraint_crossing_edges() {
         // Create a grid of points and insert a diagonal constraint
-        let (points, constraints) = load_test_map("constraint_crossing_edges");
+        let (points, constraints) = load_raw("constraint_crossing_edges");
         let mut cdt = CDT::from_points(points);
         for (a, b) in constraints {
             cdt.insert_constraint(a, b);
@@ -2193,7 +2391,7 @@ mod tests {
 
     #[test]
     fn test_constraint_edge_preserved() {
-        let (points, constraints) = load_test_map("constraint_edge_preserved");
+        let (points, constraints) = load_raw("constraint_edge_preserved");
         let mut cdt = CDT::from_points(points);
         for (a, b) in constraints {
             cdt.insert_constraint(a, b);
@@ -2227,7 +2425,7 @@ mod tests {
     }
 
     fn square_cdt() -> CDT {
-        let (points, _) = load_test_map("square");
+        let (points, _) = load_raw("square");
         CDT::triangulate(points)
     }
 
@@ -2240,7 +2438,13 @@ mod tests {
         let sf = cdt.locate_face(start).unwrap();
         let gf = cdt.locate_face(goal).unwrap();
         assert_eq!(sf, gf, "test requires both points in the same face");
-        let path = crate::astar::find_path(&cdt, start, goal);
+        let path = crate::astar::find_path(
+            &cdt,
+            start,
+            goal,
+            &mut crate::astar::AStarScratch::new(),
+            0.0,
+        );
         assert_eq!(path.len(), 2);
         assert_eq!(path[0], start);
         assert_eq!(path[1], goal);
@@ -2258,7 +2462,8 @@ mod tests {
             cdt.locate_face(c1).unwrap(),
             "centroids must be in different faces"
         );
-        let path = crate::astar::find_path(&cdt, c0, c1);
+        let path =
+            crate::astar::find_path(&cdt, c0, c1, &mut crate::astar::AStarScratch::new(), 0.0);
         assert!(!path.is_empty(), "should find a path");
         assert_eq!(*path.first().unwrap(), c0);
         assert_eq!(*path.last().unwrap(), c1);
@@ -2271,7 +2476,7 @@ mod tests {
         //  |   |   |
         //  0---1---2
         // Constraints form a full horizontal wall separating top from bottom.
-        let (points, constraints) = load_test_map("wall_no_route");
+        let (points, constraints) = load_raw("wall_no_route");
         let mut cdt = CDT::from_points(points);
         for (a, b) in constraints {
             cdt.insert_constraint(a, b);
@@ -2284,7 +2489,13 @@ mod tests {
         // If goal is outside, locate_face returns None → empty path
         // If goal happens to be inside (mesh extends beyond 1.0 vertically it won't),
         // then the wall constraints ensure disconnection.
-        let path = crate::astar::find_path(&cdt, start, goal);
+        let path = crate::astar::find_path(
+            &cdt,
+            start,
+            goal,
+            &mut crate::astar::AStarScratch::new(),
+            0.0,
+        );
         assert!(
             path.is_empty(),
             "should find no path through a full constraint wall"
@@ -2296,7 +2507,13 @@ mod tests {
         let cdt = square_cdt();
         let start = Vector2::new(0.5, 0.5);
         let outside = Vector2::new(10.0, 10.0);
-        let path = crate::astar::find_path(&cdt, start, outside);
+        let path = crate::astar::find_path(
+            &cdt,
+            start,
+            outside,
+            &mut crate::astar::AStarScratch::new(),
+            0.0,
+        );
         assert!(path.is_empty(), "point outside mesh → empty path");
     }
 
@@ -2304,7 +2521,8 @@ mod tests {
     fn test_path_start_equals_goal() {
         let cdt = square_cdt();
         let pt = Vector2::new(0.5, 0.5);
-        let path = crate::astar::find_path(&cdt, pt, pt);
+        let path =
+            crate::astar::find_path(&cdt, pt, pt, &mut crate::astar::AStarScratch::new(), 0.0);
         // same face → [start, goal]
         assert_eq!(path.len(), 2);
         assert_eq!(path[0], pt);
@@ -2316,9 +2534,107 @@ mod tests {
         let cdt = square_cdt();
         let c0 = cdt.face_centroid(0);
         let c1 = cdt.face_centroid(1);
-        let path = crate::astar::find_path(&cdt, c0, c1);
+        let path =
+            crate::astar::find_path(&cdt, c0, c1, &mut crate::astar::AStarScratch::new(), 0.0);
         assert!(!path.is_empty());
         assert_eq!(*path.first().unwrap(), c0, "first waypoint must be start");
         assert_eq!(*path.last().unwrap(), c1, "last waypoint must be goal");
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-portal passability tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_portal_radius_all_positive() {
+        let (points, constraints) = load_raw("test_unit_size_corridors");
+        let mut cdt = CDT::from_points(points);
+        for (a, b) in constraints {
+            cdt.insert_constraint(a, b);
+        }
+        cdt.remove_super_triangle();
+        cdt.build_grid_index();
+        cdt.compute_widths();
+        for he in 0..cdt.half_edges.len() as u32 {
+            let r = cdt.portal_radius(he);
+            // A portal that admits no positive-radius agent yields exactly 0;
+            // anything negative or NaN would be a bug.
+            assert!(r >= 0.0, "half-edge {he} has invalid radius {r}");
+            assert!(r.is_finite() || r == f32::INFINITY);
+        }
+    }
+
+    #[test]
+    fn test_portal_radius_returns_infinity_before_compute() {
+        let points = vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(4.0, 0.0),
+            Vector2::new(0.0, 3.0),
+        ];
+        let mut cdt = CDT::from_points(points);
+        cdt.insert_constraint(0, 1);
+        cdt.insert_constraint(1, 2);
+        cdt.insert_constraint(2, 0);
+        cdt.remove_super_triangle();
+        cdt.build_grid_index();
+        // compute_widths NOT called — portal_radius should return infinity.
+        assert_eq!(cdt.portal_radius(0), f32::INFINITY);
+    }
+
+    #[test]
+    fn test_portal_max_radius_matches_valid_range_search() {
+        // The cached `portal_max_radius` must be bit-for-bit identical to the
+        // original binary search that re-evaluated `portal_valid_range` each
+        // step — same arithmetic, same iteration count, same precision.
+        let (points, constraints) = load_raw("test_unit_size_corridors");
+        let mut cdt = CDT::from_points(points);
+        for (a, b) in constraints {
+            cdt.insert_constraint(a, b);
+        }
+        cdt.remove_super_triangle();
+        cdt.build_grid_index();
+
+        // Reference implementation: the pre-refactor algorithm verbatim.
+        let reference = |he: u32| -> f32 {
+            let a_idx = cdt.origin(he);
+            let b_idx = cdt.dest(he);
+            let mut has_constraint = false;
+            cdt.for_outgoing_he(a_idx, |oh| {
+                has_constraint |= cdt.he_constrained[oh as usize];
+            });
+            if !has_constraint {
+                cdt.for_outgoing_he(b_idx, |oh| {
+                    has_constraint |= cdt.he_constrained[oh as usize];
+                });
+            }
+            if !has_constraint {
+                return f32::INFINITY;
+            }
+            let pa = cdt.points[a_idx as usize];
+            let pb = cdt.points[b_idx as usize];
+            let (dx, dy) = (pb.x - pa.x, pb.y - pa.y);
+            let ab_len = (dx * dx + dy * dy).sqrt();
+            let (mut lo, mut hi) = (0.0f32, ab_len);
+            for _ in 0..32 {
+                let mid = (lo + hi) * 0.5;
+                let (t_lo, t_hi) = cdt.portal_valid_range(he, mid);
+                if t_lo <= t_hi {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+
+        for he in 0..cdt.half_edges.len() as u32 {
+            let got = cdt.portal_max_radius(he);
+            let want = reference(he);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "portal_max_radius({he}) = {got} diverged from reference {want}"
+            );
+        }
     }
 }

@@ -2,9 +2,14 @@ extends Control
 
 @onready var _editor: DelaunayEditorNode = $"../../DelaunayEditorNode"
 
+@export var actor_size: float = 5.0
+
 var _start: Vector2
 var _has_start: bool = false
 var _path: PackedVector2Array = []
+
+func _ready() -> void:
+	pass
 
 func _gui_input(event: InputEvent) -> void:
 	if not (event is InputEventMouseButton and event.is_pressed()):
@@ -22,9 +27,7 @@ func _gui_input(event: InputEvent) -> void:
 				push_error("Left-click first to set a start point.")
 				return
 			var goal: Vector2 = event.position
-			_path = _editor._triangulator.find_path(_start, goal)
-			if _path.is_empty():
-				print("No path from ", _start, " to ", goal)
+			_path = _editor._triangulator.find_path(_start, goal, actor_size)
 			queue_redraw()
 
 func _draw() -> void:
@@ -35,4 +38,6 @@ func _draw() -> void:
 		return
 
 	draw_polyline(_path, Color.YELLOW, 2.0)
+	for point in _path:
+		draw_circle(point, 1, Color.RED)
 	draw_circle(_path[-1], 6.0, Color.RED)
