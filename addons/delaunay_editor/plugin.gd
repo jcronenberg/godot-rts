@@ -17,7 +17,12 @@ func _enter_tree() -> void:
 	_toolbar = HBoxContainer.new()
 
 	var group := ButtonGroup.new()
-	for entry in [["Add", Mode.ADD], ["Constraint", Mode.CONSTRAINT], ["Edit", Mode.EDIT], ["Erase", Mode.ERASE]]:
+	for entry in [
+		["Add", Mode.ADD],
+		["Constraint", Mode.CONSTRAINT],
+		["Edit", Mode.EDIT],
+		["Erase", Mode.ERASE]
+	]:
 		var btn := Button.new()
 		btn.text = entry[0]
 		btn.toggle_mode = true
@@ -37,7 +42,11 @@ func _enter_tree() -> void:
 
 	var clear_btn := Button.new()
 	clear_btn.text = "Clear All"
-	clear_btn.pressed.connect(func(): _active_node.clear_all(); _active_node.notify_property_list_changed())
+	clear_btn.pressed.connect(
+		func():
+			_active_node.clear_all()
+			_active_node.notify_property_list_changed()
+	)
 	_make_transparent(clear_btn)
 	_toolbar.add_child(clear_btn)
 
@@ -136,12 +145,11 @@ func _handle_edit(event: InputEvent) -> bool:
 			var pos := _active_node.vp_to_local()
 			_drag_idx = _active_node.find_nearest_point(pos)
 			return _drag_idx >= 0
-		else:
-			var was_dragging := _drag_idx >= 0
-			_drag_idx = -1
-			if was_dragging:
-				_auto_triangulate()
-			return was_dragging
+		var was_dragging := _drag_idx >= 0
+		_drag_idx = -1
+		if was_dragging:
+			_auto_triangulate()
+		return was_dragging
 
 	if event is InputEventMouseMotion and _drag_idx >= 0:
 		_active_node.move_point(_drag_idx, _active_node.vp_to_local())
@@ -162,5 +170,5 @@ func _handle_erase(event: InputEvent) -> bool:
 	return false
 
 
-func _handles(object: Object) -> bool:
+func _handles(_object: Object) -> bool:
 	return true

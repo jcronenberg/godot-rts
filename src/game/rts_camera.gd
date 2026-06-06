@@ -39,8 +39,11 @@ func _input(event: InputEvent) -> void:
 				_apply_zoom(1.0 / zoom_factor)
 				get_viewport().set_input_as_handled()
 
-	if drag_pan_enabled and event is InputEventMouseButton \
-			and event.button_index == MOUSE_BUTTON_MIDDLE:
+	if (
+		drag_pan_enabled
+		and event is InputEventMouseButton
+		and event.button_index == MOUSE_BUTTON_MIDDLE
+	):
 		_dragging = event.is_pressed()
 		get_viewport().set_input_as_handled()
 

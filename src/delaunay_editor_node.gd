@@ -2,6 +2,9 @@
 class_name DelaunayEditorNode
 extends Node2D
 
+const SNAP_RADIUS: float = 10.0
+const POINT_RADIUS: float = 2.0
+
 @export_group("Colors")
 @export var floor_color: Color = Color(0.0, 0.5, 1, 0.25)
 @export var edge_color: Color = Color(0.0, 0.0, 1.0)
@@ -24,13 +27,10 @@ extends Node2D
 
 var _triangles: Array[PackedInt32Array] = []
 var _triangulator: DelaunayTriangulator = DelaunayTriangulator.new()
-var _pending_constraint_start: int = -1 # User adding constraint tracking
+var _pending_constraint_start: int = -1  # User adding constraint tracking
 var _mouse_pos: Vector2 = Vector2.ZERO
 var _save_dialog: EditorFileDialog = null
 var _load_dialog: EditorFileDialog = null
-
-const SNAP_RADIUS: float = 10.0
-const POINT_RADIUS: float = 2.0
 
 
 func _exit_tree() -> void:
@@ -83,8 +83,10 @@ func handle_constraint_click() -> void:
 		_pending_constraint_start = -1
 		# Toggle: remove if already exists, add if not.
 		for i in range(0, constraints.size() - 1, 2):
-			if (constraints[i] == a and constraints[i + 1] == b) or \
-			   (constraints[i] == b and constraints[i + 1] == a):
+			if (
+				(constraints[i] == a and constraints[i + 1] == b)
+				or (constraints[i] == b and constraints[i + 1] == a)
+			):
 				constraints.remove_at(i + 1)
 				constraints.remove_at(i)
 				queue_redraw()

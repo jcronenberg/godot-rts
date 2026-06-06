@@ -4,6 +4,7 @@ var suites = [
 	["DelaunayTriangulator", preload("res://tests/test_delaunay.gd").new()],
 ]
 
+
 func _initialize() -> void:
 	print("=== RTS GDExtension Test Suite ===\n")
 
@@ -26,6 +27,7 @@ func _initialize() -> void:
 
 func _process(_delta: float) -> bool:
 	return true
+
 
 func _print_summary(results: Array, total_passed: int, total_failed: int) -> void:
 	print("=== Summary ===")

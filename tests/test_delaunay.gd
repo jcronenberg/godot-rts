@@ -1,11 +1,15 @@
 extends TestSuite
 
+
 func get_cases() -> Array:
 	return [
 		["test_3_points_gives_1_triangle", test_3_points_gives_1_triangle],
 		["test_4_points_square_gives_2_triangles", test_4_points_square_gives_2_triangles],
 		["test_triangle_count_matches_indices_size", test_triangle_count_matches_indices_size],
-		["test_mesh_vertices_count_is_triangle_count_times_3", test_mesh_vertices_count_is_triangle_count_times_3],
+		[
+			"test_mesh_vertices_count_is_triangle_count_times_3",
+			test_mesh_vertices_count_is_triangle_count_times_3
+		],
 		["test_indices_have_3_elements_each", test_indices_have_3_elements_each],
 		["test_indices_in_valid_range", test_indices_in_valid_range],
 		["test_with_constraint", test_with_constraint],
@@ -16,11 +20,18 @@ func get_cases() -> Array:
 
 func test_3_points_gives_1_triangle() -> Array[String]:
 	var dt := DelaunayTriangulator.new()
-	dt.set_points(PackedVector2Array([
-		Vector2(0.0, 0.0),
-		Vector2(1.0, 0.0),
-		Vector2(0.5, 1.0),
-	]))
+	(
+		dt
+		. set_points(
+			PackedVector2Array(
+				[
+					Vector2(0.0, 0.0),
+					Vector2(1.0, 0.0),
+					Vector2(0.5, 1.0),
+				]
+			)
+		)
+	)
 	dt.triangulate()
 	var f: Array[String] = []
 	if dt.get_triangle_count() != 1:
@@ -30,12 +41,19 @@ func test_3_points_gives_1_triangle() -> Array[String]:
 
 func test_4_points_square_gives_2_triangles() -> Array[String]:
 	var dt := DelaunayTriangulator.new()
-	dt.set_points(PackedVector2Array([
-		Vector2(0.0, 0.0),
-		Vector2(1.0, 0.0),
-		Vector2(1.0, 1.0),
-		Vector2(0.0, 1.0),
-	]))
+	(
+		dt
+		. set_points(
+			PackedVector2Array(
+				[
+					Vector2(0.0, 0.0),
+					Vector2(1.0, 0.0),
+					Vector2(1.0, 1.0),
+					Vector2(0.0, 1.0),
+				]
+			)
+		)
+	)
 	dt.triangulate()
 	var f: Array[String] = []
 	if dt.get_triangle_count() != 2:
@@ -45,14 +63,21 @@ func test_4_points_square_gives_2_triangles() -> Array[String]:
 
 func test_triangle_count_matches_indices_size() -> Array[String]:
 	var dt := DelaunayTriangulator.new()
-	dt.set_points(PackedVector2Array([
-		Vector2(0.0, 0.0),
-		Vector2(4.0, 0.0),
-		Vector2(4.0, 4.0),
-		Vector2(0.0, 4.0),
-		Vector2(1.0, 1.0),
-		Vector2(3.0, 1.0),
-	]))
+	(
+		dt
+		. set_points(
+			PackedVector2Array(
+				[
+					Vector2(0.0, 0.0),
+					Vector2(4.0, 0.0),
+					Vector2(4.0, 4.0),
+					Vector2(0.0, 4.0),
+					Vector2(1.0, 1.0),
+					Vector2(3.0, 1.0),
+				]
+			)
+		)
+	)
 	dt.triangulate()
 	var f: Array[String] = []
 	var count := dt.get_triangle_count()
@@ -64,13 +89,20 @@ func test_triangle_count_matches_indices_size() -> Array[String]:
 
 func test_mesh_vertices_count_is_triangle_count_times_3() -> Array[String]:
 	var dt := DelaunayTriangulator.new()
-	dt.set_points(PackedVector2Array([
-		Vector2(0.0, 0.0),
-		Vector2(2.0, 0.0),
-		Vector2(2.0, 2.0),
-		Vector2(0.0, 2.0),
-		Vector2(1.0, 1.0),
-	]))
+	(
+		dt
+		. set_points(
+			PackedVector2Array(
+				[
+					Vector2(0.0, 0.0),
+					Vector2(2.0, 0.0),
+					Vector2(2.0, 2.0),
+					Vector2(0.0, 2.0),
+					Vector2(1.0, 1.0),
+				]
+			)
+		)
+	)
 	dt.triangulate()
 	var f: Array[String] = []
 	var count := dt.get_triangle_count()
@@ -82,13 +114,20 @@ func test_mesh_vertices_count_is_triangle_count_times_3() -> Array[String]:
 
 func test_indices_have_3_elements_each() -> Array[String]:
 	var dt := DelaunayTriangulator.new()
-	dt.set_points(PackedVector2Array([
-		Vector2(0.0, 0.0),
-		Vector2(2.0, 0.0),
-		Vector2(2.0, 2.0),
-		Vector2(0.0, 2.0),
-		Vector2(1.0, 1.0),
-	]))
+	(
+		dt
+		. set_points(
+			PackedVector2Array(
+				[
+					Vector2(0.0, 0.0),
+					Vector2(2.0, 0.0),
+					Vector2(2.0, 2.0),
+					Vector2(0.0, 2.0),
+					Vector2(1.0, 1.0),
+				]
+			)
+		)
+	)
 	dt.triangulate()
 	var f: Array[String] = []
 	var indices: Array[PackedInt32Array] = dt.get_indices()
@@ -99,13 +138,15 @@ func test_indices_have_3_elements_each() -> Array[String]:
 
 
 func test_indices_in_valid_range() -> Array[String]:
-	var pts := PackedVector2Array([
-		Vector2(0.0, 0.0),
-		Vector2(2.0, 0.0),
-		Vector2(2.0, 2.0),
-		Vector2(0.0, 2.0),
-		Vector2(1.0, 1.0),
-	])
+	var pts := PackedVector2Array(
+		[
+			Vector2(0.0, 0.0),
+			Vector2(2.0, 0.0),
+			Vector2(2.0, 2.0),
+			Vector2(0.0, 2.0),
+			Vector2(1.0, 1.0),
+		]
+	)
 	var dt := DelaunayTriangulator.new()
 	dt.set_points(pts)
 	dt.triangulate()
@@ -117,19 +158,25 @@ func test_indices_in_valid_range() -> Array[String]:
 		for j in tri.size():
 			var idx := tri[j]
 			if idx < 0 or idx >= point_count:
-				f.append("Triangle %d index %d = %d out of range [0, %d)" % [i, j, idx, point_count])
+				f.append(
+					"Triangle %d index %d = %d out of range [0, %d)" % [i, j, idx, point_count]
+				)
 		if tri.size() == 3 and (tri[0] == tri[1] or tri[1] == tri[2] or tri[0] == tri[2]):
-			f.append("Triangle %d has duplicate indices: [%d, %d, %d]" % [i, tri[0], tri[1], tri[2]])
+			f.append(
+				"Triangle %d has duplicate indices: [%d, %d, %d]" % [i, tri[0], tri[1], tri[2]]
+			)
 	return f
 
 
 func test_with_constraint() -> Array[String]:
-	var pts := PackedVector2Array([
-		Vector2(0.0, 0.0),
-		Vector2(1.0, 0.0),
-		Vector2(1.0, 1.0),
-		Vector2(0.0, 1.0),
-	])
+	var pts := PackedVector2Array(
+		[
+			Vector2(0.0, 0.0),
+			Vector2(1.0, 0.0),
+			Vector2(1.0, 1.0),
+			Vector2(0.0, 1.0),
+		]
+	)
 	var dt := DelaunayTriangulator.new()
 	dt.set_points(pts)
 	dt.set_constraints(PackedInt32Array([0, 2]))
@@ -155,7 +202,9 @@ func test_with_constraint() -> Array[String]:
 
 	# Consistency: indices.size() == triangle_count
 	if indices.size() != dt.get_triangle_count():
-		f.append("get_indices().size() == %d, expected %d" % [indices.size(), dt.get_triangle_count()])
+		f.append(
+			"get_indices().size() == %d, expected %d" % [indices.size(), dt.get_triangle_count()]
+		)
 
 	return f
 
@@ -195,7 +244,9 @@ func test_large_point_set() -> Array[String]:
 		for j in tri.size():
 			var idx := tri[j]
 			if idx < 0 or idx >= point_count:
-				f.append("Triangle %d index %d = %d out of range [0, %d)" % [i, j, idx, point_count])
+				f.append(
+					"Triangle %d index %d = %d out of range [0, %d)" % [i, j, idx, point_count]
+				)
 				out_of_range_found = true
 				break
 		if out_of_range_found:
@@ -205,13 +256,15 @@ func test_large_point_set() -> Array[String]:
 
 
 func test_retriangulate() -> Array[String]:
-	var pts := PackedVector2Array([
-		Vector2(0.0, 0.0),
-		Vector2(2.0, 0.0),
-		Vector2(2.0, 2.0),
-		Vector2(0.0, 2.0),
-		Vector2(1.0, 1.0),
-	])
+	var pts := PackedVector2Array(
+		[
+			Vector2(0.0, 0.0),
+			Vector2(2.0, 0.0),
+			Vector2(2.0, 2.0),
+			Vector2(0.0, 2.0),
+			Vector2(1.0, 1.0),
+		]
+	)
 	var dt := DelaunayTriangulator.new()
 	dt.set_points(pts)
 
@@ -236,7 +289,12 @@ func test_retriangulate() -> Array[String]:
 		for i in indices1.size():
 			for j in 3:
 				if indices1[i][j] != indices2[i][j]:
-					f.append("Index mismatch at triangle %d element %d: %d vs %d" % [i, j, indices1[i][j], indices2[i][j]])
+					f.append(
+						(
+							"Index mismatch at triangle %d element %d: %d vs %d"
+							% [i, j, indices1[i][j], indices2[i][j]]
+						)
+					)
 					break
 
 	if verts1.size() != verts2.size():

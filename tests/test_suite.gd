@@ -1,9 +1,11 @@
 class_name TestSuite
 extends RefCounted
 
+
 # Subclasses must override this to return [["test_name", callable], ...]
 func get_cases() -> Array:
 	return []
+
 
 func test() -> Dictionary:
 	var passed := 0

@@ -1,22 +1,23 @@
 extends Control
 
-@onready var _editor: DelaunayEditorNode = $"../../DelaunayEditorNode"
-
-@export var actor_size: float = 5.0
-
 const ACTOR_SIZE_MIN: float = 1.0
 const ACTOR_SIZE_MAX: float = 50.0
+
+@export var actor_size: float = 5.0
 
 var _start: Vector2
 var _has_start: bool = false
 var _goal: Vector2
 var _has_goal: bool = false
 var _path: PackedVector2Array = []
-
 var _actor_size_label: Label
+
+@onready var _editor: DelaunayEditorNode = $"../../DelaunayEditorNode"
+
 
 func _ready() -> void:
 	_build_debug_ui()
+
 
 func _process(_delta: float) -> void:
 	# Start/path are stored in world space, but we draw in this Control's screen
@@ -24,11 +25,14 @@ func _process(_delta: float) -> void:
 	if _has_start:
 		queue_redraw()
 
+
 func _gui_input(event: InputEvent) -> void:
 	if not (event is InputEventMouseButton and event.is_pressed()):
 		return
 
-	var world: Vector2 = _editor.get_global_transform_with_canvas().affine_inverse() * event.position
+	var world: Vector2 = (
+		_editor.get_global_transform_with_canvas().affine_inverse() * event.position
+	)
 
 	match event.button_index:
 		MOUSE_BUTTON_LEFT:
@@ -46,11 +50,13 @@ func _gui_input(event: InputEvent) -> void:
 			_has_goal = true
 			_recompute_path()
 
+
 func _recompute_path() -> void:
 	if not (_has_start and _has_goal):
 		return
 	_path = _editor._triangulator.find_path(_start, _goal, actor_size)
 	queue_redraw()
+
 
 func _build_debug_ui() -> void:
 	# Lives inside this full-screen Control; it only intercepts clicks on its own
@@ -79,13 +85,16 @@ func _build_debug_ui() -> void:
 
 	_update_actor_size_label()
 
+
 func _on_actor_size_changed(value: float) -> void:
 	actor_size = value
 	_update_actor_size_label()
 	_recompute_path()
 
+
 func _update_actor_size_label() -> void:
 	_actor_size_label.text = "Actor size: %.1f" % actor_size
+
 
 func _draw() -> void:
 	var to_screen := _editor.get_global_transform_with_canvas()
