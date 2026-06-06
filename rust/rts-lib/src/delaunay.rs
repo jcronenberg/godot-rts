@@ -119,7 +119,7 @@ fn next(he: u32) -> u32 {
 /// Previous half-edge within the same face (CCW).
 #[inline(always)]
 fn prev(he: u32) -> u32 {
-    if he % 3 == 0 { he + 2 } else { he - 1 }
+    if he.is_multiple_of(3) { he + 2 } else { he - 1 }
 }
 
 /// Orientation test: positive if CCW, negative if CW, zero if collinear.

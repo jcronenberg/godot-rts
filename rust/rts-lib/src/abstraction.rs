@@ -132,11 +132,9 @@ impl Abstraction {
 
         // ── Step 3: classify remaining faces as Corridor or DecisionPoint ────
         for f in 0..n {
-            if levels[f] == NodeLevel::Corridor {
-                if free[f] >= 3 {
-                    levels[f] = NodeLevel::DecisionPoint;
-                }
-                // free[f] == 2 stays Corridor
+            // free[f] == 2 stays Corridor
+            if levels[f] == NodeLevel::Corridor && free[f] >= 3 {
+                levels[f] = NodeLevel::DecisionPoint;
             }
         }
 
@@ -391,6 +389,7 @@ pub fn find_channel_between(
 /// nearest-to-goal.  The channel (written into `channel`, cleared first) runs
 /// from `start_face` to `goal_face`, passing through those level-3 nodes.
 /// `seg` is a reusable scratch buffer. Returns `false` if reconstruction fails.
+#[allow(clippy::too_many_arguments)]
 pub fn reconstruct_channel(
     cdt: &CDT,
     abs: &Abstraction,
