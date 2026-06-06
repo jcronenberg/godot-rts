@@ -2,8 +2,13 @@
 
 [ext_resource type="Script" uid="uid://c6bshac87n8m2" path="res://src/delaunay_editor_node.gd" id="1_8mjns"]
 [ext_resource type="Script" uid="uid://i1lwbim0qidt" path="res://src/game/level_test_ui.gd" id="1_itlob"]
+[ext_resource type="Script" uid="uid://75ysqink0v4" path="res://src/game/rts_camera.gd" id="3_rtscam"]
 
 [node name="LevelTest" type="Node2D" unique_id=1640675612]
+
+[node name="Camera2D" type="Camera2D" parent="." unique_id=733512488]
+position = Vector2(200, 275)
+script = ExtResource("3_rtscam")
 
 [node name="CanvasLayer" type="CanvasLayer" parent="." unique_id=952951614]
 
