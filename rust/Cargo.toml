@@ -4,3 +4,11 @@ members = [
     "rts-lib",
     "rts",
 ]
+
+# Release builds (and the bench profile, which inherits release) compile each
+# crate as a single codegen unit with thin LTO so the A* hot loop can inline the
+# small CDT accessors (portal_radius, for_each_neighbor, …) across modules and
+# crate boundaries. Costs more compile time; measured for pathfinding throughput.
+[profile.release]
+codegen-units = 1
+lto = "thin"
