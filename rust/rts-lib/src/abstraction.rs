@@ -253,11 +253,10 @@ impl Abstraction {
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 /// Walk a corridor from `start_corridor` (entered from `prev_face`), invoking
-/// `on_step(next_face, entry_half_edge)` for each face stepped into (including
-/// the terminal decision point or the dead-end face that stops the walk).
+/// `on_step(next_face, entry_half_edge)` for each face stepped into. Only
+/// steps onto Corridor/DecisionPoint faces; dead-end branches are ignored.
 ///
-/// Returns `Some(decision_point_face)` when the corridor ends at a level-3 node,
-/// or `None` if it leads into a dead-end/island or forms a ring without one.
+/// Returns `Some(decision_point_face)`, or `None` for a ring without one.
 fn walk_corridor(
     cdt: &CDT,
     levels: &[NodeLevel],
@@ -270,11 +269,16 @@ fn walk_corridor(
     let max_steps = cdt.num_faces() as usize;
 
     for _ in 0..max_steps {
-        // The exit is the single free edge not leading back to `prev`.
+        // The exit is the single core neighbour besides `prev`; dead-end
+        // branches hanging off the corridor must be skipped, not followed.
         let mut next = NONE;
         let mut next_he = NONE;
         cdt.for_each_neighbor(cur, |nb, he| {
-            if nb != prev && next == NONE {
+            let in_core = matches!(
+                levels[nb as usize],
+                NodeLevel::Corridor | NodeLevel::DecisionPoint
+            );
+            if nb != prev && in_core && next == NONE {
                 next = nb;
                 next_he = he;
             }
@@ -291,7 +295,7 @@ fn walk_corridor(
                 prev = cur;
                 cur = next;
             }
-            _ => return None, // dead-end or island
+            _ => unreachable!("the walk only steps onto Corridor/DecisionPoint faces"),
         }
     }
     None // ring
