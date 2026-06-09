@@ -1,9 +1,11 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use godot::prelude::*;
 
 use rts_lib::abstraction::Abstraction;
 use rts_lib::astar::{self, AStarScratch};
 use rts_lib::delaunay::CDT;
+
+mod common;
 
 fn lcg(state: &mut u64) -> u64 {
     *state = state.wrapping_mul(1103515245).wrapping_add(12345);
@@ -31,9 +33,7 @@ fn grid_points(size: usize) -> Vec<Vector2> {
 fn constrained_cdt(n: usize, seed: u64) -> CDT {
     let pts = random_points(n, seed);
     let mut cdt = CDT::from_points(pts);
-    for i in (0..n.saturating_sub(1)).step_by(10) {
-        cdt.insert_constraint(i as u32, (i + 1) as u32);
-    }
+    common::insert_chain_constraints(&mut cdt, n);
     cdt.remove_super_triangle();
     cdt.build_grid_index();
     cdt.compute_widths();
@@ -213,6 +213,36 @@ fn bench_tra_star_query(c: &mut Criterion) {
     group.finish();
 }
 
+/// TRA* queries on a rooms-and-corridors map (game-like mesh, every doorway
+/// a choke point). Parameterised by room count.
+fn bench_tra_star_query_rooms(c: &mut Criterion) {
+    const QUERIES: usize = 16;
+    let mut group = c.benchmark_group("astar/tra_star_query_rooms_16");
+
+    for &side in &[4usize, 8, 16] {
+        let cdt = common::rooms_cdt(side, side);
+        let abs = Abstraction::build(&cdt);
+        let pairs = make_pairs(&cdt, QUERIES);
+        let mut sc = AStarScratch::new();
+
+        group.bench_with_input(BenchmarkId::from_parameter(side * side), &side, |b, _| {
+            b.iter(|| {
+                for &(start, goal) in &pairs {
+                    black_box(astar::find_path_abstract(
+                        black_box(&cdt),
+                        black_box(&abs),
+                        start,
+                        goal,
+                        &mut sc,
+                        5.0,
+                    ));
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
 // ── Abstraction build (one-time cost) ────────────────────────────────────────
 
 fn bench_abstraction_build(c: &mut Criterion) {
@@ -253,6 +283,69 @@ fn bench_portal_max_radius(c: &mut Criterion) {
     group.finish();
 }
 
+// ── full level-load pipeline ──────────────────────────────────────────────────
+
+/// End-to-end load cost for a level: triangulate, insert the wall constraints,
+/// drop the super-triangle, build the locate-face grid, precompute portal
+/// widths, and build the TRA* abstraction. This is what actually runs when a
+/// map loads; no other bench captures the whole chain.
+fn bench_load_pipeline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pipeline/load");
+
+    for &n in &[200usize, 1_000, 5_000] {
+        let pts = random_points(n, 0x10AD_5EED);
+
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            // Clone in setup so only the pipeline is timed.
+            b.iter_batched(
+                || pts.clone(),
+                |pts| {
+                    let mut cdt = CDT::from_points(pts);
+                    common::insert_chain_constraints(&mut cdt, n);
+                    cdt.remove_super_triangle();
+                    cdt.build_grid_index();
+                    cdt.compute_widths();
+                    let abs = Abstraction::build(&cdt);
+                    black_box((cdt, abs));
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+/// `bench_load_pipeline` on a rooms-and-corridors map instead of random
+/// points. Parameterised by room count.
+fn bench_load_pipeline_rooms(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pipeline/load_rooms");
+
+    for &side in &[4usize, 8, 16] {
+        let (pts, constraints) = common::rooms_map(side, side);
+
+        group.bench_with_input(BenchmarkId::from_parameter(side * side), &side, |b, _| {
+            b.iter_batched(
+                || pts.clone(),
+                |pts| {
+                    let mut cdt = CDT::from_points(pts);
+                    for &(s, e) in &constraints {
+                        cdt.insert_constraint(s, e);
+                    }
+                    cdt.remove_super_triangle();
+                    cdt.build_grid_index();
+                    cdt.compute_widths();
+                    let abs = Abstraction::build(&cdt);
+                    black_box((cdt, abs));
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 // ── neighbor iteration ────────────────────────────────────────────────────────
 
 fn bench_neighbor_iteration(c: &mut Criterion) {
@@ -282,6 +375,9 @@ criterion_group!(
     bench_single_query,
     bench_multi_agent,
     bench_tra_star_query,
+    bench_tra_star_query_rooms,
+    bench_load_pipeline,
+    bench_load_pipeline_rooms,
     bench_neighbor_iteration,
 );
 criterion_main!(benches);

@@ -501,3 +501,380 @@ fn push_unique(v: &mut Vec<u32>, x: u32) {
         v.push(x);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::build_cdt;
+    use godot::prelude::Vector2;
+    use std::collections::{HashMap, HashSet};
+
+    /// Real maps with walls, corridors, dead-ends, and (for `wall_no_route`)
+    /// disconnected regions. Every property below must hold on all of them.
+    const MAPS: &[&str] = &[
+        "test_unit_size_corridors",
+        "non_square_walls",
+        "wall_no_route",
+        "square",
+    ];
+
+    /// Free-edge adjacency built only from the public traversal API — the ground
+    /// truth the abstraction is supposed to summarise.
+    fn free_adj(cdt: &CDT) -> Vec<Vec<u32>> {
+        (0..cdt.num_faces())
+            .map(|f| {
+                let mut v = Vec::new();
+                cdt.for_each_neighbor(f, |nb, _| v.push(nb));
+                v
+            })
+            .collect()
+    }
+
+    /// Independent connected components over free edges (each isolated face is
+    /// its own component). Shares no code with `flood_fill_components`.
+    fn ref_components(adj: &[Vec<u32>]) -> Vec<u32> {
+        let n = adj.len();
+        let mut comp = vec![u32::MAX; n];
+        let mut next = 0u32;
+        for s in 0..n {
+            if comp[s] != u32::MAX {
+                continue;
+            }
+            comp[s] = next;
+            let mut stack = vec![s as u32];
+            while let Some(f) = stack.pop() {
+                for &nb in &adj[f as usize] {
+                    if comp[nb as usize] == u32::MAX {
+                        comp[nb as usize] = next;
+                        stack.push(nb);
+                    }
+                }
+            }
+            next += 1;
+        }
+        comp
+    }
+
+    /// Independent 4-level classification via iterated leaf removal (the 2-core):
+    /// islands have no free exit; dead-ends are the tree faces peeled away; the
+    /// surviving core splits into corridors (degree 2) and decision points
+    /// (degree >= 3). This is the *definition* Demyen's classification realises,
+    /// computed by a different algorithm than `Abstraction::build`.
+    fn ref_levels(adj: &[Vec<u32>]) -> Vec<NodeLevel> {
+        let n = adj.len();
+        let deg0: Vec<usize> = adj.iter().map(|a| a.len()).collect();
+        let mut deg: Vec<i64> = deg0.iter().map(|&d| d as i64).collect();
+        let mut removed = vec![false; n];
+        let mut queue: Vec<u32> = (0..n as u32)
+            .filter(|&f| deg0[f as usize] >= 1 && deg[f as usize] <= 1)
+            .collect();
+        while let Some(f) = queue.pop() {
+            if removed[f as usize] {
+                continue;
+            }
+            removed[f as usize] = true;
+            for &nb in &adj[f as usize] {
+                if !removed[nb as usize] {
+                    deg[nb as usize] -= 1;
+                    if deg[nb as usize] <= 1 {
+                        queue.push(nb);
+                    }
+                }
+            }
+        }
+        (0..n)
+            .map(|f| {
+                if deg0[f] == 0 {
+                    NodeLevel::Island
+                } else if removed[f] {
+                    NodeLevel::DeadEnd
+                } else if deg[f] == 2 {
+                    NodeLevel::Corridor
+                } else {
+                    NodeLevel::DecisionPoint
+                }
+            })
+            .collect()
+    }
+
+    /// Equality for choke widths that treats `f32::INFINITY` (an unconstrained,
+    /// freely-passable portal) as a first-class value.
+    fn choke_eq(a: f32, b: f32) -> bool {
+        if a.is_infinite() || b.is_infinite() {
+            a == b
+        } else {
+            (a - b).abs() <= 1e-3 * a.abs().max(b.abs()).max(1.0)
+        }
+    }
+
+    /// Hand-rolled corridor walk from decision point `f` out through free
+    /// neighbour `start` (reached via half-edge `entry`). Returns the terminal
+    /// decision point and the narrowest portal radius along the way, or `None`
+    /// for a dead-end or a ring with no decision point — the contract
+    /// `l3_neighbor`/`l3_choke_at` must satisfy, derived here independently.
+    fn walk(cdt: &CDT, levels: &[NodeLevel], f: u32, start: u32, entry: u32) -> Option<(u32, f32)> {
+        let mut min_choke = cdt.portal_radius(entry);
+        match levels[start as usize] {
+            NodeLevel::DecisionPoint => return Some((start, min_choke)),
+            NodeLevel::Island | NodeLevel::DeadEnd => return None,
+            NodeLevel::Corridor => {}
+        }
+        let mut prev = f;
+        let mut cur = start;
+        for _ in 0..cdt.num_faces() {
+            // Continue along the unique non-`prev` core neighbour; dead-end
+            // branches off the corridor must be skipped.
+            let mut next = NONE;
+            let mut next_he = NONE;
+            cdt.for_each_neighbor(cur, |nb, he| {
+                let in_core = matches!(
+                    levels[nb as usize],
+                    NodeLevel::Corridor | NodeLevel::DecisionPoint
+                );
+                if nb != prev && in_core && next == NONE {
+                    next = nb;
+                    next_he = he;
+                }
+            });
+            if next == NONE {
+                return None;
+            }
+            min_choke = min_choke.min(cdt.portal_radius(next_he));
+            match levels[next as usize] {
+                NodeLevel::DecisionPoint => return Some((next, min_choke)),
+                NodeLevel::Corridor => {
+                    prev = cur;
+                    cur = next;
+                }
+                _ => unreachable!("walk only steps onto core faces"),
+            }
+        }
+        None // ring
+    }
+
+    /// Reference for `find_local_l3`: the set of decision points reachable from
+    /// `f` over free edges without passing *through* another decision point.
+    fn ref_local_l3(adj: &[Vec<u32>], levels: &[NodeLevel], f: u32) -> HashSet<u32> {
+        let mut out = HashSet::new();
+        match levels[f as usize] {
+            NodeLevel::Island => return out,
+            NodeLevel::DecisionPoint => {
+                out.insert(f);
+                return out;
+            }
+            _ => {}
+        }
+        let mut seen = HashSet::from([f]);
+        let mut stack = vec![f];
+        while let Some(c) = stack.pop() {
+            for &nb in &adj[c as usize] {
+                if !seen.insert(nb) {
+                    continue;
+                }
+                match levels[nb as usize] {
+                    NodeLevel::DecisionPoint => {
+                        out.insert(nb);
+                    }
+                    NodeLevel::Island => {}
+                    _ => stack.push(nb),
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn components_partition_matches_reference_bfs() {
+        // `component_of` must induce exactly the connected components of the
+        // free-edge graph. IDs are arbitrary, so compare the *partition* via a
+        // bijection rather than the raw numbers.
+        for &map in MAPS {
+            let cdt = build_cdt(map);
+            let abs = Abstraction::build(&cdt);
+            let reference = ref_components(&free_adj(&cdt));
+
+            let mut abs_to_ref: HashMap<u32, u32> = HashMap::new();
+            let mut ref_to_abs: HashMap<u32, u32> = HashMap::new();
+            for f in 0..cdt.num_faces() {
+                let a = abs.component_of(f);
+                let r = reference[f as usize];
+                assert_eq!(
+                    *abs_to_ref.entry(a).or_insert(r),
+                    r,
+                    "[{map}] face {f}: abstraction merges components the reference keeps apart"
+                );
+                assert_eq!(
+                    *ref_to_abs.entry(r).or_insert(a),
+                    a,
+                    "[{map}] face {f}: abstraction splits a single reference component"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn levels_match_two_core_reference() {
+        for &map in MAPS {
+            let cdt = build_cdt(map);
+            let abs = Abstraction::build(&cdt);
+            let reference = ref_levels(&free_adj(&cdt));
+            for f in 0..cdt.num_faces() {
+                assert_eq!(
+                    abs.level_of(f),
+                    reference[f as usize],
+                    "[{map}] face {f} misclassified"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn l3_adjacency_matches_independent_corridor_walk() {
+        for &map in MAPS {
+            let cdt = build_cdt(map);
+            let abs = Abstraction::build(&cdt);
+            for f in 0..cdt.num_faces() {
+                if abs.level_of(f) != NodeLevel::DecisionPoint {
+                    // Only decision points carry abstract edges.
+                    for s in 0..3u32 {
+                        assert_eq!(
+                            abs.l3_neighbor(f, s),
+                            NONE,
+                            "[{map}] non-decision face {f} slot {s} has an l3 edge"
+                        );
+                    }
+                    continue;
+                }
+
+                let mut slot_nb = [NONE; 3];
+                let mut slot_he = [NONE; 3];
+                cdt.for_each_neighbor(f, |nb, he| {
+                    let s = (he % 3) as usize;
+                    slot_nb[s] = nb;
+                    slot_he[s] = he;
+                });
+
+                for s in 0..3usize {
+                    let got = abs.l3_neighbor(f, s as u32);
+                    if slot_nb[s] == NONE {
+                        assert_eq!(
+                            got, NONE,
+                            "[{map}] f{f} slot{s}: blocked edge has an l3 dest"
+                        );
+                        continue;
+                    }
+                    match walk(&cdt, &abs.levels, f, slot_nb[s], slot_he[s]) {
+                        None => assert_eq!(
+                            got, NONE,
+                            "[{map}] f{f} slot{s}: corridor leads nowhere but l3 dest is {got}"
+                        ),
+                        Some((dest, choke)) => {
+                            assert_eq!(got, dest, "[{map}] f{f} slot{s}: wrong l3 dest");
+                            assert_eq!(
+                                abs.level_of(dest),
+                                NodeLevel::DecisionPoint,
+                                "[{map}] f{f} slot{s}: l3 dest {dest} is not a decision point"
+                            );
+                            assert!(
+                                choke_eq(abs.l3_choke_at(f, s as u32), choke),
+                                "[{map}] f{f} slot{s}: choke {} != walked {choke}",
+                                abs.l3_choke_at(f, s as u32)
+                            );
+                            // Corridors are bidirectional: the destination must
+                            // carry an abstract edge back to f.
+                            let back = (0..3u32).any(|s2| abs.l3_neighbor(dest, s2) == f);
+                            assert!(back, "[{map}] l3 edge f{f}->{dest} has no reverse");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn find_local_l3_matches_reachability_spec() {
+        for &map in MAPS {
+            let cdt = build_cdt(map);
+            let abs = Abstraction::build(&cdt);
+            let adj = free_adj(&cdt);
+            let mut sc = AbsScratch::default();
+            let mut out = Vec::new();
+            for f in 0..cdt.num_faces() {
+                abs.find_local_l3(&cdt, f, &mut out, &mut sc);
+
+                let got: HashSet<u32> = out.iter().copied().collect();
+                assert_eq!(got.len(), out.len(), "[{map}] f{f}: duplicate in local l3");
+                for &g in &out {
+                    assert_eq!(
+                        abs.level_of(g),
+                        NodeLevel::DecisionPoint,
+                        "[{map}] f{f}: returned {g} is not a decision point"
+                    );
+                }
+                assert_eq!(
+                    got,
+                    ref_local_l3(&adj, &abs.levels, f),
+                    "[{map}] f{f}: local l3 set disagrees with reachability"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn find_channel_between_is_contiguous_and_respects_components() {
+        for &map in MAPS {
+            let cdt = build_cdt(map);
+            let abs = Abstraction::build(&cdt);
+            let nf = cdt.num_faces();
+            let mut sc = AbsScratch::default();
+            let mut out = Vec::new();
+            for a in 0..nf {
+                for b in 0..nf {
+                    let ok = find_channel_between(&cdt, a, b, &mut out, &mut sc);
+                    assert_eq!(
+                        ok,
+                        abs.component_of(a) == abs.component_of(b),
+                        "[{map}] reachability {a}->{b} disagrees with component ids"
+                    );
+                    if !ok {
+                        continue;
+                    }
+                    assert_eq!(
+                        *out.first().unwrap(),
+                        a,
+                        "[{map}] channel must start at {a}"
+                    );
+                    assert_eq!(*out.last().unwrap(), b, "[{map}] channel must end at {b}");
+                    for w in out.windows(2) {
+                        assert!(
+                            cdt.shared_edge_between(w[0], w[1]).is_some(),
+                            "[{map}] channel faces {} and {} are not adjacent",
+                            w[0],
+                            w[1]
+                        );
+                    }
+                    let uniq: HashSet<u32> = out.iter().copied().collect();
+                    assert_eq!(uniq.len(), out.len(), "[{map}] channel revisits a face");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_on_minimal_mesh_is_consistent() {
+        // Smallest possible triangulation: a single triangle bounded entirely by
+        // the convex hull (no free edges) is an island with no abstract edges.
+        let cdt = CDT::triangulate(vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(10.0, 0.0),
+            Vector2::new(5.0, 10.0),
+        ]);
+        let abs = Abstraction::build(&cdt);
+        assert_eq!(cdt.num_faces(), 1);
+        assert_eq!(abs.levels.len(), 1);
+        assert_eq!(abs.level_of(0), NodeLevel::Island);
+        for s in 0..3u32 {
+            assert_eq!(abs.l3_neighbor(0, s), NONE);
+        }
+    }
+}

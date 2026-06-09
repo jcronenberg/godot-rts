@@ -2637,4 +2637,61 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_portal_radius_symmetric_across_shared_edge() {
+        // The widest agent that can cross an edge is a property of the edge, not
+        // of the direction of travel — so a half-edge and its twin must report
+        // the same crossing radius.
+        let cdt = crate::test_utils::build_cdt("test_unit_size_corridors");
+        for f in 0..cdt.num_faces() {
+            cdt.for_each_neighbor(f, |nb, he| {
+                let twin = cdt
+                    .shared_edge_between(nb, f)
+                    .expect("free neighbour must share an edge back");
+                let r1 = cdt.portal_radius(he);
+                let r2 = cdt.portal_radius(twin);
+                let ok = if r1.is_infinite() || r2.is_infinite() {
+                    r1 == r2
+                } else {
+                    (r1 - r2).abs() <= 1e-3 * r1.abs().max(r2.abs()).max(1.0)
+                };
+                assert!(
+                    ok,
+                    "portal radius asymmetric across edge: he {he} = {r1}, twin {twin} = {r2}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_version_changes_on_geometry_mutation() {
+        // External caches (e.g. the A* centroid cache) invalidate by comparing
+        // `version()`, so every structural mutation must produce a fresh token,
+        // and two independently built CDTs must never collide.
+        let (points, constraints) = load_raw("test_unit_size_corridors");
+        let mut cdt = CDT::from_points(points);
+
+        let (points2, _) = load_raw("test_unit_size_corridors");
+        let other = CDT::from_points(points2);
+        assert_ne!(
+            cdt.version(),
+            other.version(),
+            "independently built CDTs must have distinct versions"
+        );
+
+        let mut prev = cdt.version();
+        for (a, b) in &constraints {
+            cdt.insert_constraint(*a, *b);
+            assert_ne!(cdt.version(), prev, "insert_constraint must bump version");
+            prev = cdt.version();
+        }
+
+        cdt.remove_super_triangle();
+        assert_ne!(
+            cdt.version(),
+            prev,
+            "remove_super_triangle must bump version"
+        );
+    }
 }

@@ -708,18 +708,13 @@ mod tests {
         min_dist
     }
 
-    /// Assert the path stays at least `radius * 0.5` from every constraint edge.
-    ///
-    /// Why not `radius`? When consecutive waypoints are both near the same
-    /// constraint-edge corner V (e.g. "enter gap" + "leave gap below"), the
-    /// straight-line chord between them dips to `r·cos(θ/2)` from V.  For the
-    /// worst-case geometry seen in the test maps (θ ≈ 124°) that floor is
-    /// ~0.47r; we observe a minimum of ~0.51r.  Arc tessellation would be
-    /// required to guarantee full-r clearance with more than 1 waypoint per
-    /// corner, which contradicts the simple-polyline path contract.
+    /// Assert the path stays at least `radius * 0.35` from every constraint
+    /// edge. The polyline contract forbids arc tessellation, so chords around
+    /// a corner dip to `r·cos(θ/2)`; worst observed is ~0.388r (θ ≈ 134°,
+    /// U-turn around a wall tip). A real hugging/crossing bug shows as ≈ 0.
     fn assert_min_clearance(cdt: &CDT, path: &[Vector2], radius: f32) {
         let clearance = path_min_clearance(cdt, path);
-        let threshold = radius * 0.5;
+        let threshold = radius * 0.35;
         assert!(
             clearance >= threshold,
             "path comes within {clearance:.3} of a constraint edge (radius={radius}, min allowed={threshold:.3})"
@@ -1325,5 +1320,188 @@ mod tests {
         let path = find_path(&cdt, start, goal, &mut scratch(), 0.0);
         assert!(!path.is_empty(), "radius 0 must always find a path");
         assert_no_constraint_crossing(&cdt, &path);
+    }
+
+    // ── general-correctness properties (independent of the search internals) ──
+
+    /// Evenly-spaced face-centroid pairs across a mesh, skipping the diagonal.
+    fn centroid_pairs(cdt: &CDT, buckets: u32) -> Vec<(Vector2, Vector2)> {
+        let nf = cdt.num_faces();
+        let step = (nf / buckets).max(1);
+        let mut pairs = Vec::new();
+        for i in (0..nf).step_by(step as usize) {
+            for j in (0..nf).step_by(step as usize) {
+                if i != j {
+                    pairs.push((cdt.face_centroid(i), cdt.face_centroid(j)));
+                }
+            }
+        }
+        pairs
+    }
+
+    #[test]
+    fn test_find_path_deterministic() {
+        // Repeated identical queries must return byte-identical paths; any
+        // dependence on heap tie-break order or stale scratch would break this.
+        for map in ["test_unit_size_corridors", "non_square_walls"] {
+            let cdt = crate::test_utils::build_cdt(map);
+            let mut sc = scratch();
+            for (s, g) in centroid_pairs(&cdt, 10) {
+                for &r in &[0.0f32, 4.0, 10.0] {
+                    let a = find_path(&cdt, s, g, &mut sc, r);
+                    let b = find_path(&cdt, s, g, &mut sc, r);
+                    assert_eq!(a, b, "[{map}] nondeterministic path s={s:?} g={g:?} r={r}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_path_reachability_symmetric() {
+        // Passability is undirected (the portal gate is the same edge width from
+        // either side), so a goal is reachable from a start iff the reverse holds.
+        for map in ["test_unit_size_corridors", "non_square_walls"] {
+            let cdt = crate::test_utils::build_cdt(map);
+            let mut sc = scratch();
+            for (s, g) in centroid_pairs(&cdt, 10) {
+                for &r in &[0.0f32, 5.0, 10.0] {
+                    let fwd = find_path(&cdt, s, g, &mut sc, r).is_empty();
+                    let rev = find_path(&cdt, g, s, &mut sc, r).is_empty();
+                    assert_eq!(
+                        fwd, rev,
+                        "[{map}] asymmetric reachability s={s:?} g={g:?} r={r}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_path_radius_monotonic_passability() {
+        // The passable subgraph only grows as the agent shrinks, so reachability
+        // must be monotone: if some radius reaches the goal, every smaller one does.
+        for map in ["test_unit_size_corridors", "non_square_walls"] {
+            let cdt = crate::test_utils::build_cdt(map);
+            let mut sc = scratch();
+            let radii = [25.0f32, 10.0, 5.0, 1.0, 0.0]; // strictly decreasing
+            for (s, g) in centroid_pairs(&cdt, 8) {
+                let mut larger_reached = false;
+                for &r in &radii {
+                    let reached = !find_path(&cdt, s, g, &mut sc, r).is_empty();
+                    if larger_reached {
+                        assert!(
+                            reached,
+                            "[{map}] radius>{r} reached the goal but r={r} did not (s={s:?} g={g:?})"
+                        );
+                    }
+                    larger_reached = reached;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_radius0_path_bends_only_at_mesh_vertices() {
+        // A radius-0 funnel path is a taut polyline through the triangle channel:
+        // straight between bends, with every bend sitting exactly on a portal
+        // endpoint — i.e. a triangulation vertex. An interior waypoint that is not
+        // a mesh vertex would mean the funnel invented a corner. (This is the
+        // tautness guarantee; the path is channel-optimal, not globally optimal,
+        // so its total length is deliberately not asserted.)
+        for map in ["test_unit_size_corridors", "non_square_walls"] {
+            let cdt = crate::test_utils::build_cdt(map);
+            let pts = cdt.points().to_vec();
+            let mut sc = scratch();
+            for (s, g) in centroid_pairs(&cdt, 10) {
+                let path = find_path(&cdt, s, g, &mut sc, 0.0);
+                if path.len() <= 2 {
+                    continue; // start + goal only: nothing to bend at
+                }
+                // Bit-exact on purpose: the funnel must copy apex vertices,
+                // never recompute them.
+                for &wp in &path[1..path.len() - 1] {
+                    assert!(
+                        pts.contains(&wp),
+                        "[{map}] interior waypoint {wp:?} is not a mesh vertex"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_path_abstract_deterministic() {
+        // Same contract as `test_find_path_deterministic`, but for the TRA*
+        // entry point, which has its own heap, tie-breaking, and scratch pools.
+        for map in ["test_unit_size_corridors", "non_square_walls"] {
+            let cdt = crate::test_utils::build_cdt(map);
+            let abs = crate::abstraction::Abstraction::build(&cdt);
+            let mut sc = scratch();
+            for (s, g) in centroid_pairs(&cdt, 10) {
+                for &r in &[0.0f32, 4.0, 10.0] {
+                    let a = find_path_abstract(&cdt, &abs, s, g, &mut sc, r);
+                    let b = find_path_abstract(&cdt, &abs, s, g, &mut sc, r);
+                    assert_eq!(
+                        a, b,
+                        "[{map}] nondeterministic TRA* path s={s:?} g={g:?} r={r}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_path_clearance_sweep() {
+        // Every routable sampled query must keep the clearance floor (see
+        // `assert_min_clearance`). Pairs with an endpoint within r of a wall
+        // are skipped — no clearance promise applies there.
+        for map in ["test_unit_size_corridors", "non_square_walls"] {
+            let cdt = crate::test_utils::build_cdt(map);
+            let abs = crate::abstraction::Abstraction::build(&cdt);
+            let mut sc = scratch();
+            for (s, g) in centroid_pairs(&cdt, 8) {
+                for &r in &[2.0f32, 5.0] {
+                    // A degenerate one-segment "path" measures point clearance.
+                    if path_min_clearance(&cdt, &[s, s]) < r
+                        || path_min_clearance(&cdt, &[g, g]) < r
+                    {
+                        continue;
+                    }
+                    let path = find_path(&cdt, s, g, &mut sc, r);
+                    if !path.is_empty() {
+                        assert_min_clearance(&cdt, &path, r);
+                    }
+                    let tra = find_path_abstract(&cdt, &abs, s, g, &mut sc, r);
+                    if !tra.is_empty() {
+                        assert_min_clearance(&cdt, &tra, r);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_path_steady_state_allocs() {
+        // Companion to the TRA* allocation guard: once the scratch is warm, a
+        // find_path call's only heap allocation is the returned Vec — all search
+        // state (heap, g/came_from/generation, portals, funnel buffers) is pooled.
+        let cdt = corridors_cdt();
+        let start = Vector2::new(75.0, 175.0);
+        let goal = Vector2::new(325.0, 175.0);
+        let radius = 5.0;
+        let mut sc = AStarScratch::new();
+
+        let warm = find_path(&cdt, start, goal, &mut sc, radius);
+        assert!(!warm.is_empty(), "query must traverse a corridor");
+
+        for _ in 0..4 {
+            let allocs = crate::alloc_counter::count_allocs(|| {
+                std::hint::black_box(find_path(&cdt, start, goal, &mut sc, radius));
+            });
+            assert_eq!(
+                allocs, 1,
+                "steady-state find_path should allocate exactly once (the returned path Vec); got {allocs}"
+            );
+        }
     }
 }

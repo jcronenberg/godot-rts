@@ -1,7 +1,9 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use godot::prelude::*;
 
 use rts_lib::delaunay::CDT;
+
+mod common;
 
 fn generate_random_points(count: usize, seed: u64) -> Vec<Vector2> {
     let mut rng = seed;
@@ -207,6 +209,56 @@ fn bench_constrained(c: &mut Criterion) {
     group.finish();
 }
 
+/// Random points with a constraint every 10th index, prepared for width queries
+/// (super-triangle removed, grid built) but *without* `compute_widths`.
+fn prepared_constrained(n: usize, seed: u64) -> CDT {
+    let mut cdt = CDT::from_points(generate_random_points(n, seed));
+    common::insert_chain_constraints(&mut cdt, n);
+    cdt.remove_super_triangle();
+    cdt.build_grid_index();
+    cdt
+}
+
+/// Per-portal passability precomputation — a one-time load cost (a 32-step
+/// binary search per half-edge) that the pathfinders depend on but no other
+/// bench measures.
+fn bench_compute_widths(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compute_widths");
+
+    for &n in &[200usize, 1_000, 5_000] {
+        let mut cdt = prepared_constrained(n, 0x00C0_FFEE);
+
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| cdt.compute_widths());
+        });
+    }
+
+    group.finish();
+}
+
+/// Cost of inserting a batch of constraints (the edge-flip work), isolated from
+/// the initial triangulation via `iter_batched` so only the insertions are timed.
+fn bench_insert_constraints(c: &mut Criterion) {
+    let mut group = c.benchmark_group("insert_constraints");
+
+    for &n in &[200usize, 1_000, 5_000] {
+        let points = generate_random_points(n, 0x0BAD_BEEF);
+
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter_batched(
+                || CDT::from_points(points.clone()),
+                |mut cdt| {
+                    common::insert_chain_constraints(&mut cdt, n);
+                    cdt
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_random_points,
@@ -216,6 +268,8 @@ criterion_group!(
     bench_constrained,
     bench_locate_face,
     bench_graph_traversal,
+    bench_compute_widths,
+    bench_insert_constraints,
 );
 
 criterion_main!(benches);
