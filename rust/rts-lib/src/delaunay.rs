@@ -137,6 +137,66 @@ fn max_radius_search(a_walls: &[WallBound], b_walls: &[WallBound], ab_len2: f32)
     a
 }
 
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+/// FNV-1a step over a whole u32 word (not bytes).
+#[inline]
+fn fnv1a(h: u64, x: u32) -> u64 {
+    (h ^ x as u64).wrapping_mul(FNV_PRIME)
+}
+
+/// Identity hasher for keys that are already FNV-mixed u64s.
+#[derive(Default)]
+struct PreHashed(u64);
+
+impl std::hash::Hasher for PreHashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("PreHashed only supports write_u64");
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+type WidthMap = std::collections::HashMap<u64, f32, std::hash::BuildHasherDefault<PreHashed>>;
+
+/// Cross-rebuild cache of portal width searches, keyed by the exact local
+/// geometry that determines a width ([`CDT::portal_width_key`]). Generational:
+/// entries unused for two consecutive rebuilds are dropped, so the cache stays
+/// bounded by the working set.
+#[derive(Default)]
+pub(crate) struct WidthCache {
+    cur: WidthMap,
+    prev: WidthMap,
+}
+
+impl WidthCache {
+    /// Start a new rebuild generation: keep last generation's entries
+    /// reachable, drop the one before.
+    fn advance(&mut self) {
+        std::mem::swap(&mut self.cur, &mut self.prev);
+        self.cur.clear();
+    }
+
+    /// Hit in either generation; promotes `prev` hits into `cur`.
+    fn get(&mut self, key: u64) -> Option<f32> {
+        if let Some(&r) = self.cur.get(&key) {
+            return Some(r);
+        }
+        let r = *self.prev.get(&key)?;
+        self.cur.insert(key, r);
+        Some(r)
+    }
+
+    fn insert(&mut self, key: u64, r: f32) {
+        self.cur.insert(key, r);
+    }
+}
+
 /// 8 bytes — no padding. `constrained` lives in CDT::he_constrained to keep this tight.
 #[derive(Debug, Clone)]
 struct HalfEdge {
@@ -976,8 +1036,8 @@ impl CDT {
             let he = base + j;
             let a = self.point(self.origin(he));
             let b = self.point(self.dest(he));
-            let edge_len = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
-            let eps = (edge_len * 1e-4).max(1e-12);
+            let edge_len2 = (b.x - a.x).powi(2) + (b.y - a.y).powi(2);
+            let eps2 = (edge_len2 * 1e-8).max(1e-24);
             let twin = self.half_edges[he as usize].twin;
             let apex = if twin != NONE {
                 self.dest(next(twin))
@@ -990,7 +1050,7 @@ impl CDT {
                 }
                 let q = self.point(v);
                 let d2 = (p.x - q.x).powi(2) + (p.y - q.y).powi(2);
-                if d2 <= eps * eps {
+                if d2 <= eps2 {
                     return v;
                 }
             }
@@ -1967,6 +2027,34 @@ impl CDT {
         max_radius_search(a_walls, b_walls, ab_len2)
     }
 
+    /// Geometry key for a portal width: canonical endpoint coordinates plus
+    /// order-independent hashes of each endpoint's wall set — exactly the
+    /// inputs of [`portal_max_radius_csr`], so equal keys give bitwise-equal
+    /// widths regardless of mesh history.
+    fn portal_width_key(&self, he: u32, offsets: &[u32], vwalls: &[(f32, f32, f32)]) -> u64 {
+        let mut a = self.origin(he) as usize;
+        let mut b = self.dest(he) as usize;
+        if (self.points[b].x, self.points[b].y) < (self.points[a].x, self.points[a].y) {
+            std::mem::swap(&mut a, &mut b);
+        }
+        let (pa, pb) = (self.points[a], self.points[b]);
+        let mut h = fnv1a(FNV_OFFSET, pa.x.to_bits());
+        h = fnv1a(h, pa.y.to_bits());
+        h = fnv1a(h, pb.x.to_bits());
+        h = fnv1a(h, pb.y.to_bits());
+        for v in [a, b] {
+            // Sum-combined per-wall hashes: wall order is mesh-history noise,
+            // and unlike XOR, addition can't cancel subsets out.
+            let mut hw = 0u64;
+            for &(cx, cy, _) in &vwalls[offsets[v] as usize..offsets[v + 1] as usize] {
+                hw = hw.wrapping_add(fnv1a(fnv1a(FNV_OFFSET, cx.to_bits()), cy.to_bits()));
+            }
+            // Fold the low/high halves of the 64-bit wall hash into the chain.
+            h = fnv1a(fnv1a(h, hw as u32), (hw >> 32) as u32);
+        }
+        h
+    }
+
     /// Pre-compute the per-half-edge passability table ([`portal_radius`]).
     ///
     /// Call this once after the last structural mutation. Afterwards
@@ -2007,7 +2095,8 @@ impl CDT {
     /// every slot it touches) between two width-clean endpoints keeps the width
     /// precomputed on `base`; everything else is recomputed. Call *before*
     /// [`remove_super_triangle`], which carries the table through compaction.
-    pub(crate) fn compute_widths_from(&mut self, base: &CDT) {
+    pub(crate) fn compute_widths_from(&mut self, base: &CDT, cache: &mut WidthCache) {
+        cache.advance();
         debug_assert_eq!(
             base.edge_max_radius.len(),
             base.half_edges.len(),
@@ -2046,7 +2135,18 @@ impl CDT {
             radii[he as usize] = if reusable {
                 base.edge_max_radius[he as usize]
             } else {
-                self.portal_max_radius_csr(he, &offsets, &vwalls, &mut a_walls, &mut b_walls)
+                let key = self.portal_width_key(he, &offsets, &vwalls);
+                cache.get(key).unwrap_or_else(|| {
+                    let r = self.portal_max_radius_csr(
+                        he,
+                        &offsets,
+                        &vwalls,
+                        &mut a_walls,
+                        &mut b_walls,
+                    );
+                    cache.insert(key, r);
+                    r
+                })
             };
         }
         self.edge_max_radius = radii;

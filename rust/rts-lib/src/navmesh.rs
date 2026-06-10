@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use godot::prelude::*;
 
-use crate::delaunay::CDT;
+use crate::delaunay::{CDT, WidthCache};
 
 /// A set of constraint edges over its own point list (`edges` hold local
 /// indices into `points`). Obstacle edges must not cross other constraint
@@ -60,6 +60,9 @@ pub struct DynamicNavmesh {
     next_id: u64,
     navmesh: CDT,
     dirty: bool,
+    /// Portal width searches reused across rebuilds for obstacles that
+    /// didn't change (identical local geometry ⇒ identical width).
+    width_cache: WidthCache,
 }
 
 impl DynamicNavmesh {
@@ -72,13 +75,15 @@ impl DynamicNavmesh {
         // One-time width precomputation; rebuilds reuse it for every portal
         // the obstacle set doesn't touch (compute_widths_from).
         base.compute_widths();
-        let navmesh = build_active(&base, std::iter::empty());
+        let mut width_cache = WidthCache::default();
+        let navmesh = build_active(&base, std::iter::empty(), &mut width_cache);
         DynamicNavmesh {
             base,
             obstacles: BTreeMap::new(),
             next_id: 0,
             navmesh,
             dirty: false,
+            width_cache,
         }
     }
 
@@ -101,7 +106,7 @@ impl DynamicNavmesh {
     /// Rebuild the active navmesh if the obstacle set changed; returns it.
     pub fn rebuild(&mut self) -> &CDT {
         if self.dirty {
-            self.navmesh = build_active(&self.base, self.obstacles.values());
+            self.navmesh = build_active(&self.base, self.obstacles.values(), &mut self.width_cache);
             self.dirty = false;
         }
         &self.navmesh
@@ -123,7 +128,11 @@ impl DynamicNavmesh {
 
 /// Clone the base, insert all obstacle vertices then all obstacle constraints,
 /// and finish the navmesh (super-triangle removal, grid index, portal widths).
-fn build_active<'a>(base: &CDT, obstacles: impl Iterator<Item = &'a Obstacle>) -> CDT {
+fn build_active<'a>(
+    base: &CDT,
+    obstacles: impl Iterator<Item = &'a Obstacle>,
+    width_cache: &mut WidthCache,
+) -> CDT {
     let mut cdt = base.clone();
 
     // Insert points first so constraint insertion sees every obstacle vertex.
@@ -149,7 +158,7 @@ fn build_active<'a>(base: &CDT, obstacles: impl Iterator<Item = &'a Obstacle>) -
 
     // Widths before super removal so half-edge slots still align with `base`;
     // removal then carries the table through its compaction.
-    cdt.compute_widths_from(base);
+    cdt.compute_widths_from(base, width_cache);
     cdt.remove_super_triangle();
     cdt.build_grid_index();
     cdt
