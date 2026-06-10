@@ -100,7 +100,7 @@ impl DelaunayTriangulator {
         };
 
         let mut result = Array::new();
-        for f in 0..cdt.num_triangles() {
+        for f in 0..cdt.num_faces() {
             let verts = cdt.face_vertices(f);
             let mut indices = PackedInt32Array::new();
             indices.push(verts[0] as i32);
@@ -114,7 +114,7 @@ impl DelaunayTriangulator {
     #[func]
     pub fn get_triangle_count(&self) -> i32 {
         match &self.cdt {
-            Some(cdt) => cdt.num_triangles() as i32,
+            Some(cdt) => cdt.num_faces() as i32,
             None => 0,
         }
     }
@@ -130,11 +130,7 @@ impl DelaunayTriangulator {
             return PackedVector2Array::new();
         };
         let path = rts_lib::astar::find_path(cdt, start, goal, &mut self.scratch, radius);
-        let mut result = PackedVector2Array::new();
-        for pt in &path {
-            result.push(*pt);
-        }
-        result
+        PackedVector2Array::from(path.as_slice())
     }
 
     /// Find a path using TRA* (requires `build_abstraction()` to have been called).
@@ -163,10 +159,6 @@ impl DelaunayTriangulator {
                 rts_lib::astar::find_path(cdt, start, goal, &mut self.scratch, radius)
             }
         };
-        let mut result = PackedVector2Array::new();
-        for pt in &path {
-            result.push(*pt);
-        }
-        result
+        PackedVector2Array::from(path.as_slice())
     }
 }

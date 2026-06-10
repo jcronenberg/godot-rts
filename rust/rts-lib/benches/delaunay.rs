@@ -174,9 +174,7 @@ fn bench_graph_traversal(c: &mut Criterion) {
             b.iter(|| {
                 let mut acc = 0u32;
                 for f in 0..cdt.num_faces() {
-                    for n in cdt.face_neighbors(black_box(f)) {
-                        acc = acc.wrapping_add(n);
-                    }
+                    cdt.for_each_neighbor(black_box(f), |n, _| acc = acc.wrapping_add(n));
                 }
                 black_box(acc)
             });

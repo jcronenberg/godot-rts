@@ -501,7 +501,6 @@ impl CDT {
         }
 
         // Link internal edges:
-        // he1 (v1->v in face f) <-> b_base+2 (v->v1 in face B)... wait let me think
         // face f:  he0=v0->v1, he1=v1->v, he2=v->v0
         // face A:  a0=v1->v2, a1=v2->v, a2=v->v1
         // face B:  b0=v2->v0, b1=v0->v, b2=v->v2
@@ -517,8 +516,6 @@ impl CDT {
         // Update vertex_half_edge
         self.vertex_half_edge[v as usize] = he2; // v->v0
         self.vertex_half_edge[v0 as usize] = he0;
-        self.vertex_half_edge[v1 as usize] = he1; // keep valid; v1->v
-        // v1 also starts a_base (v1->v2), pick one that's valid
         self.vertex_half_edge[v1 as usize] = a_base; // v1->v2
         self.vertex_half_edge[v2 as usize] = b_base; // v2->v0
     }
@@ -1222,11 +1219,6 @@ impl CDT {
         self.version
     }
 
-    /// Alias for `num_faces`.
-    pub fn num_triangles(&self) -> u32 {
-        self.num_faces()
-    }
-
     /// Number of vertices.
     pub fn num_vertices(&self) -> u32 {
         self.points.len() as u32
@@ -1242,20 +1234,6 @@ impl CDT {
         ]
     }
 
-    /// Adjacent faces through non-constrained, non-boundary edges.
-    pub fn face_neighbors(&self, face: u32) -> Vec<u32> {
-        let base = face * 3;
-        let mut neighbors = Vec::with_capacity(3);
-        for j in 0..3u32 {
-            let he = base + j;
-            let twin = self.half_edges[he as usize].twin;
-            if twin != NONE && !self.he_constrained[he as usize] {
-                neighbors.push(face_of(twin));
-            }
-        }
-        neighbors
-    }
-
     /// Centroid of a face.
     pub fn face_centroid(&self, face: u32) -> Vector2 {
         let [v0, v1, v2] = self.face_vertices(face);
@@ -1263,13 +1241,6 @@ impl CDT {
         let p1 = self.point(v1);
         let p2 = self.point(v2);
         Vector2::new((p0.x + p1.x + p2.x) / 3.0, (p0.y + p1.y + p2.y) / 3.0)
-    }
-
-    /// Midpoint of the edge starting at half-edge `he`.
-    pub fn edge_midpoint(&self, he: u32) -> Vector2 {
-        let a = self.point(self.origin(he));
-        let b = self.point(self.dest(he));
-        Vector2::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
     }
 
     /// Half-edge ID of the shared edge between two adjacent faces, from f1's side.
@@ -1472,7 +1443,6 @@ impl CDT {
 
     /// Iterate walkable neighbors without allocation.
     /// Calls `f(neighbor_face, half_edge_from_self_to_neighbor)` for each non-constrained, non-boundary edge.
-    /// The half-edge can be passed to `edge_midpoint()` to compute smooth waypoints.
     pub fn for_each_neighbor(&self, face: u32, mut f: impl FnMut(u32, u32)) {
         let base = face * 3;
         for j in 0u32..3 {
@@ -1828,7 +1798,7 @@ mod tests {
 
         let d = CDT::triangulate(points);
         assert_eq!(
-            d.num_triangles(),
+            d.num_faces(),
             1,
             "Three points should form exactly one triangle"
         );
@@ -1851,7 +1821,7 @@ mod tests {
 
         let d = CDT::triangulate(points);
         assert_eq!(
-            d.num_triangles(),
+            d.num_faces(),
             2,
             "Four points in a square should form 2 triangles"
         );
@@ -1870,7 +1840,7 @@ mod tests {
 
         let d = CDT::triangulate(points);
         assert_eq!(
-            d.num_triangles(),
+            d.num_faces(),
             4,
             "5 points (4 corners + center) should form 4 triangles"
         );
@@ -1879,7 +1849,7 @@ mod tests {
         // Center point should appear in all 4 triangles.
         // Spatial sort may reorder indices, so find it by frequency instead.
         let mut vertex_freq = vec![0u32; d.num_vertices() as usize];
-        for f in 0..d.num_triangles() {
+        for f in 0..d.num_faces() {
             for v in d.face_vertices(f) {
                 vertex_freq[v as usize] += 1;
             }
@@ -1907,11 +1877,11 @@ mod tests {
         let d = CDT::triangulate(points);
         assert_eq!(d.num_vertices(), 6);
         assert!(
-            d.num_triangles() >= 4,
+            d.num_faces() >= 4,
             "6 points should form at least 4 triangles"
         );
 
-        for f in 0..d.num_triangles() {
+        for f in 0..d.num_faces() {
             let verts = d.face_vertices(f);
             assert!(verts[0] < 6);
             assert!(verts[1] < 6);
@@ -1934,7 +1904,7 @@ mod tests {
 
         let d = CDT::triangulate(points);
 
-        for f in 0..d.num_triangles() {
+        for f in 0..d.num_faces() {
             let verts = d.face_vertices(f);
             let a = d.points()[verts[0] as usize];
             let b = d.points()[verts[1] as usize];
@@ -1961,7 +1931,7 @@ mod tests {
     fn test_large_coordinate_values() {
         let (points, _) = load_raw("large_coordinates");
         let d = CDT::triangulate(points);
-        assert_eq!(d.num_triangles(), 1);
+        assert_eq!(d.num_faces(), 1);
         assert_eq!(d.num_vertices(), 3);
     }
 
@@ -1975,7 +1945,7 @@ mod tests {
 
         let d = CDT::triangulate(points);
         // 1 triangle * 3 vertices = 3 mesh vertices
-        assert_eq!(d.num_triangles() * 3, 3);
+        assert_eq!(d.num_faces() * 3, 3);
     }
 
     #[test]
@@ -1991,9 +1961,10 @@ mod tests {
         let d = CDT::triangulate(points);
 
         // Every interior face should have at least 1 neighbor
-        for f in 0..d.num_triangles() {
-            let neighbors = d.face_neighbors(f);
-            assert!(!neighbors.is_empty(), "Face {} should have neighbors", f);
+        for f in 0..d.num_faces() {
+            let mut count = 0;
+            d.for_each_neighbor(f, |_, _| count += 1);
+            assert!(count > 0, "Face {} should have neighbors", f);
         }
     }
 
@@ -2300,7 +2271,7 @@ mod tests {
 
         let d = CDT::triangulate(points);
         let v = d.num_vertices();
-        let f = d.num_triangles();
+        let f = d.num_faces();
 
         // Count edges (each internal edge has 2 half-edges, boundary has 1)
         let mut edge_count = 0u32;
@@ -2341,7 +2312,7 @@ mod tests {
 
         let d = CDT::triangulate(points);
         assert_eq!(
-            d.num_triangles(),
+            d.num_faces(),
             2,
             "4 cocircular points should produce 2 triangles"
         );
@@ -2363,7 +2334,7 @@ mod tests {
         let d = CDT::triangulate(points);
 
         // Verify Delaunay property
-        for f in 0..d.num_triangles() {
+        for f in 0..d.num_faces() {
             let verts = d.face_vertices(f);
             let a = d.points()[verts[0] as usize];
             let b = d.points()[verts[1] as usize];
@@ -2415,7 +2386,7 @@ mod tests {
         ];
 
         let d = CDT::triangulate(points);
-        assert_eq!(d.num_triangles(), 2);
+        assert_eq!(d.num_faces(), 2);
 
         let edge = d.shared_edge_between(0, 1);
         assert!(
