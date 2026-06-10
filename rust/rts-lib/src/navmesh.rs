@@ -69,6 +69,9 @@ impl DynamicNavmesh {
         for &(a, b) in constraints {
             base.insert_constraint(a, b);
         }
+        // One-time width precomputation; rebuilds reuse it for every portal
+        // the obstacle set doesn't touch (compute_widths_from).
+        base.compute_widths();
         let navmesh = build_active(&base, std::iter::empty());
         DynamicNavmesh {
             base,
@@ -144,9 +147,11 @@ fn build_active<'a>(base: &CDT, obstacles: impl Iterator<Item = &'a Obstacle>) -
         }
     }
 
+    // Widths before super removal so half-edge slots still align with `base`;
+    // removal then carries the table through its compaction.
+    cdt.compute_widths_from(base);
     cdt.remove_super_triangle();
     cdt.build_grid_index();
-    cdt.compute_widths();
     cdt
 }
 
@@ -166,6 +171,20 @@ mod tests {
 
     fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Obstacle {
         Obstacle::polygon(vec![v(x0, y0), v(x1, y0), v(x1, y1), v(x0, y1)])
+    }
+
+    /// Incrementally-reused portal widths must be bitwise identical to a full
+    /// recompute on the same mesh.
+    fn assert_widths_match_full(cdt: &CDT) {
+        let mut full = cdt.clone();
+        full.compute_widths();
+        for he in 0..cdt.num_faces() * 3 {
+            assert_eq!(
+                cdt.portal_radius(he).to_bits(),
+                full.portal_radius(he).to_bits(),
+                "incremental width diverged at he {he}"
+            );
+        }
     }
 
     /// From-scratch CDT over map + obstacle geometry in one batch.
@@ -318,6 +337,7 @@ mod tests {
             let cdt = nav.rebuild();
             assert_valid(cdt);
             assert_local_delaunay(cdt);
+            assert_widths_match_full(cdt);
             let edges = constrained_edge_set(cdt);
             assert!(
                 edges.is_superset(&map_edges),
@@ -331,6 +351,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_incremental_widths_match_full() {
+        // Plain insertion plus the wall-set-changing paths: a corner reusing a
+        // map vertex and a vertex splitting a constrained edge.
+        let (points, constraints) = rooms_map(2, 2);
+        let mut nav = DynamicNavmesh::new(points, &constraints);
+        assert_widths_match_full(nav.navmesh());
+        let id = nav.add_obstacle(rect(20.0, 20.0, 40.0, 40.0));
+        nav.add_obstacle(Obstacle::polygon(vec![
+            v(100.0, 100.0),
+            v(70.0, 80.0),
+            v(80.0, 70.0),
+        ]));
+        assert_widths_match_full(nav.rebuild());
+        nav.remove_obstacle(id);
+        assert_widths_match_full(nav.rebuild());
+
+        // (100, 20) lies on the wall segment (100,0)-(100,35).
+        let (points, constraints) = rooms_map(2, 1);
+        let mut nav = DynamicNavmesh::new(points, &constraints);
+        nav.add_obstacle(Obstacle::polygon(vec![
+            v(100.0, 20.0),
+            v(70.0, 10.0),
+            v(70.0, 30.0),
+        ]));
+        assert_widths_match_full(nav.rebuild());
     }
 
     #[test]
