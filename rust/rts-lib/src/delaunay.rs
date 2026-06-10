@@ -997,6 +997,9 @@ impl CDT {
 
         // Flip crossing edges until the constraint edge appears
         let mut queue = std::collections::VecDeque::from(crossing);
+        // Half-edges of every face rewritten by a flip; only these (and edges
+        // exposed by later legalization flips) can violate Delaunay afterwards.
+        let mut touched: Vec<u32> = Vec::new();
         let mut safety = 0;
         let max_flips = queue.len() * queue.len() + queue.len() + 100;
 
@@ -1069,6 +1072,7 @@ impl CDT {
                 f2_base + 1,
                 f2_base + 2,
             ] {
+                touched.push(check);
                 let ca = self.origin(check);
                 let cb = self.dest(check);
                 if (ca == v0 && cb == v1) || (ca == v1 && cb == v0) {
@@ -1095,32 +1099,43 @@ impl CDT {
             self.he_constrained[twin as usize] = true;
         }
 
-        // Re-legalize non-constrained edges near the constraint
-        // Collect edges to legalize (those that were flipped and aren't the constraint)
-        let num_faces = self.half_edges.len() as u32 / 3;
-        for f in 0..num_faces {
-            let base = f * 3;
-            for j in 0..3u32 {
-                let he = base + j;
-                if self.he_constrained[he as usize] {
-                    continue;
-                }
-                let twin = self.half_edges[he as usize].twin;
-                if twin == NONE {
-                    continue;
-                }
+        // Re-legalize to a fixpoint, but only around the faces the flip walk
+        // rewrote — the rest of the mesh was Delaunay before and still is.
+        // Each flip re-queues the rewritten faces' edges, so violations the
+        // flip exposes are also re-checked. The safety bound guards against
+        // f32 round-off oscillation; exact arithmetic would always terminate.
+        let mut safety = touched.len() * 8 + 64;
+        while let Some(he) = touched.pop() {
+            if safety == 0 {
+                break;
+            }
+            safety -= 1;
 
-                let a = self.origin(he);
-                let b = self.dest(he);
-                let c = self.origin(prev(he));
-                let d = self.origin(prev(twin));
+            if self.he_constrained[he as usize] {
+                continue;
+            }
+            let twin = self.half_edges[he as usize].twin;
+            if twin == NONE {
+                continue;
+            }
 
-                if in_circumcircle(self.point(a), self.point(b), self.point(c), self.point(d)) {
-                    // Only legalize if the edge involves vertices near the constraint
-                    // For simplicity, just do a single pass of flips
-                    self.flip_edge(he);
-                    break; // face indices shifted, restart scan
-                }
+            let a = self.origin(he);
+            let b = self.dest(he);
+            let c = self.origin(prev(he));
+            let d = self.origin(prev(twin));
+
+            if in_circumcircle(self.point(a), self.point(b), self.point(c), self.point(d)) {
+                self.flip_edge(he);
+                let f1_base = face_of(he) * 3;
+                let f2_base = face_of(twin) * 3;
+                touched.extend_from_slice(&[
+                    f1_base,
+                    f1_base + 1,
+                    f1_base + 2,
+                    f2_base,
+                    f2_base + 1,
+                    f2_base + 2,
+                ]);
             }
         }
     }
