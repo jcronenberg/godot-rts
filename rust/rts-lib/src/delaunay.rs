@@ -1386,25 +1386,18 @@ impl CDT {
             face_alive[f as usize] = !touches_super;
         }
 
-        // Compact points: swap each super vertex with the tail, in descending
-        // index order. A vertex moved into one super slot can become the tail
-        // again later, so track slot occupants to chain the remap correctly.
-        let mut vmap: Vec<u32> = (0..self.points.len() as u32).collect();
-        let mut occupant: Vec<u32> = (0..self.points.len() as u32).collect();
-        let mut svs = [s0, s1, s2];
-        svs.sort_unstable();
-        for &sv in svs.iter().rev() {
-            let last = self.points.len() as u32 - 1;
-            self.points.swap_remove(sv as usize);
-            if sv != last {
-                let moved = occupant[last as usize];
-                occupant[sv as usize] = moved;
-                vmap[moved as usize] = sv;
+        // Compact points preserving order; vmap maps old to new vertex ids.
+        let mut vmap = vec![NONE; self.points.len()];
+        let mut new_points = Vec::with_capacity(self.points.len() - 3);
+        for (v, &p) in self.points.iter().enumerate() {
+            let v = v as u32;
+            if v == s0 || v == s1 || v == s2 {
+                continue;
             }
+            vmap[v as usize] = new_points.len() as u32;
+            new_points.push(p);
         }
-        for &sv in &svs {
-            vmap[sv as usize] = NONE;
-        }
+        self.points = new_points;
         let n = self.points.len() as u32;
 
         // Build old->new half-edge index mapping
@@ -1887,23 +1880,9 @@ impl CDT {
     /// quadratic).  Returns `f32::INFINITY` when neither endpoint has
     /// constrained edges (traversable at any agent size).
     ///
-    /// For batch precomputation prefer [`compute_widths`], which reuses the wall
+    /// For batch precomputation prefer [`compute_widths`], which reuses wall
     /// buffers across half-edges; this single-shot accessor allocates them.
     pub fn portal_max_radius(&self, he: u32) -> f32 {
-        let mut a_walls = Vec::new();
-        let mut b_walls = Vec::new();
-        self.portal_max_radius_buf(he, &mut a_walls, &mut b_walls)
-    }
-
-    /// [`portal_max_radius`] using caller-provided scratch buffers so a batch
-    /// caller pays the wall-gathering walk once per endpoint, not once per
-    /// binary-search step.
-    fn portal_max_radius_buf(
-        &self,
-        he: u32,
-        a_walls: &mut Vec<WallBound>,
-        b_walls: &mut Vec<WallBound>,
-    ) -> f32 {
         let a_idx = self.origin(he);
         let b_idx = self.dest(he);
         let pa = self.points[a_idx as usize];
@@ -1913,8 +1892,10 @@ impl CDT {
 
         // Gather each endpoint's constrained edges once. Directions match
         // `portal_valid_range`: AB at A, BA at B.
-        self.gather_walls(a_idx, ab_x, ab_y, a_walls);
-        self.gather_walls(b_idx, -ab_x, -ab_y, b_walls);
+        let mut a_walls = Vec::new();
+        let mut b_walls = Vec::new();
+        self.gather_walls(a_idx, ab_x, ab_y, &mut a_walls);
+        self.gather_walls(b_idx, -ab_x, -ab_y, &mut b_walls);
 
         // No wall to clear → freely traversable at any size.
         if a_walls.is_empty() && b_walls.is_empty() {
@@ -1925,7 +1906,7 @@ impl CDT {
         if ab_len2 < 1e-20 {
             return 0.0; // degenerate portal
         }
-        max_radius_search(a_walls, b_walls, ab_len2)
+        max_radius_search(&a_walls, &b_walls, ab_len2)
     }
 
     // -----------------------------------------------------------------------
@@ -2066,27 +2047,7 @@ impl CDT {
     /// pathfinders only see portals via `for_each_neighbor`, which filters
     /// constrained edges).
     pub fn compute_widths(&mut self) {
-        let num_he = self.half_edges.len() as u32;
-        let (offsets, vwalls) = self.collect_vertex_walls();
-        let mut radii = vec![0.0f32; num_he as usize];
-        let mut a_walls = Vec::new();
-        let mut b_walls = Vec::new();
-        for he in 0..num_he {
-            if self.he_constrained[he as usize] {
-                continue;
-            }
-            let twin = self.half_edges[he as usize].twin;
-            // Crossing width is a property of the edge, not the direction:
-            // the twin (already computed) has the same value.
-            if twin != NONE && twin < he {
-                radii[he as usize] = radii[twin as usize];
-            } else {
-                radii[he as usize] =
-                    self.portal_max_radius_csr(he, &offsets, &vwalls, &mut a_walls, &mut b_walls);
-            }
-        }
-        self.edge_max_radius = radii;
-        self.width_dirty_verts.clear(); // widths now match every wall set
+        self.compute_widths_impl(None);
     }
 
     /// [`compute_widths`] for a CDT cloned from `base` (same slot and vertex
@@ -2096,61 +2057,81 @@ impl CDT {
     /// precomputed on `base`; everything else is recomputed. Call *before*
     /// [`remove_super_triangle`], which carries the table through compaction.
     pub(crate) fn compute_widths_from(&mut self, base: &CDT, cache: &mut WidthCache) {
-        cache.advance();
         debug_assert_eq!(
             base.edge_max_radius.len(),
             base.half_edges.len(),
             "base must have compute_widths() applied"
         );
-        let mut vert_dirty = vec![false; base.points.len()];
-        for &v in &self.width_dirty_verts {
-            if let Some(d) = vert_dirty.get_mut(v as usize) {
-                *d = true;
+        self.compute_widths_impl(Some((base, cache)));
+    }
+
+    /// Shared core of the two `compute_widths` variants. Without `from`, every
+    /// portal gets a fresh width search; with it, base slots and the
+    /// cross-rebuild cache are consulted first.
+    fn compute_widths_impl(&mut self, mut from: Option<(&CDT, &mut WidthCache)>) {
+        // Only indexed on the reuse path below, which requires `from`.
+        let vert_dirty: Vec<bool> = if let Some((base, cache)) = from.as_mut() {
+            debug_assert!(
+                self.super_verts[0] != NONE,
+                "incremental widths must run before remove_super_triangle"
+            );
+            cache.advance();
+            let mut dirty = vec![false; base.points.len()];
+            for &v in &self.width_dirty_verts {
+                if let Some(d) = dirty.get_mut(v as usize) {
+                    *d = true;
+                }
             }
-        }
+            dirty
+        } else {
+            Vec::new()
+        };
 
         let num_he = self.half_edges.len() as u32;
-        let base_num_he = base.half_edges.len() as u32;
         let (offsets, vwalls) = self.collect_vertex_walls();
         let mut radii = vec![0.0f32; num_he as usize];
         let mut a_walls = Vec::new();
         let mut b_walls = Vec::new();
         for he in 0..num_he {
             if self.he_constrained[he as usize] {
-                continue; // wall: stays 0.0, same as compute_widths
+                continue; // wall: stays 0.0, never crossable
             }
             let twin = self.half_edges[he as usize].twin;
+            // Crossing width is a property of the edge, not the direction:
+            // the twin (already computed) has the same value.
             if twin != NONE && twin < he {
                 radii[he as usize] = radii[twin as usize];
                 continue;
             }
-            // `he < base_num_he` plus the origin/dest match also bounds-guard
-            // `vert_dirty`: matching slots can only name base vertex ids.
-            let (a, b) = (self.origin(he), self.dest(he));
-            let reusable = he < base_num_he
-                && base.origin(he) == a
-                && base.dest(he) == b
-                && !vert_dirty[a as usize]
-                && !vert_dirty[b as usize];
-            radii[he as usize] = if reusable {
-                base.edge_max_radius[he as usize]
-            } else {
+            if let Some((base, cache)) = from.as_mut() {
+                // `he < base len` plus the origin/dest match also bounds-guard
+                // `vert_dirty`: matching slots can only name base vertex ids.
+                let (a, b) = (self.origin(he), self.dest(he));
+                let reusable = (he as usize) < base.half_edges.len()
+                    && base.origin(he) == a
+                    && base.dest(he) == b
+                    && !vert_dirty[a as usize]
+                    && !vert_dirty[b as usize];
+                if reusable {
+                    radii[he as usize] = base.edge_max_radius[he as usize];
+                    continue;
+                }
                 let key = self.portal_width_key(he, &offsets, &vwalls);
-                cache.get(key).unwrap_or_else(|| {
-                    let r = self.portal_max_radius_csr(
-                        he,
-                        &offsets,
-                        &vwalls,
-                        &mut a_walls,
-                        &mut b_walls,
-                    );
-                    cache.insert(key, r);
-                    r
-                })
-            };
+                if let Some(r) = cache.get(key) {
+                    radii[he as usize] = r;
+                    continue;
+                }
+                let r =
+                    self.portal_max_radius_csr(he, &offsets, &vwalls, &mut a_walls, &mut b_walls);
+                cache.insert(key, r);
+                radii[he as usize] = r;
+            } else {
+                radii[he as usize] =
+                    self.portal_max_radius_csr(he, &offsets, &vwalls, &mut a_walls, &mut b_walls);
+            }
         }
         self.edge_max_radius = radii;
-        self.width_dirty_verts.clear();
+        self.width_dirty_verts.clear(); // widths now match every wall set
     }
 
     /// Largest agent radius that can cross portal half-edge `he` (precomputed
