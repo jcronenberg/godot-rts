@@ -170,8 +170,8 @@ mod tests {
     use crate::astar::{AStarScratch, find_path};
     use crate::mapgen::rooms_map;
     use crate::test_utils::{
-        assert_local_delaunay, assert_navmesh_equiv, assert_valid, constrained_edge_set, load_raw,
-        vertex_set, vkey,
+        assert_local_delaunay, assert_navmesh_equiv, assert_valid, constrained_edge_set, ekey,
+        load_raw, vertex_set, vkey,
     };
 
     fn v(x: f32, y: f32) -> Vector2 {
@@ -474,6 +474,104 @@ mod tests {
             let key = if ka <= kb { (ka, kb) } else { (kb, ka) };
             assert!(edges.contains(&key), "edge {a:?}-{b:?} missing");
         }
+    }
+
+    #[test]
+    fn test_two_obstacles_sharing_vertex() {
+        let (points, constraints) = rooms_map(2, 2);
+        let n_map = points.len() as u32;
+        let mut nav = DynamicNavmesh::new(points, &constraints);
+        // Two triangles meeting at (50, 50) — the shared corner must dedupe.
+        nav.add_obstacle(Obstacle::polygon(vec![
+            v(50.0, 50.0),
+            v(30.0, 40.0),
+            v(40.0, 30.0),
+        ]));
+        nav.add_obstacle(Obstacle::polygon(vec![
+            v(50.0, 50.0),
+            v(70.0, 60.0),
+            v(60.0, 70.0),
+        ]));
+        let cdt = nav.rebuild();
+        assert_valid(cdt);
+        assert_eq!(cdt.num_vertices(), n_map + 5, "shared corner must be reused");
+        assert_local_delaunay(cdt);
+        assert_widths_match_full(cdt);
+    }
+
+    #[test]
+    fn test_obstacle_vertex_on_other_obstacle_edge() {
+        let (points, constraints) = rooms_map(2, 2);
+        let mut nav = DynamicNavmesh::new(points, &constraints);
+        nav.add_obstacle(rect(20.0, 20.0, 40.0, 40.0));
+        // Corner (40, 30) lies on the rect's right edge (40,20)-(40,40).
+        nav.add_obstacle(Obstacle::polygon(vec![
+            v(40.0, 30.0),
+            v(60.0, 25.0),
+            v(60.0, 35.0),
+        ]));
+        let cdt = nav.rebuild();
+        assert_valid(cdt);
+        let edges = constrained_edge_set(cdt);
+        for (a, b) in [
+            (v(40.0, 20.0), v(40.0, 30.0)),
+            (v(40.0, 30.0), v(40.0, 40.0)),
+        ] {
+            assert!(
+                edges.contains(&ekey(a, b)),
+                "split obstacle edge half {a:?}-{b:?} missing"
+            );
+        }
+        assert_local_delaunay(cdt);
+        assert_widths_match_full(cdt);
+    }
+
+    #[test]
+    fn test_obstacle_edges_collinear_overlap() {
+        let (points, constraints) = rooms_map(2, 2);
+        let mut nav = DynamicNavmesh::new(points, &constraints);
+        // Open segments (no closing edge): B lies inside A's collinear segment,
+        // so A splits at B's endpoints.
+        nav.add_obstacle(Obstacle {
+            points: vec![v(10.0, 50.0), v(90.0, 50.0)],
+            edges: vec![(0, 1)],
+        });
+        nav.add_obstacle(Obstacle {
+            points: vec![v(30.0, 50.0), v(60.0, 50.0)],
+            edges: vec![(0, 1)],
+        });
+        let cdt = nav.rebuild();
+        assert_valid(cdt);
+        let edges = constrained_edge_set(cdt);
+        for (a, b) in [
+            (v(10.0, 50.0), v(30.0, 50.0)),
+            (v(30.0, 50.0), v(60.0, 50.0)),
+            (v(60.0, 50.0), v(90.0, 50.0)),
+        ] {
+            assert!(edges.contains(&ekey(a, b)), "segment {a:?}-{b:?} missing");
+        }
+        assert_local_delaunay(cdt);
+        assert_widths_match_full(cdt);
+    }
+
+    #[test]
+    fn test_adjacent_obstacles_share_edge() {
+        let (points, constraints) = rooms_map(2, 2);
+        let n_map = points.len() as u32;
+        let mut nav = DynamicNavmesh::new(points, &constraints);
+        // Two rects sharing the full edge (40,20)-(40,40), constrained by both.
+        nav.add_obstacle(rect(20.0, 20.0, 40.0, 40.0));
+        nav.add_obstacle(rect(40.0, 20.0, 60.0, 40.0));
+        let cdt = nav.rebuild();
+        assert_valid(cdt);
+        assert_eq!(cdt.num_vertices(), n_map + 6, "shared corners must be reused");
+        let edges = constrained_edge_set(cdt);
+        assert!(
+            edges.contains(&ekey(v(40.0, 20.0), v(40.0, 40.0))),
+            "shared edge missing"
+        );
+        assert_local_delaunay(cdt);
+        assert_widths_match_full(cdt);
     }
 
     #[test]

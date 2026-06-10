@@ -303,9 +303,13 @@ const OBSTACLE_SCENARIOS: &[(&str, usize, &[usize])] = &[
     ("40x40", 40, &[10, 100, 500, 1000]),
 ];
 
-fn obstacle_set(cols: usize, k: usize) -> Vec<Obstacle> {
-    let mut rng = Lcg(0x0B57_AC1E ^ (cols as u64) << 32 ^ k as u64);
+fn obstacle_set_salted(cols: usize, k: usize, salt: u64) -> Vec<Obstacle> {
+    let mut rng = Lcg(0x0B57_AC1E ^ (cols as u64) << 32 ^ k as u64 ^ salt);
     (0..k).map(|s| slot_rect(cols, s, &mut rng)).collect()
+}
+
+fn obstacle_set(cols: usize, k: usize) -> Vec<Obstacle> {
+    obstacle_set_salted(cols, k, 0)
 }
 
 /// Full declarative rebuild with k live obstacles: clone base → insert points
@@ -336,6 +340,45 @@ fn bench_obstacle_rebuild(c: &mut Criterion) {
                         // Swap one obstacle out and back in: marks dirty, keeps k live.
                         nav.remove_obstacle(ids[0]);
                         ids[0] = nav.add_obstacle(obstacles[0].clone());
+                        black_box(nav.rebuild().num_faces())
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+/// Worst case for the width cache: alternate between two disjoint obstacle
+/// sets so every rebuild replaces all k obstacles and no obstacle-local portal
+/// width can be reused (the cache holds only the previous generation).
+fn bench_obstacle_rebuild_all_change(c: &mut Criterion) {
+    let mut group = c.benchmark_group("obstacles");
+    group.sample_size(10);
+
+    for &(label, cols, ks) in OBSTACLE_SCENARIOS {
+        let (points, constraints) = common::rooms_map(cols, cols);
+        for &k in ks {
+            let mut nav = DynamicNavmesh::new(points.clone(), &constraints);
+            let sets = [
+                obstacle_set_salted(cols, k, 0),
+                obstacle_set_salted(cols, k, 0x5A17),
+            ];
+            let mut ids: Vec<_> = sets[0].iter().map(|o| nav.add_obstacle(o.clone())).collect();
+            nav.rebuild();
+            let mut flip = 1usize;
+
+            group.bench_with_input(
+                BenchmarkId::new(format!("rebuild_all_change/{label}"), k),
+                &k,
+                |b, _| {
+                    b.iter(|| {
+                        for id in ids.drain(..) {
+                            nav.remove_obstacle(id);
+                        }
+                        ids.extend(sets[flip].iter().map(|o| nav.add_obstacle(o.clone())));
+                        flip ^= 1;
                         black_box(nav.rebuild().num_faces())
                     });
                 },
@@ -510,6 +553,7 @@ criterion_group!(
     bench_compute_widths,
     bench_insert_constraints,
     bench_obstacle_rebuild,
+    bench_obstacle_rebuild_all_change,
     bench_obstacle_rebuild_with_abstraction,
     bench_obstacle_stages,
 );

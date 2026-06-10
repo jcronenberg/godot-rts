@@ -106,7 +106,7 @@ pub(crate) mod test_utils {
         (p.x.to_bits(), p.y.to_bits())
     }
 
-    fn ekey(a: Vector2, b: Vector2) -> (VKey, VKey) {
+    pub(crate) fn ekey(a: Vector2, b: Vector2) -> (VKey, VKey) {
         let (ka, kb) = (vkey(a), vkey(b));
         if ka <= kb { (ka, kb) } else { (kb, ka) }
     }
