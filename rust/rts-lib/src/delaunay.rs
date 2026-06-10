@@ -1028,6 +1028,8 @@ impl CDT {
                 continue;
             }
             if self.he_constrained[he as usize] {
+                // Debug-only: conflicting input is rejected silently in release.
+                #[cfg(debug_assertions)]
                 godot_error!(
                     "Cannot insert constraint ({}-{}): it intersects existing constraint ({}-{})",
                     v0,
@@ -1086,6 +1088,7 @@ impl CDT {
 
         // Mark the constraint edge
         let Some(constraint_he) = self.find_half_edge(v0, v1) else {
+            #[cfg(debug_assertions)]
             godot_error!(
                 "Failed to insert constraint ({}-{}): edge not found after flipping",
                 v0,
