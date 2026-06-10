@@ -102,6 +102,10 @@ pub struct CDT {
     /// Globally-unique token identifying this triangulation's current geometry.
     /// Bumped on every structural mutation so external caches can detect changes.
     version: u64,
+    /// Vertex ids of the super-triangle, valid until `remove_super_triangle`.
+    /// Stored explicitly because post-build `insert_point` calls append vertices
+    /// after them, so they are not necessarily the last 3 points.
+    super_verts: [u32; 3],
 }
 
 /// Face index for a half-edge.
@@ -130,7 +134,7 @@ fn orient2d(a: Vector2, b: Vector2, c: Vector2) -> f32 {
 
 /// Returns true if `p` is strictly inside the circumcircle of triangle (a, b, c),
 /// for either winding. Orders the triangle CCW, then defers to the winding-free test.
-fn in_circumcircle(a: Vector2, b: Vector2, c: Vector2, p: Vector2) -> bool {
+pub(crate) fn in_circumcircle(a: Vector2, b: Vector2, c: Vector2, p: Vector2) -> bool {
     if orient2d(a, b, c) < 0.0 {
         in_circumcircle_ccw(a, c, b, p)
     } else {
@@ -233,7 +237,7 @@ fn segments_intersect_proper(a: Vector2, b: Vector2, c: Vector2, d: Vector2) -> 
 
 #[cfg(debug_assertions)]
 impl CDT {
-    fn assert_dcel_valid(&self) {
+    pub(crate) fn assert_dcel_valid(&self) {
         assert!(
             self.half_edges.len().is_multiple_of(3),
             "half_edges length must be multiple of 3"
@@ -368,6 +372,7 @@ impl CDT {
             grid_cell_size: Vector2::ZERO,
             edge_max_radius: Vec::new(),
             version: next_cdt_version(),
+            super_verts: [sv0, sv1, sv2],
         };
 
         // Face 0: the super-triangle (CCW)
@@ -795,72 +800,7 @@ impl CDT {
         let mut last_face: u32 = 0;
 
         for i in 0..n as u32 {
-            let pt = cdt.points[i as usize];
-
-            // Locate containing face
-            let f = cdt.locate_containing_face(pt, last_face);
-
-            // Check if point is on an edge of the face
-            let base = f * 3;
-            let mut on_edge: Option<u32> = None;
-            for j in 0..3u32 {
-                let he = base + j;
-                let a = cdt.point(cdt.origin(he));
-                let b = cdt.point(cdt.dest(he));
-                let o = orient2d(a, b, pt).abs();
-                let edge_len = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
-                if o < edge_len * 1e-5 && edge_len > 1e-10 {
-                    // Check pt is actually between a and b
-                    let t = if (b.x - a.x).abs() > (b.y - a.y).abs() {
-                        (pt.x - a.x) / (b.x - a.x)
-                    } else {
-                        (pt.y - a.y) / (b.y - a.y)
-                    };
-                    if t > 1e-4 && t < 1.0 - 1e-4 {
-                        on_edge = Some(he);
-                        break;
-                    }
-                }
-            }
-
-            if let Some(he) = on_edge {
-                // Save f2_base BEFORE split (twin changes during split)
-                let f1_base = face_of(he) * 3;
-                let f2_base = face_of(cdt.half_edges[he as usize].twin) * 3;
-
-                cdt.split_edge_4(he, i);
-
-                // After split_edge_4:
-                // T1 at f1_base: C->A, A->V, V->C — legalize C->A (f1_base)
-                // T3 at f2_base: D->B, B->V, V->D — legalize D->B (f2_base)
-                // T2 at t2_base: C->V, V->B, B->C — legalize B->C (t2_base+2)
-                // T4 at t4_base: D->V, V->A, A->D — legalize A->D (t4_base+2)
-                let num_he = cdt.half_edges.len() as u32;
-                let t2_base = num_he - 6;
-                let t4_base = num_he - 3;
-
-                cdt.legalize(f1_base, i);
-                cdt.legalize(f2_base, i);
-                cdt.legalize(t2_base + 2, i);
-                cdt.legalize(t4_base + 2, i);
-            } else {
-                // Point inside face: split into 3
-                cdt.split_face_3(f, i);
-
-                // Legalize the 3 outer edges (the original edges of face f)
-                let base = f * 3;
-                // After split_face_3:
-                // Face f reused: (v0,v1,v) — outer edge is he0 (v0->v1)
-                let a_base = cdt.half_edges.len() as u32 - 6;
-                let b_base = cdt.half_edges.len() as u32 - 3;
-                // Face A: (v1,v2,v) — outer edge is a_base (v1->v2)
-                // Face B: (v2,v0,v) — outer edge is b_base (v2->v0)
-
-                cdt.legalize(base, i);
-                cdt.legalize(a_base, i);
-                cdt.legalize(b_base, i);
-            }
-
+            let f = cdt.insert_vertex(i, last_face);
             last_face = f.min((cdt.half_edges.len() as u32 / 3).saturating_sub(1));
         }
 
@@ -868,6 +808,125 @@ impl CDT {
         cdt.assert_dcel_valid();
 
         cdt
+    }
+
+    /// Insert the already-stored vertex `i` into the triangulation, starting
+    /// the locate walk at `hint_face`. Returns the face the locate ended in
+    /// (callers use it as the next hint).
+    fn insert_vertex(&mut self, i: u32, hint_face: u32) -> u32 {
+        let pt = self.points[i as usize];
+
+        // Locate containing face
+        let f = self.locate_containing_face(pt, hint_face);
+
+        // Check if point is on an edge of the face
+        let base = f * 3;
+        let mut on_edge: Option<u32> = None;
+        for j in 0..3u32 {
+            let he = base + j;
+            let a = self.point(self.origin(he));
+            let b = self.point(self.dest(he));
+            let o = orient2d(a, b, pt).abs();
+            let edge_len = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+            if o < edge_len * 1e-5 && edge_len > 1e-10 {
+                // Check pt is actually between a and b
+                let t = if (b.x - a.x).abs() > (b.y - a.y).abs() {
+                    (pt.x - a.x) / (b.x - a.x)
+                } else {
+                    (pt.y - a.y) / (b.y - a.y)
+                };
+                if t > 1e-4 && t < 1.0 - 1e-4 {
+                    on_edge = Some(he);
+                    break;
+                }
+            }
+        }
+
+        if let Some(he) = on_edge {
+            // Save f2_base BEFORE split (twin changes during split)
+            let f1_base = face_of(he) * 3;
+            let f2_base = face_of(self.half_edges[he as usize].twin) * 3;
+
+            self.split_edge_4(he, i);
+
+            // After split_edge_4:
+            // T1 at f1_base: C->A, A->V, V->C — legalize C->A (f1_base)
+            // T3 at f2_base: D->B, B->V, V->D — legalize D->B (f2_base)
+            // T2 at t2_base: C->V, V->B, B->C — legalize B->C (t2_base+2)
+            // T4 at t4_base: D->V, V->A, A->D — legalize A->D (t4_base+2)
+            let num_he = self.half_edges.len() as u32;
+            let t2_base = num_he - 6;
+            let t4_base = num_he - 3;
+
+            self.legalize(f1_base, i);
+            self.legalize(f2_base, i);
+            self.legalize(t2_base + 2, i);
+            self.legalize(t4_base + 2, i);
+        } else {
+            // Point inside face: split into 3
+            self.split_face_3(f, i);
+
+            // Legalize the 3 outer edges (the original edges of face f)
+            let base = f * 3;
+            // After split_face_3:
+            // Face f reused: (v0,v1,v) — outer edge is he0 (v0->v1)
+            let a_base = self.half_edges.len() as u32 - 6;
+            let b_base = self.half_edges.len() as u32 - 3;
+            // Face A: (v1,v2,v) — outer edge is a_base (v1->v2)
+            // Face B: (v2,v0,v) — outer edge is b_base (v2->v0)
+
+            self.legalize(base, i);
+            self.legalize(a_base, i);
+            self.legalize(b_base, i);
+        }
+
+        f
+    }
+
+    /// Insert point `p` into a built triangulation (super-triangle still
+    /// present), starting the locate walk at `hint_face`. Returns the new
+    /// vertex id — or the existing id if `p` coincides with a vertex of the
+    /// containing face or a neighbor apex (within the same relative ε as the
+    /// on-edge test).
+    pub fn insert_point(&mut self, p: Vector2, hint_face: u32) -> u32 {
+        let f = self.locate_containing_face(p, hint_face);
+
+        // Duplicate check against the containing face's corners and the
+        // neighbor apexes (the ε-ball around p can cross an edge of f)
+        let base = f * 3;
+        for j in 0..3u32 {
+            let he = base + j;
+            let a = self.point(self.origin(he));
+            let b = self.point(self.dest(he));
+            let edge_len = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+            let eps = (edge_len * 1e-4).max(1e-12);
+            let twin = self.half_edges[he as usize].twin;
+            let apex = if twin != NONE { self.dest(next(twin)) } else { NONE };
+            for v in [self.origin(he), apex] {
+                if v == NONE {
+                    continue;
+                }
+                let q = self.point(v);
+                let d2 = (p.x - q.x).powi(2) + (p.y - q.y).powi(2);
+                if d2 <= eps * eps {
+                    return v;
+                }
+            }
+        }
+
+        self.version = next_cdt_version();
+        self.grid_cells.clear();
+
+        let i = self.points.len() as u32;
+        self.points.push(p);
+        self.vertex_half_edge.push(NONE);
+        self.insert_vertex(i, f);
+        i
+    }
+
+    /// Some face incident to vertex `v` — a valid locate hint near `v`.
+    pub fn face_of_vertex(&self, v: u32) -> u32 {
+        face_of(self.vertex_half_edge[v as usize])
     }
 
     /// Find the half-edge from vertex `v0` to vertex `v1`, if it exists.
@@ -902,34 +961,19 @@ impl CDT {
         let p0 = self.point(v0);
         let p1 = self.point(v1);
 
-        // Check if any vertex lies strictly between v0 and v1 on the segment.
-        // If so, split the constraint at the closest such vertex and recurse.
-        {
-            let dx = p1.x - p0.x;
-            let dy = p1.y - p0.y;
-            let len_sq = dx * dx + dy * dy;
-            let mut best: Option<(u32, f32)> = None; // (vertex, parametric t)
-            for vi in 0..self.points.len() as u32 {
-                if vi == v0 || vi == v1 {
-                    continue;
-                }
-                let pi = self.point(vi);
-                // Check collinearity
-                if orient2d(p0, p1, pi).abs() > 1e-4 {
-                    continue;
-                }
-                // Parametric t along p0→p1
-                let t = ((pi.x - p0.x) * dx + (pi.y - p0.y) * dy) / len_sq;
-                if t > 1e-6 && t < 1.0 - 1e-6 && (best.is_none() || t < best.unwrap().1) {
-                    best = Some((vi, t));
-                }
+        // A vertex lying on the open segment splits the constraint in two.
+        // Detected during the crossing walk (the segment shows up as
+        // orient2d ≈ 0 on a fan/face vertex), not via a scan over all points.
+        let seg_dx = p1.x - p0.x;
+        let seg_dy = p1.y - p0.y;
+        let seg_len_sq = seg_dx * seg_dx + seg_dy * seg_dy;
+        let on_segment = |pi: Vector2| -> bool {
+            if orient2d(p0, p1, pi).abs() > 1e-4 {
+                return false;
             }
-            if let Some((v_mid, _)) = best {
-                self.insert_constraint(v0, v_mid);
-                self.insert_constraint(v_mid, v1);
-                return;
-            }
-        }
+            let t = ((pi.x - p0.x) * seg_dx + (pi.y - p0.y) * seg_dy) / seg_len_sq;
+            t > 1e-6 && t < 1.0 - 1e-6
+        };
 
         // Collect crossing edges
         let mut crossing: Vec<u32> = Vec::new();
@@ -939,8 +983,15 @@ impl CDT {
         // `for_outgoing_he` sweeps v0's whole fan (both directions on a boundary).
         assert!(self.vertex_half_edge[v0 as usize] != NONE);
         let mut exit_he: Option<u32> = None;
+        let mut split_at: Option<u32> = None;
         self.for_outgoing_he(v0, |he| {
-            if exit_he.is_some() {
+            if exit_he.is_some() || split_at.is_some() {
+                return;
+            }
+            // Segment passes exactly through a neighbor of v0.
+            let dest = self.dest(he);
+            if dest != v1 && on_segment(self.point(dest)) {
+                split_at = Some(dest);
                 return;
             }
             let n = next(he);
@@ -955,6 +1006,12 @@ impl CDT {
                 }
             }
         });
+
+        if let Some(v_mid) = split_at {
+            self.insert_constraint(v0, v_mid);
+            self.insert_constraint(v_mid, v1);
+            return;
+        }
 
         let Some(first_crossing) = exit_he else {
             return;
@@ -980,7 +1037,22 @@ impl CDT {
                 break; // Reached destination
             }
 
+            // Segment passes exactly through the apex of the entered face
+            // (the vertex not on the entry edge): split the constraint there.
+            let entry_org = self.origin(twin);
+            let entry_dest = self.dest(twin);
+            let apex = [fv0, fv1, fv2]
+                .into_iter()
+                .find(|&fv| fv != entry_org && fv != entry_dest)
+                .unwrap();
+            if on_segment(self.point(apex)) {
+                self.insert_constraint(v0, apex);
+                self.insert_constraint(apex, v1);
+                return;
+            }
+
             // Find which of the other two edges of this face the segment crosses
+            let mut advanced = false;
             for j in 0..3u32 {
                 let he = f_base + j;
                 if he == twin {
@@ -990,8 +1062,12 @@ impl CDT {
                 let eb = self.point(self.dest(he));
                 if segments_intersect_proper(p0, p1, ea, eb) {
                     crossing.push(he);
+                    advanced = true;
                     break;
                 }
+            }
+            if !advanced {
+                break; // numerically stuck; bail out and let the flip phase report
             }
         }
 
@@ -1144,11 +1220,14 @@ impl CDT {
     }
 
     /// Remove super-triangle faces and compact the DCEL arrays.
+    ///
+    /// The super vertices may sit anywhere in the points array (post-build
+    /// `insert_point` appends after them), so they are removed by swapping
+    /// with the tail and remapping the moved vertex ids.
     pub fn remove_super_triangle(&mut self) {
         self.version = next_cdt_version(); // face indices change after compaction
         self.grid_cells.clear(); // face indices change after compaction
-        let n = self.points.len() as u32 - 3; // number of real vertices
-        let sv0 = n;
+        let [s0, s1, s2] = self.super_verts;
 
         let num_faces = self.half_edges.len() as u32 / 3;
 
@@ -1159,9 +1238,30 @@ impl CDT {
             let v0 = self.origin(base);
             let v1 = self.origin(base + 1);
             let v2 = self.origin(base + 2);
-            let touches_super = v0 >= sv0 || v1 >= sv0 || v2 >= sv0;
+            let touches_super = [v0, v1, v2].iter().any(|&v| v == s0 || v == s1 || v == s2);
             face_alive[f as usize] = !touches_super;
         }
+
+        // Compact points: swap each super vertex with the tail, in descending
+        // index order. A vertex moved into one super slot can become the tail
+        // again later, so track slot occupants to chain the remap correctly.
+        let mut vmap: Vec<u32> = (0..self.points.len() as u32).collect();
+        let mut occupant: Vec<u32> = (0..self.points.len() as u32).collect();
+        let mut svs = [s0, s1, s2];
+        svs.sort_unstable();
+        for &sv in svs.iter().rev() {
+            let last = self.points.len() as u32 - 1;
+            self.points.swap_remove(sv as usize);
+            if sv != last {
+                let moved = occupant[last as usize];
+                occupant[sv as usize] = moved;
+                vmap[moved as usize] = sv;
+            }
+        }
+        for &sv in &svs {
+            vmap[sv as usize] = NONE;
+        }
+        let n = self.points.len() as u32;
 
         // Build old->new half-edge index mapping
         let mut he_remap = vec![NONE; self.half_edges.len()];
@@ -1191,21 +1291,26 @@ impl CDT {
                     NONE
                 };
                 new_half_edges.push(HalfEdge {
-                    origin: he.origin,
+                    origin: vmap[he.origin as usize],
                     twin: new_twin,
                 });
                 new_he_constrained.push(self.he_constrained[old_idx]);
             }
         }
 
-        // Remap vertex_half_edge
+        // Remap vertex_half_edge through both the vertex and half-edge maps
         let mut new_vhe = vec![NONE; n as usize];
-        for v in 0..n {
-            let old = self.vertex_half_edge[v as usize];
-            if old != NONE && (old as usize) < he_remap.len() {
-                new_vhe[v as usize] = he_remap[old as usize];
+        for (old_v, &old_he) in self.vertex_half_edge.iter().enumerate() {
+            let nv = vmap[old_v];
+            if nv == NONE {
+                continue;
             }
-            // If the mapped value is NONE, find any valid outgoing half-edge
+            if old_he != NONE && (old_he as usize) < he_remap.len() {
+                new_vhe[nv as usize] = he_remap[old_he as usize];
+            }
+        }
+        // Entries whose half-edge died with a super face: find any outgoing edge
+        for v in 0..n {
             if new_vhe[v as usize] == NONE {
                 for (i, he) in new_half_edges.iter().enumerate() {
                     if he.origin == v {
@@ -1219,7 +1324,6 @@ impl CDT {
         self.half_edges = new_half_edges;
         self.he_constrained = new_he_constrained;
         self.vertex_half_edge = new_vhe;
-        self.points.truncate(n as usize);
     }
 
     /// Number of faces (triangles) in the triangulation.
@@ -1452,6 +1556,23 @@ impl CDT {
             vertices.push(self.point(v2));
         }
         vertices
+    }
+
+    /// Endpoint pairs of all constrained edges (each edge once) for rendering.
+    pub fn get_constrained_edge_vertices(&self) -> PackedVector2Array {
+        let mut segments = PackedVector2Array::new();
+        for he in 0..self.half_edges.len() as u32 {
+            if !self.he_constrained[he as usize] {
+                continue;
+            }
+            let twin = self.half_edges[he as usize].twin;
+            if twin != NONE && twin < he {
+                continue;
+            }
+            segments.push(self.point(self.origin(he)));
+            segments.push(self.point(self.origin(next(he))));
+        }
+        segments
     }
 
     /// Access the points array.
@@ -2651,6 +2772,83 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn test_insert_point_after_build_then_remove_super() {
+        let points: Vec<Vector2> = (0..5)
+            .flat_map(|y| (0..5).map(move |x| Vector2::new(x as f32, y as f32)))
+            .collect();
+        let mut cdt = CDT::from_points(points);
+        let extras = [
+            Vector2::new(1.5, 2.3),
+            Vector2::new(3.2, 0.4),
+            Vector2::new(0.5, 3.6),
+        ];
+        for &p in &extras {
+            let v = cdt.insert_point(p, 0);
+            assert_eq!(cdt.points()[v as usize], p);
+        }
+        cdt.remove_super_triangle();
+
+        assert_eq!(cdt.num_vertices(), 28);
+        crate::test_utils::assert_valid(&cdt);
+        let vs = crate::test_utils::vertex_set(&cdt);
+        for &p in &extras {
+            assert!(vs.contains(&crate::test_utils::vkey(p)));
+        }
+        crate::test_utils::assert_local_delaunay(&cdt);
+    }
+
+    #[test]
+    fn test_insert_point_equals_from_points() {
+        let points = crate::mapgen::random_points(60, 7);
+        let mut full = CDT::from_points(points.clone());
+        full.remove_super_triangle();
+
+        let mut inc = CDT::from_points(points[..30].to_vec());
+        for &p in &points[30..] {
+            inc.insert_point(p, 0);
+        }
+        inc.remove_super_triangle();
+
+        crate::test_utils::assert_navmesh_equiv(&full, &inc);
+    }
+
+    #[test]
+    fn test_insert_point_duplicate_returns_existing() {
+        let points = vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(1.0, 0.0),
+            Vector2::new(1.0, 1.0),
+            Vector2::new(0.0, 1.0),
+        ];
+        let mut cdt = CDT::from_points(points);
+        let nv = cdt.num_vertices();
+        let nf = cdt.num_faces();
+        let v = cdt.insert_point(Vector2::new(1.0, 0.0), 0);
+        assert_eq!(v, 1, "coincident insert must return the existing id");
+        assert_eq!(cdt.num_vertices(), nv, "no vertex added");
+        assert_eq!(cdt.num_faces(), nf, "triangulation untouched");
+    }
+
+    #[test]
+    fn test_insert_point_near_duplicate_in_neighbor_face() {
+        // p lands inside face ABC but is ε-coincident with D, the apex of
+        // the neighbor across constrained AB — must return D's id instead
+        // of inserting a near-duplicate.
+        let points = vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(100.0, 0.0),
+            Vector2::new(50.0, 50.0),
+            Vector2::new(50.0, -1e-4),
+        ];
+        let mut cdt = CDT::from_points(points);
+        cdt.insert_constraint(0, 1);
+        let nv = cdt.num_vertices();
+        let v = cdt.insert_point(Vector2::new(50.0, 1e-5), 0);
+        assert_eq!(v, 3, "must return the ε-coincident neighbor apex");
+        assert_eq!(cdt.num_vertices(), nv, "no vertex added");
     }
 
     #[test]

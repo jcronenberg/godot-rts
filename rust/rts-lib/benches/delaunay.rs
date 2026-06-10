@@ -1,7 +1,9 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use godot::prelude::*;
 
+use rts_lib::abstraction::Abstraction;
 use rts_lib::delaunay::CDT;
+use rts_lib::navmesh::{DynamicNavmesh, Obstacle};
 
 mod common;
 
@@ -257,6 +259,245 @@ fn bench_insert_constraints(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic obstacle rebuild benches
+// ---------------------------------------------------------------------------
+
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+    fn range(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + (hi - lo) * (self.next() % 10001) as f32 / 10000.0
+    }
+}
+
+/// Random rect in a quadrant of a [`common::rooms_map`] room. Each slot owns
+/// one 50x50 quadrant, so obstacles never overlap or touch walls.
+fn slot_rect(cols: usize, slot: usize, rng: &mut Lcg) -> Obstacle {
+    let room = slot / 4;
+    let q = slot % 4;
+    let qx = (room % cols) as f32 * 100.0 + (q % 2) as f32 * 50.0;
+    let qy = (room / cols) as f32 * 100.0 + (q / 2) as f32 * 50.0;
+    let x0 = rng.range(qx + 8.0, qx + 25.0);
+    let y0 = rng.range(qy + 8.0, qy + 25.0);
+    let w = rng.range(5.0, 17.0);
+    let h = rng.range(5.0, 17.0);
+    Obstacle::polygon(vec![
+        Vector2::new(x0, y0),
+        Vector2::new(x0 + w, y0),
+        Vector2::new(x0 + w, y0 + h),
+        Vector2::new(x0, y0 + h),
+    ])
+}
+
+/// (map label, room grid size, obstacle counts) — k is capped at 4 per room.
+const OBSTACLE_SCENARIOS: &[(&str, usize, &[usize])] = &[
+    ("10x10", 10, &[10, 100]),
+    ("20x20", 20, &[10, 100, 500, 1000]),
+    ("40x40", 40, &[10, 100, 500, 1000]),
+];
+
+fn obstacle_set(cols: usize, k: usize) -> Vec<Obstacle> {
+    let mut rng = Lcg(0x0B57_AC1E ^ (cols as u64) << 32 ^ k as u64);
+    (0..k).map(|s| slot_rect(cols, s, &mut rng)).collect()
+}
+
+/// Full declarative rebuild with k live obstacles: clone base → insert points
+/// and constraints → super removal → grid index → widths. One iteration is
+/// also the cost of a single obstacle change while k obstacles are live (the
+/// `delta` signal from the plan): removal is "not re-inserting", so any change
+/// triggers exactly this rebuild.
+fn bench_obstacle_rebuild(c: &mut Criterion) {
+    let mut group = c.benchmark_group("obstacles");
+    group.sample_size(10);
+
+    for &(label, cols, ks) in OBSTACLE_SCENARIOS {
+        let (points, constraints) = common::rooms_map(cols, cols);
+        for &k in ks {
+            let mut nav = DynamicNavmesh::new(points.clone(), &constraints);
+            let obstacles = obstacle_set(cols, k);
+            let mut ids: Vec<_> = obstacles
+                .iter()
+                .map(|o| nav.add_obstacle(o.clone()))
+                .collect();
+            nav.rebuild();
+
+            group.bench_with_input(
+                BenchmarkId::new(format!("rebuild/{label}"), k),
+                &k,
+                |b, _| {
+                    b.iter(|| {
+                        // Swap one obstacle out and back in: marks dirty, keeps k live.
+                        nav.remove_obstacle(ids[0]);
+                        ids[0] = nav.add_obstacle(obstacles[0].clone());
+                        black_box(nav.rebuild().num_faces())
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+/// Rebuild plus abstraction rebuild — the end-to-end cost when TRA* is in use.
+fn bench_obstacle_rebuild_with_abstraction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("obstacles");
+    group.sample_size(10);
+
+    for &(label, cols, ks) in OBSTACLE_SCENARIOS {
+        let (points, constraints) = common::rooms_map(cols, cols);
+        for &k in ks {
+            let mut nav = DynamicNavmesh::new(points.clone(), &constraints);
+            let obstacles = obstacle_set(cols, k);
+            let mut ids: Vec<_> = obstacles
+                .iter()
+                .map(|o| nav.add_obstacle(o.clone()))
+                .collect();
+            nav.rebuild();
+
+            group.bench_with_input(
+                BenchmarkId::new(format!("rebuild_with_abstraction/{label}"), k),
+                &k,
+                |b, _| {
+                    b.iter(|| {
+                        nav.remove_obstacle(ids[0]);
+                        ids[0] = nav.add_obstacle(obstacles[0].clone());
+                        let cdt = nav.rebuild();
+                        black_box(Abstraction::build(cdt))
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+/// Stage breakdown of the rebuild pipeline (representative 20x20 map) to
+/// direct the optimization pass. Each stage's setup replays the prior stages
+/// untimed; obstacle geometry is replicated via the same public CDT calls
+/// `DynamicNavmesh::rebuild` uses.
+fn bench_obstacle_stages(c: &mut Criterion) {
+    let mut group = c.benchmark_group("obstacles");
+    group.sample_size(10);
+
+    let cols = 20;
+    let (points, constraints) = common::rooms_map(cols, cols);
+    let mut base = CDT::from_points(points);
+    for &(a, b) in &constraints {
+        base.insert_constraint(a, b);
+    }
+
+    let insert_points = |cdt: &mut CDT, obstacles: &[Obstacle]| -> Vec<Vec<u32>> {
+        let mut hint = 0;
+        obstacles
+            .iter()
+            .map(|obs| {
+                obs.points
+                    .iter()
+                    .map(|&p| {
+                        let v = cdt.insert_point(p, hint);
+                        hint = cdt.face_of_vertex(v);
+                        v
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let insert_constraints = |cdt: &mut CDT, obstacles: &[Obstacle], ids: &[Vec<u32>]| {
+        for (obs, vs) in obstacles.iter().zip(ids) {
+            for &(a, b) in &obs.edges {
+                cdt.insert_constraint(vs[a as usize], vs[b as usize]);
+            }
+        }
+    };
+
+    for &k in &[100usize, 1000] {
+        let obstacles = obstacle_set(cols, k);
+
+        group.bench_with_input(BenchmarkId::new("stage/clone/20x20", k), &k, |b, _| {
+            b.iter(|| black_box(base.clone()));
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("stage/insert_points/20x20", k),
+            &k,
+            |b, _| {
+                b.iter_batched(
+                    || base.clone(),
+                    |mut cdt| {
+                        black_box(insert_points(&mut cdt, &obstacles));
+                        cdt
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("stage/insert_constraints/20x20", k),
+            &k,
+            |b, _| {
+                b.iter_batched(
+                    || {
+                        let mut cdt = base.clone();
+                        let ids = insert_points(&mut cdt, &obstacles);
+                        (cdt, ids)
+                    },
+                    |(mut cdt, ids)| {
+                        insert_constraints(&mut cdt, &obstacles, &ids);
+                        cdt
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        let constrained = || {
+            let mut cdt = base.clone();
+            let ids = insert_points(&mut cdt, &obstacles);
+            insert_constraints(&mut cdt, &obstacles, &ids);
+            cdt
+        };
+
+        group.bench_with_input(
+            BenchmarkId::new("stage/remove_super/20x20", k),
+            &k,
+            |b, _| {
+                b.iter_batched(
+                    constrained,
+                    |mut cdt| {
+                        cdt.remove_super_triangle();
+                        cdt
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        let mut removed = constrained();
+        removed.remove_super_triangle();
+
+        group.bench_with_input(BenchmarkId::new("stage/grid/20x20", k), &k, |b, _| {
+            b.iter(|| removed.build_grid_index());
+        });
+
+        removed.build_grid_index();
+        group.bench_with_input(BenchmarkId::new("stage/widths/20x20", k), &k, |b, _| {
+            b.iter(|| removed.compute_widths());
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_random_points,
@@ -268,6 +509,9 @@ criterion_group!(
     bench_graph_traversal,
     bench_compute_widths,
     bench_insert_constraints,
+    bench_obstacle_rebuild,
+    bench_obstacle_rebuild_with_abstraction,
+    bench_obstacle_stages,
 );
 
 criterion_main!(benches);

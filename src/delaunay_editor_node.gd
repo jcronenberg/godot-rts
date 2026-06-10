@@ -25,12 +25,38 @@ const POINT_RADIUS: float = 2.0
 		constraints = value
 		triangulate()
 
-var _triangles: Array[PackedInt32Array] = []
+var _triangle_soup: PackedVector2Array = []  # 3 vertices per face
+var _constrained_edges: PackedVector2Array = []  # Segment soup, 2 vertices per edge
+var _mesh_vertices: PackedVector2Array = []  # Unique vertices, including inserted obstacle ones
 var _triangulator: DelaunayTriangulator = DelaunayTriangulator.new()
 var _pending_constraint_start: int = -1  # User adding constraint tracking
 var _mouse_pos: Vector2 = Vector2.ZERO
 var _save_dialog: EditorFileDialog = null
 var _load_dialog: EditorFileDialog = null
+var _top_layer: TopLayer = null
+
+
+# Constrained edges and points draw at z 2 so game overlays (e.g. buildings
+# at z 1) can slot between them and the floor/mesh at z 0.
+class TopLayer:
+	extends Node2D
+	var editor: DelaunayEditorNode
+
+	func _draw() -> void:
+		editor._draw_top(self)
+
+
+func _ready() -> void:
+	_top_layer = TopLayer.new()
+	_top_layer.editor = self
+	_top_layer.z_index = 2
+	add_child(_top_layer, false, Node.INTERNAL_MODE_BACK)
+
+
+func _request_redraw() -> void:
+	queue_redraw()
+	if _top_layer:
+		_top_layer.queue_redraw()
 
 
 func _exit_tree() -> void:
@@ -60,12 +86,12 @@ func find_nearest_point(pos: Vector2) -> int:
 
 func update_mouse_pos() -> void:
 	_mouse_pos = vp_to_local()
-	queue_redraw()
+	_request_redraw()
 
 
 func handle_add_click() -> void:
 	points.append(vp_to_local())
-	queue_redraw()
+	_request_redraw()
 
 
 func handle_constraint_click() -> void:
@@ -89,16 +115,16 @@ func handle_constraint_click() -> void:
 			):
 				constraints.remove_at(i + 1)
 				constraints.remove_at(i)
-				queue_redraw()
+				_request_redraw()
 				return
 		constraints.append(a)
 		constraints.append(b)
-		queue_redraw()
+		_request_redraw()
 
 
 func move_point(idx: int, pos: Vector2) -> void:
 	points[idx] = pos
-	queue_redraw()
+	_request_redraw()
 
 
 func erase_point(idx: int) -> void:
@@ -119,28 +145,57 @@ func erase_point(idx: int) -> void:
 	elif _pending_constraint_start > idx:
 		_pending_constraint_start -= 1
 
-	_triangles.clear()
-	queue_redraw()
+	_clear_mesh()
+	_request_redraw()
 
 
 func triangulate() -> void:
 	if points.size() < 3:
-		_triangles.clear()
-		queue_redraw()
+		_clear_mesh()
+		_request_redraw()
 		return
 	_triangulator.set_points(points)
 	_triangulator.set_constraints(constraints)
 	_triangulator.triangulate()
-	_triangles = _triangulator.get_indices()
-	queue_redraw()
+	refresh_mesh()
+
+
+func refresh_mesh() -> void:
+	_triangle_soup = _triangulator.get_mesh_vertices()
+	_constrained_edges = _triangulator.get_constrained_edges()
+	_mesh_vertices = _triangulator.get_points()
+	_request_redraw()
+
+
+func _clear_mesh() -> void:
+	_triangle_soup.clear()
+	_constrained_edges.clear()
+	_mesh_vertices.clear()
+
+
+## Insert a closed-polygon obstacle; returns its id (-1 on error).
+func add_obstacle(polygon: PackedVector2Array) -> int:
+	var id: int = _triangulator.add_obstacle(polygon)
+	if id != -1:
+		refresh_mesh()
+	return id
+
+
+func remove_obstacle(id: int) -> void:
+	_triangulator.remove_obstacle(id)
+	refresh_mesh()
+
+
+func find_path(start: Vector2, goal: Vector2, radius: float) -> PackedVector2Array:
+	return _triangulator.find_path(start, goal, radius)
 
 
 func clear_all() -> void:
 	points.clear()
 	constraints.clear()
-	_triangles.clear()
+	_clear_mesh()
 	_pending_constraint_start = -1
-	queue_redraw()
+	_request_redraw()
 
 
 func _save_to_json() -> void:
@@ -201,23 +256,26 @@ func _on_load_file_selected(path: String) -> void:
 
 func _draw() -> void:
 	# Floor fill
-	for tri in _triangles:
-		var verts := PackedVector2Array([points[tri[0]], points[tri[1]], points[tri[2]]])
-		draw_polygon(verts, PackedColorArray([floor_color]))
+	for base in range(0, _triangle_soup.size(), 3):
+		draw_polygon(_triangle_soup.slice(base, base + 3), PackedColorArray([floor_color]))
 
 	# Edges
-	for tri in _triangles:
-		draw_line(points[tri[0]], points[tri[1]], edge_color, 1.0)
-		draw_line(points[tri[1]], points[tri[2]], edge_color, 1.0)
-		draw_line(points[tri[2]], points[tri[0]], edge_color, 1.0)
+	for base in range(0, _triangle_soup.size(), 3):
+		draw_line(_triangle_soup[base], _triangle_soup[base + 1], edge_color, 1.0)
+		draw_line(_triangle_soup[base + 1], _triangle_soup[base + 2], edge_color, 1.0)
+		draw_line(_triangle_soup[base + 2], _triangle_soup[base], edge_color, 1.0)
 
-	# Constraints
-	for i in range(0, constraints.size() - 1, 2):
-		draw_line(points[constraints[i]], points[constraints[i + 1]], constraint_color, 2.0)
+
+func _draw_top(ci: CanvasItem) -> void:
+	# Constrained edges (map constraints plus inserted obstacles)
+	for base in range(0, _constrained_edges.size(), 2):
+		ci.draw_line(_constrained_edges[base], _constrained_edges[base + 1], constraint_color, 2.0)
 
 	# Pending constraint preview
 	if _pending_constraint_start >= 0:
-		draw_line(points[_pending_constraint_start], _mouse_pos, constraint_color, 1.0)
+		ci.draw_line(points[_pending_constraint_start], _mouse_pos, constraint_color, 1.0)
 
-	for p in points:
-		draw_circle(p, POINT_RADIUS, Color.WHITE)
+	# Mesh vertices when triangulated (includes obstacle vertices), raw points otherwise
+	var markers := _mesh_vertices if not _mesh_vertices.is_empty() else points
+	for p in markers:
+		ci.draw_circle(p, POINT_RADIUS, Color.WHITE)

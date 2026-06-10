@@ -3,6 +3,7 @@
 [ext_resource type="Script" uid="uid://c6bshac87n8m2" path="res://src/delaunay_editor_node.gd" id="1_8mjns"]
 [ext_resource type="Script" uid="uid://i1lwbim0qidt" path="res://src/game/level_test_ui.gd" id="1_itlob"]
 [ext_resource type="Script" uid="uid://75ysqink0v4" path="res://src/game/rts_camera.gd" id="3_rtscam"]
+[ext_resource type="Script" path="res://src/game/building_overlay.gd" id="4_bldov"]
 
 [node name="LevelTest" type="Node2D" unique_id=1640675612]
 
@@ -20,6 +21,10 @@ anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("1_itlob")
+
+[node name="BuildingOverlay" type="Node2D" parent="."]
+z_index = 1
+script = ExtResource("4_bldov")
 
 [node name="DelaunayEditorNode" type="Node2D" parent="." unique_id=1145508213]
 script = ExtResource("1_8mjns")
