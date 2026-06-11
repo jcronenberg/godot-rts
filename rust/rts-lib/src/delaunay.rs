@@ -392,6 +392,11 @@ impl CDT {
                     "twin symmetry broken for he {}",
                     i
                 );
+                assert_eq!(
+                    self.he_constrained[i as usize], self.he_constrained[he.twin as usize],
+                    "constrained flag asymmetric on he {} / twin {}",
+                    i, he.twin
+                );
             }
 
             // Origin valid
@@ -759,6 +764,7 @@ impl CDT {
         }
         self.link_twins(t2_base, f1_base + 2); // C->V <-> V->C
         self.link_twins(t2_base + 1, f2_base + 1); // V->B <-> B->V
+        self.he_constrained[(t2_base + 1) as usize] = con_edge;
 
         // New face T4: (D, V, A)
         let t4_base = self.alloc_face(vertex_d, v, vertex_a);
@@ -772,6 +778,7 @@ impl CDT {
         }
         self.link_twins(t4_base, f2_base + 2); // D->V <-> V->D
         self.link_twins(t4_base + 1, f1_base + 1); // V->A <-> A->V
+        self.he_constrained[(t4_base + 1) as usize] = con_edge;
 
         // Update vertex_half_edge
         self.vertex_half_edge[v as usize] = f1_base + 2; // V->C
@@ -1363,11 +1370,22 @@ impl CDT {
         }
     }
 
-    /// Remove super-triangle faces and compact the DCEL arrays.
-    ///
-    /// The super vertices may sit anywhere in the points array (post-build
-    /// `insert_point` appends after them), so they are removed by swapping
-    /// with the tail and remapping the moved vertex ids.
+    /// Whether `face` has a super-triangle vertex (such faces die in
+    /// [`Self::remove_super_triangle`]). Always false on finished meshes.
+    fn face_touches_super(&self, face: u32) -> bool {
+        let [s0, s1, s2] = self.super_verts;
+        if s0 == NONE {
+            return false;
+        }
+        let base = face * 3;
+        (0..3).any(|j| {
+            let v = self.origin(base + j);
+            v == s0 || v == s1 || v == s2
+        })
+    }
+
+    /// Remove super-triangle faces and compact the DCEL arrays,
+    /// renumbering vertex and half-edge ids order-preservingly.
     pub fn remove_super_triangle(&mut self) {
         self.version = next_cdt_version(); // face indices change after compaction
         self.grid_cells.clear(); // face indices change after compaction
@@ -1378,12 +1396,7 @@ impl CDT {
         // Identify live faces (those not touching super-triangle vertices)
         let mut face_alive = vec![false; num_faces as usize];
         for f in 0..num_faces {
-            let base = f * 3;
-            let v0 = self.origin(base);
-            let v1 = self.origin(base + 1);
-            let v2 = self.origin(base + 2);
-            let touches_super = [v0, v1, v2].iter().any(|&v| v == s0 || v == s1 || v == s2);
-            face_alive[f as usize] = !touches_super;
+            face_alive[f as usize] = !self.face_touches_super(f);
         }
 
         // Compact points preserving order; vmap maps old to new vertex ids.
@@ -1416,6 +1429,11 @@ impl CDT {
         // Widths survive compaction: super edges are unconstrained, so removal
         // changes no wall set and every surviving width stays valid.
         let keep_widths = self.edge_max_radius.len() == self.half_edges.len();
+        // Dirty verts without a full width table are fine: nothing is carried.
+        debug_assert!(
+            !keep_widths || self.width_dirty_verts.is_empty(),
+            "widths are stale: mesh mutated after compute_widths"
+        );
         let mut new_half_edges = Vec::with_capacity(new_he_idx as usize);
         let mut new_he_constrained = Vec::with_capacity(new_he_idx as usize);
         let mut new_widths = Vec::with_capacity(if keep_widths { new_he_idx as usize } else { 0 });
@@ -1882,6 +1900,9 @@ impl CDT {
     ///
     /// For batch precomputation prefer [`compute_widths`], which reuses wall
     /// buffers across half-edges; this single-shot accessor allocates them.
+    /// It evaluates in slot direction without super filtering, so it may
+    /// differ from the cached [`Self::portal_radius`] by f32 rounding (and
+    /// materially near hull constraints before `remove_super_triangle`).
     pub fn portal_max_radius(&self, he: u32) -> f32 {
         let a_idx = self.origin(he);
         let b_idx = self.dest(he);
@@ -1921,17 +1942,7 @@ impl CDT {
         // Skip halves that remove_super_triangle will delete (outer halves of
         // hull constraints live in super-touching faces), so widths computed
         // before removal equal those computed after. No-op on finished meshes.
-        let [s0, s1, s2] = self.super_verts;
-        let dies_with_super = |he: u32| -> bool {
-            if s0 == NONE {
-                return false;
-            }
-            let base = face_of(he) * 3;
-            (0..3).any(|j| {
-                let v = self.origin(base + j);
-                v == s0 || v == s1 || v == s2
-            })
-        };
+        let dies_with_super = |he: u32| self.face_touches_super(face_of(he));
         let mut offsets = vec![0u32; self.points.len() + 1];
         for he in 0..self.half_edges.len() as u32 {
             if self.he_constrained[he as usize] && !dies_with_super(he) {
@@ -1956,9 +1967,23 @@ impl CDT {
         (offsets, walls)
     }
 
+    /// Portal endpoints ordered by coordinates, not slot direction. The width
+    /// search's feasibility test is not perfectly direction-symmetric under
+    /// f32 rounding, so orienting by geometry gives identical bits for an edge
+    /// on any mesh history; [`Self::portal_width_key`] and the search must
+    /// agree on this orientation for the cache to be sound.
+    fn canonical_endpoints(&self, he: u32) -> (usize, usize) {
+        let mut a = self.origin(he) as usize;
+        let mut b = self.dest(he) as usize;
+        if (self.points[b].x, self.points[b].y) < (self.points[a].x, self.points[a].y) {
+            std::mem::swap(&mut a, &mut b);
+        }
+        (a, b)
+    }
+
     /// [`portal_max_radius`] reading endpoint walls from a [`collect_vertex_walls`]
     /// table instead of walking the vertex rings; unlike the single-shot
-    /// accessor it canonicalizes the search direction (see below).
+    /// accessor it searches in canonical direction.
     fn portal_max_radius_csr(
         &self,
         he: u32,
@@ -1967,16 +1992,7 @@ impl CDT {
         a_walls: &mut Vec<WallBound>,
         b_walls: &mut Vec<WallBound>,
     ) -> f32 {
-        let mut a_idx = self.origin(he) as usize;
-        let mut b_idx = self.dest(he) as usize;
-        // Canonical orientation: the search's feasibility test is not perfectly
-        // direction-symmetric under f32 rounding, so orient by geometry (not
-        // slot order) to get identical bits for an edge on any mesh history.
-        if (self.points[b_idx].x, self.points[b_idx].y)
-            < (self.points[a_idx].x, self.points[a_idx].y)
-        {
-            std::mem::swap(&mut a_idx, &mut b_idx);
-        }
+        let (a_idx, b_idx) = self.canonical_endpoints(he);
         let wa = &vwalls[offsets[a_idx] as usize..offsets[a_idx + 1] as usize];
         let wb = &vwalls[offsets[b_idx] as usize..offsets[b_idx + 1] as usize];
         if wa.is_empty() && wb.is_empty() {
@@ -2013,11 +2029,7 @@ impl CDT {
     /// inputs of [`portal_max_radius_csr`], so equal keys give bitwise-equal
     /// widths regardless of mesh history.
     fn portal_width_key(&self, he: u32, offsets: &[u32], vwalls: &[(f32, f32, f32)]) -> u64 {
-        let mut a = self.origin(he) as usize;
-        let mut b = self.dest(he) as usize;
-        if (self.points[b].x, self.points[b].y) < (self.points[a].x, self.points[a].y) {
-            std::mem::swap(&mut a, &mut b);
-        }
+        let (a, b) = self.canonical_endpoints(he);
         let (pa, pb) = (self.points[a], self.points[b]);
         let mut h = fnv1a(FNV_OFFSET, pa.x.to_bits());
         h = fnv1a(h, pa.y.to_bits());
@@ -2056,6 +2068,10 @@ impl CDT {
     /// every slot it touches) between two width-clean endpoints keeps the width
     /// precomputed on `base`; everything else is recomputed. Call *before*
     /// [`remove_super_triangle`], which carries the table through compaction.
+    ///
+    /// Assumes every wall-set change dirties its endpoints. A flip in the
+    /// super region can change whether a hull wall survives removal without a
+    /// mark, so the base mesh's hull must be fully constrained.
     pub(crate) fn compute_widths_from(&mut self, base: &CDT, cache: &mut WidthCache) {
         debug_assert_eq!(
             base.edge_max_radius.len(),
@@ -2846,6 +2862,43 @@ mod tests {
             edge.is_some(),
             "Two triangles sharing an edge should find it"
         );
+    }
+
+    #[test]
+    fn test_split_constrained_edge_flags_both_halves() {
+        let points = vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(100.0, 0.0),
+            Vector2::new(100.0, 100.0),
+            Vector2::new(0.0, 100.0),
+        ];
+        let mut cdt = CDT::from_points(points);
+        cdt.insert_constraint(0, 1);
+        // Vertex on the wall splits it; both halves of each sub-edge must stay walls.
+        let v = cdt.insert_point(Vector2::new(50.0, 0.0), 0);
+        for u in [0u32, 1] {
+            let he = cdt.find_half_edge(u, v).expect("split sub-edge exists");
+            assert!(cdt.he_constrained[he as usize], "{u}->{v} unconstrained");
+            let twin = cdt.half_edges[he as usize].twin;
+            assert!(cdt.he_constrained[twin as usize], "{v}->{u} unconstrained");
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "widths are stale")]
+    fn test_remove_super_rejects_stale_widths() {
+        let points = vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(1.0, 0.0),
+            Vector2::new(1.0, 1.0),
+            Vector2::new(0.0, 1.0),
+        ];
+        let mut cdt = CDT::from_points(points);
+        cdt.compute_widths();
+        // Wall-set mutation that keeps the half-edge count: widths are stale.
+        cdt.insert_constraint(0, 2);
+        cdt.remove_super_triangle();
     }
 
     fn square_cdt() -> CDT {

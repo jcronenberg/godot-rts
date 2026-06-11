@@ -430,6 +430,80 @@ mod tests {
         }
     }
 
+    /// Does any path segment cross the vertical wall `x` between `y0` and `y1`?
+    /// Endpoints exactly on the wall don't count as crossings.
+    fn crosses_x_wall(path: &[Vector2], x: f32, y0: f32, y1: f32) -> bool {
+        path.windows(2).any(|w| {
+            let (a, b) = (w[0], w[1]);
+            if (a.x < x) == (b.x < x) {
+                return false;
+            }
+            let y = a.y + (x - a.x) / (b.x - a.x) * (b.y - a.y);
+            y > y0 && y < y1
+        })
+    }
+
+    #[test]
+    fn test_path_does_not_cross_split_wall() {
+        let (points, constraints) = rooms_map(2, 1);
+        let mut nav = DynamicNavmesh::new(points, &constraints);
+        // (100, 20) splits the wall segment (100,0)-(100,35); both sub-edge
+        // halves must stay uncrossable from either side.
+        nav.add_obstacle(Obstacle::polygon(vec![
+            v(100.0, 20.0),
+            v(70.0, 10.0),
+            v(70.0, 30.0),
+        ]));
+        let cdt = nav.rebuild();
+        let mut scratch = AStarScratch::new();
+        for (s, g) in [
+            (v(50.0, 10.0), v(150.0, 10.0)),
+            (v(150.0, 10.0), v(50.0, 10.0)),
+        ] {
+            let path = find_path(cdt, s, g, &mut scratch, 0.0);
+            assert!(!path.is_empty(), "route through the door exists");
+            assert!(
+                !crosses_x_wall(&path, 100.0, 0.0, 35.0),
+                "path crosses the split wall: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_split_vertex_walls_bound_portal_widths() {
+        let (points, _) = load_raw("square");
+        let mut nav = DynamicNavmesh::new(points, &[]);
+        nav.add_obstacle(Obstacle {
+            points: vec![v(0.2, 0.5), v(0.8, 0.5)],
+            edges: vec![(0, 1)],
+        });
+        // Bare point on the segment: the split halves are the vertex's only
+        // walls, so a dropped wall set is visible as an unbounded portal.
+        nav.add_obstacle(Obstacle {
+            points: vec![v(0.5, 0.5)],
+            edges: vec![],
+        });
+        let cdt = nav.rebuild();
+        let vsplit = cdt
+            .points()
+            .iter()
+            .position(|&p| vkey(p) == vkey(v(0.5, 0.5)))
+            .unwrap() as u32;
+        let mut seen = 0;
+        for he in 0..cdt.num_faces() * 3 {
+            if (cdt.he_origin(he) == vsplit || cdt.he_dest(he) == vsplit)
+                && !cdt.he_is_constrained(he)
+            {
+                assert!(
+                    cdt.portal_radius(he).is_finite(),
+                    "portal {he} at split vertex has no width bound"
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen > 0, "no portals incident to the split vertex");
+    }
+
     #[test]
     fn test_obstacle_vertex_on_unconstrained_edge() {
         let (points, _) = load_raw("square");
