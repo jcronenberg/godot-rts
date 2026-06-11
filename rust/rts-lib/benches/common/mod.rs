@@ -6,9 +6,16 @@ pub use rts_lib::mapgen::rooms_map;
 
 /// Standard bench constraint pattern: an edge between every 10th point index
 /// and its successor. Shared so the isolated benches decompose `pipeline/load`.
+pub fn chain_constraints(n: usize) -> Vec<(u32, u32)> {
+    (0..n.saturating_sub(1))
+        .step_by(10)
+        .map(|i| (i as u32, i as u32 + 1))
+        .collect()
+}
+
 pub fn insert_chain_constraints(cdt: &mut CDT, n: usize) {
-    for i in (0..n.saturating_sub(1)).step_by(10) {
-        cdt.insert_constraint(i as u32, (i + 1) as u32);
+    for (a, b) in chain_constraints(n) {
+        cdt.insert_constraint(a, b);
     }
 }
 
