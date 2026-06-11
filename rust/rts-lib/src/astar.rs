@@ -268,13 +268,9 @@ fn straight_channel(
             }
             let a = pts[cdt.he_origin(he) as usize];
             let b = pts[cdt.he_dest(he) as usize];
-            // The segment strictly crosses edge ab: endpoints straddle both
-            // the segment's line and vice versa (zeros = degenerate → skip).
-            let sa = area2(start, goal, a);
-            let sb = area2(start, goal, b);
-            let wa = area2(a, b, start);
-            let wb = area2(a, b, goal);
-            if sa * sb < 0.0 && wa * wb < 0.0 {
+            // Strict crossing only (degenerate = through a vertex → no exit
+            // found → bail); same predicate as constraint insertion.
+            if crate::delaunay::segments_intersect_proper(start, goal, a, b) {
                 debug_assert!(exit_he == NONE, "two exit crossings in one face");
                 exit_he = he;
                 exit_nb = nb;

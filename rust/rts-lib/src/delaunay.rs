@@ -353,7 +353,7 @@ fn sort_spatially(mut points: Vec<Vector2>) -> Vec<Vector2> {
 
 /// Returns true if open segments (a,b) and (c,d) properly intersect
 /// (endpoints touching does not count).
-fn segments_intersect_proper(a: Vector2, b: Vector2, c: Vector2, d: Vector2) -> bool {
+pub(crate) fn segments_intersect_proper(a: Vector2, b: Vector2, c: Vector2, d: Vector2) -> bool {
     let d1 = orient2d(c, d, a);
     let d2 = orient2d(c, d, b);
     let d3 = orient2d(a, b, c);
