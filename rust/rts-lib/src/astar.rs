@@ -33,12 +33,38 @@ pub struct AStarScratch {
     /// Reusable left/right portal-endpoint buffers, shrunk once per funnel call.
     funnel_left: Vec<Vector2>,
     funnel_right: Vec<Vector2>,
+    /// Node arena for the anytime channel refinement (TA*).
+    nodes: Vec<TaNode>,
+    /// Best (lowest) midpoint-polyline distance seen per entry half-edge.
+    edge_dom: Vec<f32>,
+    /// `edge_gen[he] == current_gen` iff `edge_dom[he]` is from this search.
+    edge_gen: Vec<u32>,
+    /// Best path found so far during refinement; cloned into the result.
+    best_path: Vec<Vector2>,
+    /// Funnel output buffer for candidate channels during refinement.
+    cand_path: Vec<Vector2>,
     /// Reusable generation-marked buffers for the abstraction's local searches.
     abs_scratch: crate::abstraction::AbsScratch,
     /// Reusable buffers for the TRA* query path. Held separately so they can be
     /// `mem::take`n out as locals during a query — letting them coexist with a
     /// `&mut AStarScratch` borrow without aliasing.
     tra: TraScratch,
+}
+
+/// Search state of the anytime refinement: one node per distinct channel
+/// prefix, keyed by the half-edge it crossed to enter `face`.
+#[derive(Clone, Copy)]
+struct TaNode {
+    face: u32,
+    /// Half-edge crossed to enter `face` (`NONE` for the start node).
+    entry_he: u32,
+    /// Arena index of the parent node (`NONE` for the start node).
+    parent: u32,
+    /// Lower bound on the true path length from `start` to `entry_he`.
+    g: f32,
+    /// Midpoint-polyline distance from `start` to `entry_he` — a cheap
+    /// true-length estimate used only for portal dominance.
+    d: f32,
 }
 
 /// Per-query work buffers for [`find_path_abstract`], pooled to keep TRA*
@@ -76,6 +102,11 @@ impl AStarScratch {
             portals: Vec::new(),
             funnel_left: Vec::new(),
             funnel_right: Vec::new(),
+            nodes: Vec::new(),
+            edge_dom: Vec::new(),
+            edge_gen: Vec::new(),
+            best_path: Vec::new(),
+            cand_path: Vec::new(),
             abs_scratch: crate::abstraction::AbsScratch::default(),
             tra: TraScratch::default(),
         }
@@ -88,11 +119,14 @@ impl AStarScratch {
             self.g_score.resize(n, 0.0);
             self.came_from.resize(n, NONE);
             self.generation.resize(n, 0);
+            self.edge_dom.resize(n * 3, 0.0);
+            self.edge_gen.resize(n * 3, 0);
         }
 
         self.current_gen = self.current_gen.wrapping_add(1);
         if self.current_gen == 0 {
             self.generation.fill(0);
+            self.edge_gen.fill(0);
             self.current_gen = 1;
         }
 
@@ -125,6 +159,14 @@ impl AStarScratch {
 /// corners are offset by `radius` along the bisector toward free space so the
 /// agent circle clears the wall.
 ///
+/// Search pipeline: a straight-segment walk first (free-line-of-sight queries
+/// finish immediately); otherwise a fast centroid-cost channel search supplies
+/// a feasible channel, and an anytime TA* refinement (Demyen 2006, §5.4–5.5)
+/// then funnel-evaluates alternative channels by true length, so the path is
+/// chosen by real distance instead of the centroid proxy.  Refinement effort
+/// is bounded (see `refine_channel`), making the result best-effort optimal
+/// rather than proven optimal on very large meshes.
+///
 /// Returns `[start, …, goal]`, or an empty `Vec` when either endpoint is
 /// outside the mesh or no passable route exists.
 pub fn find_path(
@@ -147,6 +189,120 @@ pub fn find_path(
         return vec![start, goal];
     }
 
+    // Fast path: when the raw segment crosses only passable portals, its
+    // channel proves reachability and funnels to a (near-)tight upper bound —
+    // typically the straight line itself, which ends the query right away.
+    if straight_channel(
+        cdt,
+        start_face,
+        goal_face,
+        start,
+        goal,
+        radius,
+        &mut scratch.portals,
+    ) {
+        scratch.prepare(cdt); // advances the epoch and sizes edge_dom/edge_gen for refine_channel
+    } else if !channel_search(cdt, start_face, goal_face, scratch, radius) {
+        return Vec::new();
+    }
+
+    // Initial candidate: funnel the channel for a true-length upper bound
+    // that prunes the refinement.
+    {
+        let s = &mut *scratch;
+        funnel(
+            cdt,
+            start,
+            goal,
+            &s.portals,
+            &mut s.funnel_left,
+            &mut s.funnel_right,
+            radius,
+            &mut s.best_path,
+        );
+    }
+    let best_len = polyline_len(&scratch.best_path);
+
+    refine_channel(
+        cdt, start, goal, start_face, goal_face, scratch, radius, best_len,
+    );
+
+    scratch.best_path.clone()
+}
+
+/// Walk the faces crossed by the segment `start → goal`; succeeds iff every
+/// crossing is a passable portal.  Fills `portals` (start → goal order).
+///
+/// Conservative: any degenerate crossing (segment through a vertex) or a
+/// blocked/constrained edge aborts with `false` and the caller falls back to
+/// the full channel search.
+fn straight_channel(
+    cdt: &CDT,
+    start_face: u32,
+    goal_face: u32,
+    start: Vector2,
+    goal: Vector2,
+    radius: f32,
+    portals: &mut Vec<u32>,
+) -> bool {
+    portals.clear();
+    let pts = cdt.points();
+    let mut face = start_face;
+    let mut prev = NONE;
+    let mut steps = 0u32;
+    while face != goal_face {
+        steps += 1;
+        if steps > cdt.num_faces() {
+            return false;
+        }
+        let mut exit_he = NONE;
+        let mut exit_nb = NONE;
+        cdt.for_each_neighbor(face, |nb, he| {
+            // Release builds stop at the first exit; debug builds keep
+            // scanning so the uniqueness assert below stays meaningful.
+            if nb == prev || (!cfg!(debug_assertions) && exit_he != NONE) {
+                return;
+            }
+            if radius > 0.0 && radius > cdt.portal_radius(he) {
+                return;
+            }
+            let a = pts[cdt.he_origin(he) as usize];
+            let b = pts[cdt.he_dest(he) as usize];
+            // The segment strictly crosses edge ab: endpoints straddle both
+            // the segment's line and vice versa (zeros = degenerate → skip).
+            let sa = area2(start, goal, a);
+            let sb = area2(start, goal, b);
+            let wa = area2(a, b, start);
+            let wb = area2(a, b, goal);
+            if sa * sb < 0.0 && wa * wb < 0.0 {
+                debug_assert!(exit_he == NONE, "two exit crossings in one face");
+                exit_he = he;
+                exit_nb = nb;
+            }
+        });
+        if exit_he == NONE {
+            return false;
+        }
+        portals.push(exit_he);
+        prev = face;
+        face = exit_nb;
+    }
+    true
+}
+
+/// Phase 1: face-keyed A* over centroid-to-centroid costs.  Cheap and
+/// complete, but its channel is not necessarily the shortest — the centroid
+/// polyline mis-measures real path length by up to the triangle size.
+///
+/// Fills `scratch.portals` with the channel's half-edges (start → goal) and
+/// returns whether the goal is reachable.
+fn channel_search(
+    cdt: &CDT,
+    start_face: u32,
+    goal_face: u32,
+    scratch: &mut AStarScratch,
+    radius: f32,
+) -> bool {
     scratch.prepare(cdt);
     let epoch = scratch.current_gen;
 
@@ -182,12 +338,9 @@ pub fn find_path(
                 return;
             }
 
-            // g(nb): centroid-to-centroid accumulated cost — a monotone lower
-            // bound that orders the channel search. (A start-to-portal distance
-            // term was tried here and measured to never change the search: it
-            // was dominated by the centroid cost in every query, so it only
-            // added a per-edge sqrt.) The funnel re-smooths the chosen channel,
-            // so this need not equal the true polyline length.
+            // g(nb): centroid-to-centroid accumulated cost.  A proxy for path
+            // length, good enough to find *a* channel; `refine_channel` fixes
+            // any mis-ranking against the true funneled length.
             let tg = g_cur + dist(c_cur, scratch.centroids[nb as usize]);
 
             // h(nb): centroid-to-goal — consistent, so each face expands at most once.
@@ -214,7 +367,7 @@ pub fn find_path(
     }
 
     if scratch.generation[goal_face as usize] != epoch {
-        return Vec::new();
+        return false;
     }
 
     // Reconstruct the ordered portal sequence (forward: start → goal).
@@ -226,16 +379,191 @@ pub fn find_path(
         cur = cdt.face_of_he(he);
     }
     scratch.portals.reverse();
+    true
+}
 
-    funnel(
-        cdt,
-        start,
-        goal,
-        &scratch.portals,
-        &mut scratch.funnel_left,
-        &mut scratch.funnel_right,
-        radius,
-    )
+/// Phase 2: anytime TA* refinement (Demyen 2006, §5.4–5.5).
+///
+/// Searches channel prefixes — one node per (face, entry edge, parent chain),
+/// so a face may be reached by several channels — ordered by `f = g + h`
+/// where both terms are admissible Euclidean lower bounds.  Each time the goal
+/// face is popped, the channel is funneled for its true polyline length; the
+/// search stops once the queue front's `f` cannot beat the best length found.
+/// `best_len` starts as the phase-1 upper bound and `scratch.best_path` holds
+/// the corresponding path.
+///
+/// Two prunes keep the prefix search from exploding in open space, where the
+/// Euclidean bounds are loose and countless interchangeable prefixes exist:
+/// a portal is only re-entered by a strictly better midpoint-distance
+/// (collapsing same-homotopy duplicates), and an adaptive node budget caps
+/// the worst case — it grows only while better channels keep being found, so
+/// hopeless searches stop early and the anytime result stands.  Both prunes
+/// can in principle hide an alternative channel, so the result is best-effort
+/// optimal rather than proven optimal, and never worse than the phase-1
+/// channel.
+#[allow(clippy::too_many_arguments)]
+fn refine_channel(
+    cdt: &CDT,
+    start: Vector2,
+    goal: Vector2,
+    start_face: u32,
+    goal_face: u32,
+    scratch: &mut AStarScratch,
+    radius: f32,
+    mut best_len: f32,
+) {
+    let h0 = dist(start, goal);
+    // Near-optimal or near-collocated: refinement can't gain >0.01% or >1e-3.
+    if best_len <= h0 * 1.0001 + 1e-3 {
+        return;
+    }
+
+    let pts = cdt.points();
+    // Adaptive anytime budget: cheap by default, extended while improving.
+    let mut budget = 512usize;
+    const BUDGET_MAX: usize = 8192;
+    let AStarScratch {
+        heap,
+        nodes,
+        edge_dom,
+        edge_gen,
+        current_gen,
+        best_path,
+        cand_path,
+        portals,
+        funnel_left,
+        funnel_right,
+        ..
+    } = scratch;
+    let epoch = *current_gen;
+
+    heap.clear();
+    nodes.clear();
+    nodes.push(TaNode {
+        face: start_face,
+        entry_he: NONE,
+        parent: NONE,
+        g: 0.0,
+        d: 0.0,
+    });
+    heap.push(Reverse((h0.to_bits(), 0u32, 0u32)));
+
+    while let Some(Reverse((f_bits, _, idx))) = heap.pop() {
+        // Every unexplored channel has a prefix node in the heap, and each
+        // node's `f` lower-bounds all completions through it — so once the
+        // heap minimum can't beat `best_len`, no remaining channel can.
+        if f32::from_bits(f_bits) >= best_len || nodes.len() >= budget {
+            break;
+        }
+        let TaNode {
+            face,
+            entry_he,
+            g,
+            d,
+            ..
+        } = nodes[idx as usize];
+
+        if face == goal_face {
+            portals.clear();
+            let mut cur = idx as usize;
+            while nodes[cur].entry_he != NONE {
+                portals.push(nodes[cur].entry_he);
+                cur = nodes[cur].parent as usize;
+            }
+            portals.reverse();
+            funnel(
+                cdt,
+                start,
+                goal,
+                portals,
+                funnel_left,
+                funnel_right,
+                radius,
+                cand_path,
+            );
+            let len = polyline_len(cand_path);
+            // Copy rather than swap: swapping would ping-pong the two pooled
+            // buffers' capacities and re-allocate on later queries.
+            if len < best_len {
+                best_len = len;
+                best_path.clear();
+                best_path.extend_from_slice(cand_path);
+                // Reward progress with more search room.
+                budget = budget.max((nodes.len() * 2).min(BUDGET_MAX));
+            }
+            continue;
+        }
+
+        // Reference point of the portal this node entered through.
+        let prev_pt = if entry_he == NONE {
+            start
+        } else {
+            let a = pts[cdt.he_origin(entry_he) as usize];
+            let b = pts[cdt.he_dest(entry_he) as usize];
+            Vector2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5)
+        };
+
+        cdt.for_each_neighbor(face, |nb, he| {
+            if nodes.len() >= budget {
+                return;
+            }
+            if radius > 0.0 && radius > cdt.portal_radius(he) {
+                return;
+            }
+
+            let pa = pts[cdt.he_origin(he) as usize];
+            let pb = pts[cdt.he_dest(he) as usize];
+            // h: goal to the entry portal.  g: max of two lower bounds on the
+            // walked distance to this portal — straight line from the start,
+            // and the parent's bound (path length is monotone along a channel).
+            // Demyen's third bound (g + h - h') is NOT admissible for a
+            // point-to-edge h and is deliberately omitted.
+            let h_nb = dist_point_seg(goal, pa, pb);
+            let g_nb = dist_point_seg(start, pa, pb).max(g);
+            let f_nb = g_nb + h_nb;
+            if f_nb >= best_len {
+                return;
+            }
+            // Portal dominance: when channels converge on a portal, keep only
+            // the prefix with the shortest midpoint polyline.  The g-bound
+            // can't rank converging prefixes (it's the same straight line for
+            // all of them); the midpoint metric tracks the walked route.
+            // Goal portals are excepted so every distinct final approach is
+            // still funnel-evaluated.
+            let mid = Vector2::new((pa.x + pb.x) * 0.5, (pa.y + pb.y) * 0.5);
+            let d_nb = d + dist(prev_pt, mid);
+            if nb != goal_face && edge_gen[he as usize] == epoch && edge_dom[he as usize] <= d_nb {
+                return;
+            }
+            // A shortest channel never revisits a face (Demyen Thm 4.3.4):
+            // drop children whose face is already on this node's chain.
+            let mut a = idx as usize;
+            loop {
+                if nodes[a].face == nb {
+                    return;
+                }
+                let p = nodes[a].parent;
+                if p == NONE {
+                    break;
+                }
+                a = p as usize;
+            }
+            // Recorded only for pushed nodes: a dominance entry from a
+            // cycle-pruned prefix could block a valid channel with no live
+            // node left at this portal.
+            edge_gen[he as usize] = epoch;
+            edge_dom[he as usize] = d_nb;
+            let nidx = nodes.len() as u32;
+            nodes.push(TaNode {
+                face: nb,
+                entry_he: he,
+                parent: idx,
+                g: g_nb,
+                d: d_nb,
+            });
+            heap.push(Reverse((f_nb.to_bits(), g_nb.to_bits(), nidx)));
+        });
+    }
 }
 
 // ── TRA* (Triangulation-Reduced A*) ──────────────────────────────────────────
@@ -350,15 +678,18 @@ fn tra_query(
             .windows(2)
             .filter_map(|w| cdt.shared_edge_between(w[0], w[1])),
     );
+    let s = &mut *scratch;
     funnel(
         cdt,
         start,
         goal,
-        &scratch.portals,
-        &mut scratch.funnel_left,
-        &mut scratch.funnel_right,
+        &s.portals,
+        &mut s.funnel_left,
+        &mut s.funnel_right,
         radius,
-    )
+        &mut s.cand_path,
+    );
+    s.cand_path.clone()
 }
 
 /// Multi-source, multi-target A* restricted to level-3 (decision-point) nodes.
@@ -486,12 +817,13 @@ fn area2(o: Vector2, a: Vector2, b: Vector2) -> f32 {
     (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
 }
 
-/// Smooth the triangle channel into a polyline path.
+/// Smooth the triangle channel into a polyline path, written into `out`.
 ///
 /// Runs the Simple Stupid Funnel Algorithm on portal endpoints shrunk to
 /// the agent-valid range along each portal — for radius `r`, each portal's
 /// `[t_lo, t_hi]` (from [`CDT::portal_valid_range`]) marks where the agent's
 /// centre stays `≥ r` away from every wall incident to the portal endpoints.
+#[allow(clippy::too_many_arguments)]
 fn funnel(
     cdt: &CDT,
     start: Vector2,
@@ -500,7 +832,8 @@ fn funnel(
     left_buf: &mut Vec<Vector2>,
     right_buf: &mut Vec<Vector2>,
     radius: f32,
-) -> Vec<Vector2> {
+    out: &mut Vec<Vector2>,
+) {
     // Shrink each portal to its agent-valid endpoints exactly once.  `portal_valid_range`
     // is the expensive O(degree) call; computing it per portal here (rather than per
     // SSFA access) keeps the funnel linear even with restarts.
@@ -538,11 +871,12 @@ fn funnel(
 
     // Pre-size to the maximum possible waypoint count (start + one per portal +
     // goal) so the output never reallocates as the funnel pushes corners.
-    let mut path: Vec<Vector2> = Vec::with_capacity(portals.len() + 2);
-    path.push(start);
+    out.clear();
+    out.reserve(portals.len() + 2);
+    out.push(start);
     if portals.is_empty() {
-        path.push(goal);
-        return path;
+        out.push(goal);
+        return;
     }
 
     let mut apex = start;
@@ -563,7 +897,7 @@ fn funnel(
                 right = pr;
                 right_idx = i;
             } else {
-                path.push(left);
+                out.push(left);
                 apex = left;
                 let restart = left_idx + 1;
                 left_idx = restart;
@@ -580,7 +914,7 @@ fn funnel(
                 left = pl;
                 left_idx = i;
             } else {
-                path.push(right);
+                out.push(right);
                 apex = right;
                 let restart = right_idx + 1;
                 left_idx = restart;
@@ -595,10 +929,9 @@ fn funnel(
         i += 1;
     }
 
-    if path.last() != Some(&goal) {
-        path.push(goal);
+    if out.last() != Some(&goal) {
+        out.push(goal);
     }
-    path
 }
 
 // ── shared helpers ────────────────────────────────────────────────────────────
@@ -608,6 +941,23 @@ fn dist(a: Vector2, b: Vector2) -> f32 {
     let dx = a.x - b.x;
     let dy = a.y - b.y;
     (dx * dx + dy * dy).sqrt()
+}
+
+/// Distance from `p` to the closest point on segment `ab`.
+#[inline(always)]
+fn dist_point_seg(p: Vector2, a: Vector2, b: Vector2) -> f32 {
+    let ab = b - a;
+    let len2 = ab.x * ab.x + ab.y * ab.y;
+    if len2 <= f32::EPSILON {
+        return dist(p, a);
+    }
+    let t = (((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / len2).clamp(0.0, 1.0);
+    dist(p, Vector2::new(a.x + t * ab.x, a.y + t * ab.y))
+}
+
+#[inline(always)]
+fn polyline_len(path: &[Vector2]) -> f32 {
+    path.windows(2).map(|w| dist(w[0], w[1])).sum()
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -805,6 +1155,51 @@ mod tests {
             path.is_empty(),
             "radius 25.1 must find no path (all corridors too narrow)"
         );
+    }
+
+    #[test]
+    fn test_shortest_gap_chosen() {
+        // Regression: lower-left → lower-right must use the bottom gap (~335
+        // units), not the middle gap (~511). The old centroid-cost A* preferred
+        // the middle channel because its centroid polyline measured shorter.
+        let cdt = corridors_cdt();
+        let start = Vector2::new(11.89206, 524.4971);
+        let goal = Vector2::new(318.6512, 498.6447);
+        let mut sc = scratch();
+        for &r in &[0.0f32, 1.0, 5.0] {
+            let path = find_path(&cdt, start, goal, &mut sc, r);
+            assert!(!path.is_empty());
+            assert_no_constraint_crossing(&cdt, &path);
+            let len = polyline_len(&path);
+            assert!(
+                len < 400.0,
+                "r={r}: path length {len:.1} detoured (bottom route is ~335)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_path_length_symmetric() {
+        // Shortest-path length is direction-independent; the old channel search
+        // wasn't, because its centroid costs depended on the start face.
+        for map in ["test_unit_size_corridors", "non_square_walls"] {
+            let cdt = crate::test_utils::build_cdt(map);
+            let mut sc = scratch();
+            for (s, g) in centroid_pairs(&cdt, 8) {
+                for &r in &[0.0f32, 5.0] {
+                    let fwd = find_path(&cdt, s, g, &mut sc, r);
+                    let rev = find_path(&cdt, g, s, &mut sc, r);
+                    if fwd.is_empty() || rev.is_empty() {
+                        continue; // reachability symmetry is tested elsewhere
+                    }
+                    let (lf, lr) = (polyline_len(&fwd), polyline_len(&rev));
+                    assert!(
+                        (lf - lr).abs() <= 0.01 * lf.max(lr),
+                        "[{map}] asymmetric lengths {lf:.2} vs {lr:.2} s={s:?} g={g:?} r={r}"
+                    );
+                }
+            }
+        }
     }
 
     // ── additional tests ──────────────────────────────────────────────────────
