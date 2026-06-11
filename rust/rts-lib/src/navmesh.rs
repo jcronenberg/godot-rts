@@ -126,8 +126,8 @@ impl DynamicNavmesh {
     }
 }
 
-/// Clone the base, insert all obstacle vertices then all obstacle constraints,
-/// and finish the navmesh (super-triangle removal, grid index, portal widths).
+/// Clone the base, insert each obstacle's vertices and constraints, and
+/// finish the navmesh (super-triangle removal, grid index, portal widths).
 fn build_active<'a>(
     base: &CDT,
     obstacles: impl Iterator<Item = &'a Obstacle>,
@@ -135,22 +135,18 @@ fn build_active<'a>(
 ) -> CDT {
     let mut cdt = base.clone();
 
-    // Insert points first so constraint insertion sees every obstacle vertex.
     // Chain locate hints: obstacle vertices are spatially local, so the
-    // walking locator stays cheap.
+    // walking locator stays cheap. A later vertex landing on an earlier
+    // obstacle's constraint is split by `insert_point` like any wall.
     let mut hint = 0u32;
-    let mut all_ids: Vec<(Vec<u32>, &Obstacle)> = Vec::new();
+    let mut ids: Vec<u32> = Vec::new();
     for obs in obstacles {
-        let mut ids = Vec::with_capacity(obs.points.len());
+        ids.clear();
         for &p in &obs.points {
             let v = cdt.insert_point(p, hint);
             hint = cdt.face_of_vertex(v);
             ids.push(v);
         }
-        all_ids.push((ids, obs));
-    }
-
-    for (ids, obs) in &all_ids {
         for &(a, b) in &obs.edges {
             cdt.insert_constraint(ids[a as usize], ids[b as usize]);
         }
