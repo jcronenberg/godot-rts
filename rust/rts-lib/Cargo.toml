@@ -18,3 +18,7 @@ harness = false
 [[bench]]
 name = "astar"
 harness = false
+
+[[bench]]
+name = "sim"
+harness = false

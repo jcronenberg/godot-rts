@@ -939,16 +939,22 @@ fn dist(a: Vector2, b: Vector2) -> f32 {
     (dx * dx + dy * dy).sqrt()
 }
 
-/// Distance from `p` to the closest point on segment `ab`.
+/// Closest point to `p` on segment `ab`.
 #[inline(always)]
-fn dist_point_seg(p: Vector2, a: Vector2, b: Vector2) -> f32 {
+pub(crate) fn closest_on_segment(p: Vector2, a: Vector2, b: Vector2) -> Vector2 {
     let ab = b - a;
     let len2 = ab.x * ab.x + ab.y * ab.y;
     if len2 <= f32::EPSILON {
-        return dist(p, a);
+        return a;
     }
     let t = (((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / len2).clamp(0.0, 1.0);
-    dist(p, Vector2::new(a.x + t * ab.x, a.y + t * ab.y))
+    a + ab * t
+}
+
+/// Distance from `p` to the closest point on segment `ab`.
+#[inline(always)]
+fn dist_point_seg(p: Vector2, a: Vector2, b: Vector2) -> f32 {
+    dist(p, closest_on_segment(p, a, b))
 }
 
 #[inline(always)]

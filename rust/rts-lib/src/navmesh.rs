@@ -124,6 +124,11 @@ impl DynamicNavmesh {
     pub fn num_obstacles(&self) -> usize {
         self.obstacles.len()
     }
+
+    /// Id the next `add_obstacle` will assign (ids are sequential, never reused).
+    pub fn next_obstacle_id(&self) -> u64 {
+        self.next_id
+    }
 }
 
 /// Clone the base, insert each obstacle's vertices and constraints, and
@@ -564,7 +569,11 @@ mod tests {
         ]));
         let cdt = nav.rebuild();
         assert_valid(cdt);
-        assert_eq!(cdt.num_vertices(), n_map + 5, "shared corner must be reused");
+        assert_eq!(
+            cdt.num_vertices(),
+            n_map + 5,
+            "shared corner must be reused"
+        );
         assert_local_delaunay(cdt);
         assert_widths_match_full(cdt);
     }
@@ -634,7 +643,11 @@ mod tests {
         nav.add_obstacle(rect(40.0, 20.0, 60.0, 40.0));
         let cdt = nav.rebuild();
         assert_valid(cdt);
-        assert_eq!(cdt.num_vertices(), n_map + 6, "shared corners must be reused");
+        assert_eq!(
+            cdt.num_vertices(),
+            n_map + 6,
+            "shared corners must be reused"
+        );
         let edges = constrained_edge_set(cdt);
         assert!(
             edges.contains(&ekey(v(40.0, 20.0), v(40.0, 40.0))),

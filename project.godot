@@ -13,6 +13,7 @@ config_version=5
 config/name="rts"
 run/main_scene="uid://bbljee0iyb346"
 config/features=PackedStringArray("4.6", "Forward Plus")
+run/max_fps=240
 config/icon="res://icon.svg"
 
 [display]
@@ -21,6 +22,7 @@ window/size/viewport_width=1920
 window/size/viewport_height=1080
 window/size/borderless=true
 window/stretch/mode="canvas_items"
+window/vsync/vsync_mode=0
 
 [editor_plugins]
 

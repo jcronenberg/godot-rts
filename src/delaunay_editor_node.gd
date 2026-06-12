@@ -190,6 +190,22 @@ func find_path(start: Vector2, goal: Vector2, radius: float) -> PackedVector2Arr
 	return _triangulator.find_path(start, goal, radius)
 
 
+## Display an externally produced mesh (e.g. the sim thread's live navmesh
+## dump) instead of this node's own triangulation. `indices` hold 3 vertex
+## indices per face; `edges` are constrained-edge endpoint pairs.
+func show_mesh_dump(
+	vertices: PackedVector2Array, indices: PackedInt32Array, edges: PackedVector2Array
+) -> void:
+	var soup := PackedVector2Array()
+	soup.resize(indices.size())
+	for i in indices.size():
+		soup[i] = vertices[indices[i]]
+	_triangle_soup = soup
+	_constrained_edges = edges
+	_mesh_vertices = vertices
+	_request_redraw()
+
+
 func clear_all() -> void:
 	points.clear()
 	constraints.clear()

@@ -3,6 +3,9 @@ pub mod astar;
 pub mod delaunay;
 pub mod mapgen;
 pub mod navmesh;
+pub mod report;
+pub mod sim;
+pub mod sim_runner;
 
 /// Per-thread allocation counter used by tests to verify that pooled-scratch
 /// code paths are allocation-free in steady state. Counts only the current

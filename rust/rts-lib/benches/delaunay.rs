@@ -365,7 +365,10 @@ fn bench_obstacle_rebuild_all_change(c: &mut Criterion) {
                 obstacle_set_salted(cols, k, 0),
                 obstacle_set_salted(cols, k, 0x5A17),
             ];
-            let mut ids: Vec<_> = sets[0].iter().map(|o| nav.add_obstacle(o.clone())).collect();
+            let mut ids: Vec<_> = sets[0]
+                .iter()
+                .map(|o| nav.add_obstacle(o.clone()))
+                .collect();
             nav.rebuild();
             let mut flip = 1usize;
 

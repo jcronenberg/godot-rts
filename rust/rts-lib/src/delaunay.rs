@@ -137,8 +137,8 @@ fn max_radius_search(a_walls: &[WallBound], b_walls: &[WallBound], ab_len2: f32)
     a
 }
 
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
+pub(crate) const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+pub(crate) const FNV_PRIME: u64 = 0x100000001b3;
 
 /// FNV-1a step over a whole u32 word (not bytes).
 #[inline]
@@ -1256,7 +1256,7 @@ impl CDT {
             if self.he_constrained[he as usize] {
                 // Debug-only: conflicting input is rejected silently in release.
                 #[cfg(debug_assertions)]
-                godot_error!(
+                crate::report_error!(
                     "Cannot insert constraint ({}-{}): it intersects existing constraint ({}-{})",
                     v0,
                     v1,
@@ -1315,7 +1315,7 @@ impl CDT {
         // Mark the constraint edge
         let Some(constraint_he) = self.find_half_edge(v0, v1) else {
             #[cfg(debug_assertions)]
-            godot_error!(
+            crate::report_error!(
                 "Failed to insert constraint ({}-{}): edge not found after flipping",
                 v0,
                 v1
@@ -1724,6 +1724,17 @@ impl CDT {
     /// Endpoint pairs of all constrained edges (each edge once) for rendering.
     pub fn get_constrained_edge_vertices(&self) -> PackedVector2Array {
         let mut segments = PackedVector2Array::new();
+        self.for_each_constrained_edge(|a, b| {
+            segments.push(a);
+            segments.push(b);
+        });
+        segments
+    }
+
+    /// Visit each constrained edge once (half-edge pairs deduped by twin;
+    /// hull edges have no twin and are always visited). Engine-free, so it
+    /// is safe on non-Godot threads, unlike the `Packed*Array` getters.
+    pub fn for_each_constrained_edge(&self, mut f: impl FnMut(Vector2, Vector2)) {
         for he in 0..self.half_edges.len() as u32 {
             if !self.he_constrained[he as usize] {
                 continue;
@@ -1732,10 +1743,11 @@ impl CDT {
             if twin != NONE && twin < he {
                 continue;
             }
-            segments.push(self.point(self.origin(he)));
-            segments.push(self.point(self.origin(next(he))));
+            f(
+                self.point(self.origin(he)),
+                self.point(self.origin(next(he))),
+            );
         }
-        segments
     }
 
     /// Access the points array.

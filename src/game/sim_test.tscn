@@ -1,0 +1,19 @@
+[gd_scene format=3 uid="uid://ckbrvmd72e7h5"]
+
+[ext_resource type="Script" uid="uid://uenl4lyinpc4" path="res://src/game/sim_test.gd" id="1_simtst"]
+[ext_resource type="Script" uid="uid://75ysqink0v4" path="res://src/game/rts_camera.gd" id="2_rtscam"]
+[ext_resource type="Script" uid="uid://c6bshac87n8m2" path="res://src/delaunay_editor_node.gd" id="3_dlned"]
+
+[node name="SimTest" type="Node2D" unique_id=1728954686]
+script = ExtResource("1_simtst")
+
+[node name="Camera2D" type="Camera2D" parent="." unique_id=1730527083]
+position = Vector2(200, 275)
+script = ExtResource("2_rtscam")
+
+[node name="DelaunayEditorNode" type="Node2D" parent="." unique_id=1268810141]
+z_index = -1
+script = ExtResource("3_dlned")
+points = PackedVector2Array(0, 0, 0, 550, 400, 550, 400, 0, 150, 0, 200, 0, 150, 550, 200, 550, 191.67151, 488.0672, 200, 450, 190.8233, 394.7657, 200, 440, 193.79199, 351.50775, 200, 320, 192.51971, 270.50513, 200, 300, 192.94379, 223.85437, 200, 200, 193.36786, 114.4372, 200, 150)
+constraints = PackedInt32Array(3, 2, 1, 0, 1, 6, 6, 7, 7, 2, 0, 4, 4, 5, 5, 3, 6, 8, 8, 9, 9, 7, 10, 11, 10, 12, 12, 13, 13, 11, 14, 15, 14, 16, 16, 17, 17, 15, 18, 19, 19, 5, 18, 4)
+metadata/_custom_type_script = "uid://c6bshac87n8m2"
