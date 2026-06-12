@@ -4,21 +4,20 @@ use godot::classes::Node;
 use godot::prelude::*;
 use rts_lib::navmesh::ObstacleId;
 use rts_lib::sim::{Command, Sim, TICK_RATE, UnitId};
-use rts_lib::sim_runner::{RenderClock, SimHandle, Snapshot};
+use rts_lib::sim_runner::{Interpolator, SimHandle, Snapshot, display_pos};
 
 /// Godot view of the Rust sim thread: commands in, snapshots out.
 ///
 /// Per frame, call `poll(delta)` once to fetch fresh snapshots and advance the
 /// render clock, then read `get_positions(alpha)` / ids / radii with the alpha
-/// it returned. All gameplay state lives in the sim; this node only holds the
-/// two snapshots it interpolates between.
+/// it returned. All gameplay state lives in the sim; this node only holds an
+/// [`Interpolator`] over recent snapshots (alpha may exceed 1.0 — bounded
+/// extrapolation). Getters read the bracket's newer snapshot.
 #[derive(GodotClass)]
 #[class(base=Node)]
 pub struct Simulation {
     handle: Option<SimHandle>,
-    prev: Arc<Snapshot>,
-    cur: Arc<Snapshot>,
-    clock: RenderClock,
+    interp: Interpolator,
     speed: f64,
     base: Base<Node>,
 }
@@ -28,9 +27,7 @@ impl INode for Simulation {
     fn init(base: Base<Node>) -> Self {
         Simulation {
             handle: None,
-            prev: Arc::new(Snapshot::default()),
-            cur: Arc::new(Snapshot::default()),
-            clock: RenderClock::new(),
+            interp: Interpolator::new(Arc::new(Snapshot::default())),
             speed: 1.0,
             base,
         }
@@ -60,9 +57,7 @@ impl Simulation {
             .collect();
         let sim = Sim::new(points.as_slice().to_vec(), &constraints, seed as u64);
         let handle = SimHandle::start(sim);
-        self.prev = handle.snapshot();
-        self.cur = Arc::clone(&self.prev);
-        self.clock = RenderClock::new();
+        self.interp = Interpolator::new(handle.snapshot());
         self.handle = Some(handle);
     }
 
@@ -145,50 +140,55 @@ impl Simulation {
         for error in handle.take_errors() {
             godot_error!("sim: {error}");
         }
-        let latest = handle.snapshot();
-        if latest.tick != self.cur.tick {
-            self.prev = std::mem::replace(&mut self.cur, latest);
-            self.clock.on_swap();
-        }
-        self.clock.advance(delta * self.speed * TICK_RATE as f64)
+        self.interp.push(handle.snapshot());
+        self.interp.advance(delta * self.speed * TICK_RATE as f64)
     }
 
     /// Current tick of the latest snapshot.
     #[func]
     pub fn tick(&self) -> i64 {
-        self.cur.tick as i64
+        self.interp.cur().tick as i64
     }
 
     /// Wall-clock cost (ms) of the sim step behind the latest snapshot.
     #[func]
     pub fn step_ms(&self) -> f32 {
-        self.cur.step_ms
+        self.interp.cur().step_ms
     }
 
     /// Unit ids in snapshot order; rows of the other getters align with this.
     #[func]
     pub fn get_unit_ids(&self) -> PackedInt64Array {
-        self.cur.ids.iter().map(|id| id.raw() as i64).collect()
+        self.interp
+            .cur()
+            .ids
+            .iter()
+            .map(|id| id.raw() as i64)
+            .collect()
     }
 
-    /// Positions interpolated between the two latest snapshots. Units that
-    /// spawned this tick have no previous sample and render at their current
-    /// position.
+    /// Positions interpolated between the snapshots bracketing render time;
+    /// alpha > 1 extrapolates waypoint-ward along the last pair (see
+    /// [`display_pos`]). Units with no sample in the older snapshot render
+    /// at their current position.
     #[func]
     pub fn get_positions(&self, alpha: f32) -> PackedVector2Array {
+        let (prev, cur) = (self.interp.prev(), self.interp.cur());
         let mut out = PackedVector2Array::new();
-        out.resize(self.cur.ids.len());
+        out.resize(cur.ids.len());
         let slice = out.as_mut_slice();
         let mut p = 0;
-        for (i, &id) in self.cur.ids.iter().enumerate() {
-            let cur = self.cur.positions[i];
+        for (i, &id) in cur.ids.iter().enumerate() {
+            let cur_pos = cur.positions[i];
             // Both id lists are in slot order: advance a single cursor.
-            while p < self.prev.ids.len() && (self.prev.ids[p].raw() as u32) < (id.raw() as u32) {
+            while p < prev.ids.len() && (prev.ids[p].raw() as u32) < (id.raw() as u32) {
                 p += 1;
             }
-            slice[i] = match self.prev.ids.get(p) {
-                Some(&pid) if pid == id => self.prev.positions[p].lerp(cur, alpha),
-                _ => cur,
+            slice[i] = match prev.ids.get(p) {
+                Some(&pid) if pid == id => {
+                    display_pos(prev.positions[p], cur_pos, cur.waypoints[i], alpha)
+                }
+                _ => cur_pos,
             };
         }
         out
@@ -196,25 +196,25 @@ impl Simulation {
 
     #[func]
     pub fn get_radii(&self) -> PackedFloat32Array {
-        self.cur.radii.as_slice().into()
+        self.interp.cur().radii.as_slice().into()
     }
 
     #[func]
     pub fn get_velocities(&self) -> PackedVector2Array {
-        PackedVector2Array::from(self.cur.velocities.as_slice())
+        PackedVector2Array::from(self.interp.cur().velocities.as_slice())
     }
 
     /// Next waypoint per unit (own position when idle).
     #[func]
     pub fn get_waypoints(&self) -> PackedVector2Array {
-        PackedVector2Array::from(self.cur.waypoints.as_slice())
+        PackedVector2Array::from(self.interp.cur().waypoints.as_slice())
     }
 
     /// Remaining path per unit; empty unless the debug overlay is on.
     #[func]
     pub fn get_unit_paths(&self) -> Array<PackedVector2Array> {
         let mut out = Array::new();
-        if let Some(paths) = &self.cur.debug_paths {
+        if let Some(paths) = &self.interp.cur().debug_paths {
             for path in paths {
                 out.push(&PackedVector2Array::from(path.as_slice()));
             }
@@ -226,7 +226,7 @@ impl Simulation {
     /// overlay is visible, call `request_mesh_dump` and poll `take_mesh_dump`.
     #[func]
     pub fn nav_version(&self) -> i64 {
-        self.cur.nav_version as i64
+        self.interp.cur().nav_version as i64
     }
 
     #[func]

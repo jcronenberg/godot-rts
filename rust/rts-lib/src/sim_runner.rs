@@ -2,6 +2,7 @@
 //! `Arc`-swapped snapshots out. Pacing lives here, never in the sim core —
 //! tests/benches/replays call `step` directly. No Godot dependencies.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -69,39 +70,113 @@ impl Snapshot {
     }
 }
 
-/// Render-side clock mapping frame time onto snapshot intervals.
-///
-/// Holds ticks elapsed past the previous snapshot; the view lerps with the
-/// returned alpha. Leftover time carries across swaps so motion stays
-/// continuous, but a lead of a full tick or more (frame stall, pause,
-/// fast-forward) is discarded and the clock resyncs to the interval start:
-/// such a lead can never be caught up smoothly (alpha is already pinned),
-/// and carrying it would pin alpha at 1.0 permanently.
-#[derive(Default)]
-pub struct RenderClock {
-    ticks: f64,
+/// View-side snapshot buffer with a continuous render clock that targets
+/// estimated *current* sim time, not the newest snapshot. Inside a snapshot
+/// interval the clock runs past the newest tick and the view extrapolates
+/// (alpha > 1 on the last pair, capped at one tick), so display latency is
+/// near zero at any sim speed; mispredictions are bounded by one tick of
+/// unit movement. Drift is corrected by nudging playback rate, never by
+/// stepping backwards, so rendered time is monotonic.
+pub struct Interpolator {
+    /// Snapshots in tick order; `[0]` is the current bracket start.
+    buf: VecDeque<Arc<Snapshot>>,
+    /// Continuous render position in tick units.
+    render_tick: f64,
+    /// Estimated continuous sim time: `push` resyncs it to the arriving
+    /// snapshot's tick; `advance` keeps it in `[newest, newest + MAX_EXTRAP]`.
+    sim_now: f64,
 }
 
-impl RenderClock {
-    pub fn new() -> RenderClock {
-        RenderClock::default()
+impl Interpolator {
+    /// Ticks the view may extrapolate past the newest snapshot.
+    const MAX_EXTRAP: f64 = 1.0;
+    /// Phase error tolerated before nudging the playback rate.
+    const DEADBAND: f64 = 0.25;
+    /// Playback rate nudge outside the deadband.
+    const SLEW: f64 = 0.05;
+    /// Phase lag beyond which the clock snaps forward to the target.
+    const SNAP: f64 = 1.5;
+
+    pub fn new(initial: Arc<Snapshot>) -> Interpolator {
+        let render_tick = initial.tick as f64;
+        Interpolator {
+            buf: VecDeque::from([initial]),
+            render_tick,
+            sim_now: render_tick,
+        }
     }
 
-    /// Call when a new snapshot becomes current (one interval consumed).
-    pub fn on_swap(&mut self) {
-        let leftover = self.ticks - 1.0;
-        self.ticks = if leftover < 1.0 {
-            leftover.max(0.0)
-        } else {
-            0.0
-        };
+    /// Buffer a snapshot; ignored unless newer than the newest held.
+    pub fn push(&mut self, snap: Arc<Snapshot>) {
+        if snap.tick > self.buf.back().unwrap().tick {
+            // Authoritative resync: the sim just published this tick. Must
+            // overwrite, not max(): max() would let frame-clock drift
+            // accumulate until sim_now saturates at the extrapolation cap
+            // and rendered time pins there. The transient negative err an
+            // overwrite can cause is absorbed by the deadband.
+            self.sim_now = snap.tick as f64;
+            self.buf.push_back(snap);
+        }
     }
 
-    /// Advance by elapsed ticks (`delta * speed * TICK_RATE`); returns alpha.
+    /// Older snapshot of the current bracket.
+    pub fn prev(&self) -> &Arc<Snapshot> {
+        &self.buf[0]
+    }
+
+    /// Newer snapshot of the current bracket; the view renders its rows.
+    pub fn cur(&self) -> &Arc<Snapshot> {
+        self.buf.get(1).unwrap_or(&self.buf[0])
+    }
+
+    /// Advance the render clock by elapsed ticks (`delta * speed * TICK_RATE`)
+    /// and return the alpha between [`Self::prev`] and [`Self::cur`].
+    /// Alpha may exceed 1.0: extrapolation past the newest snapshot.
     pub fn advance(&mut self, ticks: f64) -> f32 {
-        self.ticks += ticks;
-        self.ticks.min(1.0) as f32
+        let newest = self.buf.back().unwrap().tick as f64;
+        let oldest = self.buf.front().unwrap().tick as f64;
+        // Never assume more than one unseen tick (stall, pause).
+        self.sim_now = (self.sim_now + ticks).min(newest + Self::MAX_EXTRAP);
+        let err = self.sim_now - self.render_tick;
+        if err > Self::SNAP {
+            self.render_tick += err; // hopelessly behind (stall, fast-forward)
+        } else if err.abs() > Self::DEADBAND {
+            self.render_tick += ticks * (1.0 + Self::SLEW * err.signum());
+        } else {
+            self.render_tick += ticks;
+        }
+        self.render_tick = self.render_tick.clamp(oldest, newest + Self::MAX_EXTRAP);
+        // Trim to the bracket, but keep two snapshots: extrapolation past
+        // `newest` needs the last pair as its motion segment.
+        while self.buf.len() > 2 && (self.buf[1].tick as f64) <= self.render_tick {
+            self.buf.pop_front();
+        }
+        let prev_tick = self.buf[0].tick as f64;
+        let span = self.cur().tick as f64 - prev_tick;
+        if span > 0.0 {
+            ((self.render_tick - prev_tick) / span) as f32
+        } else {
+            1.0
+        }
     }
+}
+
+/// Display position for one unit. Alpha <= 1 lerps; beyond that only the
+/// waypoint-ward component of the last displacement is extrapolated, capped
+/// at the waypoint, so collision shoves aren't amplified and idle units
+/// (waypoint = own position) stay put.
+pub fn display_pos(prev: Vector2, cur: Vector2, waypoint: Vector2, alpha: f32) -> Vector2 {
+    if alpha <= 1.0 {
+        return prev.lerp(cur, alpha);
+    }
+    let extra = (cur - prev) * (alpha - 1.0);
+    let to_wp = waypoint - cur;
+    let len2 = to_wp.length_squared();
+    if len2 <= f32::EPSILON {
+        return cur;
+    }
+    let frac = (extra.dot(to_wp) / len2).clamp(0.0, 1.0);
+    cur + to_wp * frac
 }
 
 /// Navmesh geometry for the debug overlay, produced on request only.
@@ -332,43 +407,137 @@ mod tests {
         }
     }
 
+    fn snap_at(tick: u64) -> Arc<Snapshot> {
+        Arc::new(Snapshot {
+            tick,
+            ..Default::default()
+        })
+    }
+
+    /// Continuous rendered time implied by a bracket + alpha.
+    fn rendered(prev: &Snapshot, cur: &Snapshot, alpha: f32) -> f64 {
+        prev.tick as f64 + alpha as f64 * (cur.tick - prev.tick) as f64
+    }
+
     #[test]
-    fn test_render_clock_steady_state_is_smooth() {
-        // 2 frames per tick: alpha must advance every frame, no pinning.
-        let mut clock = RenderClock::new();
-        for _ in 0..100 {
-            let a = clock.advance(0.5);
-            let b = clock.advance(0.5);
-            assert!(b > a, "alpha must advance within the interval");
-            clock.on_swap();
+    fn test_interpolator_steady_state_is_smooth() {
+        // 2 frames per tick: rendered time advances every frame, no pin/jump.
+        let mut it = Interpolator::new(snap_at(0));
+        let mut last = 0.0;
+        for tick in 1..100 {
+            it.push(snap_at(tick));
+            for _ in 0..2 {
+                let alpha = it.advance(0.5);
+                let t = rendered(it.prev(), it.cur(), alpha);
+                assert!(t > last, "rendered time stalled: {last} -> {t}");
+                assert!(t <= tick as f64 + 1.0, "extrapolated more than one tick");
+                last = t;
+            }
+        }
+        assert!(it.buf.len() <= 2, "buffer must stay trimmed");
+    }
+
+    #[test]
+    fn test_interpolator_low_speed_tracks_sim_time() {
+        // 8 frames per tick (sim speed 0.25): rendered time must stay smooth
+        // and track estimated sim time closely — display latency must not
+        // grow to a full (long) tick like the delay-based scheme.
+        let mut it = Interpolator::new(snap_at(0));
+        let mut last = 0.0;
+        for tick in 1..100 {
+            it.push(snap_at(tick));
+            for _ in 0..8 {
+                let alpha = it.advance(0.125);
+                let t = rendered(it.prev(), it.cur(), alpha);
+                assert!(t > last, "rendered time stalled: {last} -> {t}");
+                last = t;
+                if tick > 30 {
+                    let lag = tick as f64 - t;
+                    assert!(lag < 0.5, "latency too high at tick {tick}: {lag}");
+                }
+            }
         }
     }
 
     #[test]
-    fn test_render_clock_recovers_from_long_stall() {
-        // Regression: a lead of >= 1 tick at swap (long frame, pause,
-        // fast-forward) must resync, not lock alpha at 1.0 forever.
-        let mut clock = RenderClock::new();
-        clock.advance(2.5); // frame stall spanning multiple ticks
-        clock.on_swap();
+    fn test_interpolator_absorbs_clock_drift() {
+        // Frame clock 2% fast vs snapshot cadence: the rate nudge must keep
+        // rendered time strictly advancing (no pin at the newest snapshot,
+        // which was the old stutter at sim speeds < 1).
+        let mut it = Interpolator::new(snap_at(0));
+        let mut last = 0.0;
+        for tick in 1..200 {
+            it.push(snap_at(tick));
+            for _ in 0..2 {
+                let alpha = it.advance(0.51);
+                let t = rendered(it.prev(), it.cur(), alpha);
+                assert!(t > last, "rendered time stalled: {last} -> {t}");
+                last = t;
+            }
+        }
+    }
+
+    #[test]
+    fn test_interpolator_recovers_from_stall() {
+        let mut it = Interpolator::new(snap_at(0));
+        it.push(snap_at(1));
+        // Sim stalls: render clock runs one extrapolated tick past the
+        // newest snapshot, then holds.
+        let mut last = 0.0;
         for _ in 0..10 {
-            let a = clock.advance(0.5);
-            let b = clock.advance(0.5);
-            assert!(a < 1.0, "alpha pinned after stall: interpolation dead");
-            assert!(b > a, "alpha must advance within the interval");
-            clock.on_swap();
+            let alpha = it.advance(0.5);
+            last = rendered(it.prev(), it.cur(), alpha);
         }
+        assert!(
+            (last - 2.0).abs() < 1e-9,
+            "must hold one tick past newest: {last}"
+        );
+        // Snapshots resume: rendered time moves forward again, never back.
+        for tick in 2..10 {
+            it.push(snap_at(tick));
+            for _ in 0..2 {
+                let alpha = it.advance(0.5);
+                let t = rendered(it.prev(), it.cur(), alpha);
+                assert!(t > last, "rendered time stalled or reversed: {last} -> {t}");
+                last = t;
+            }
+        }
+        assert!(last > 1.0, "must resume after stall");
     }
 
     #[test]
-    fn test_render_clock_carries_sub_tick_leftover() {
-        // A short hiccup carries over instead of resyncing.
-        let mut clock = RenderClock::new();
-        let alpha = clock.advance(1.4);
-        assert_eq!(alpha, 1.0);
-        clock.on_swap();
-        // 0.4 carried + 0.1 advanced.
-        assert!((clock.advance(0.1) - 0.5).abs() < 1e-9);
+    fn test_display_pos_extrapolation() {
+        let wp = v(10.0, 0.0);
+        // Below alpha 1: plain lerp.
+        assert_eq!(display_pos(v(0.0, 0.0), v(2.0, 0.0), wp, 0.5), v(1.0, 0.0));
+        // Straight waypoint-ward motion extrapolates linearly.
+        assert_eq!(display_pos(v(0.0, 0.0), v(1.0, 0.0), wp, 1.5), v(1.5, 0.0));
+        // Idle (waypoint = own position): never extrapolate.
+        let cur = v(3.0, 4.0);
+        assert_eq!(display_pos(v(2.0, 4.0), cur, cur, 2.0), cur);
+        // Sideways collision shove: no waypoint-ward component, no extrapolation.
+        assert_eq!(
+            display_pos(v(0.0, 0.0), v(0.0, 1.0), v(10.0, 1.0), 2.0),
+            v(0.0, 1.0)
+        );
+        // Backward displacement is dropped, not mirrored.
+        assert_eq!(display_pos(v(1.0, 0.0), v(0.0, 0.0), wp, 2.0), v(0.0, 0.0));
+        // Extrapolation is capped at the waypoint.
+        assert_eq!(
+            display_pos(v(0.0, 0.0), v(1.0, 0.0), v(1.2, 0.0), 2.0),
+            v(1.2, 0.0)
+        );
+    }
+
+    #[test]
+    fn test_interpolator_brackets_across_tick_gaps() {
+        // Snapshot gaps (fast-forward skips polls) lerp across the gap.
+        let mut it = Interpolator::new(snap_at(10));
+        it.push(snap_at(13));
+        // Far behind sim time (13): snaps forward, brackets (10, 13).
+        let alpha = it.advance(0.0);
+        assert_eq!((it.prev().tick, it.cur().tick), (10, 13));
+        assert!((rendered(it.prev(), it.cur(), alpha) - 13.0).abs() < 1e-6);
     }
 
     #[test]

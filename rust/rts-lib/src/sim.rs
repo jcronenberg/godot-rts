@@ -16,6 +16,11 @@ use crate::navmesh::{DynamicNavmesh, Obstacle, ObstacleId};
 pub const TICK_RATE: u32 = 30;
 /// Fixed timestep in seconds.
 pub const DT: f32 = 1.0 / TICK_RATE as f32;
+/// Fraction of pairwise overlap corrected per tick: soft separation, since
+/// full correction overshoots in clumps (summed pushes) and ping-pongs.
+const SEPARATION_RELAX: f32 = 0.2;
+/// Per-tick separation displacement cap, as a fraction of the unit's speed.
+const SEPARATION_MAX_FRAC: f32 = 0.5;
 
 // ── RNG ───────────────────────────────────────────────────────────────────────
 
@@ -521,10 +526,11 @@ impl Sim {
         }
     }
 
-    /// Pairwise push-out of overlapping unit circles. Forces are computed
+    /// Pairwise soft push-out of overlapping unit circles: each tick corrects
+    /// [`SEPARATION_RELAX`] of the remaining overlap, capped at
+    /// [`SEPARATION_MAX_FRAC`] of the unit's own step. Forces are computed
     /// from start-of-tick positions into a displacement buffer and applied
-    /// afterwards, so slot order can't leak into the result; per-unit
-    /// displacement is clamped to `max_speed * DT`.
+    /// afterwards, so slot order can't leak into the result.
     fn separate(&mut self) {
         let s = &mut self.step_scratch;
         s.ids.clear();
@@ -569,7 +575,7 @@ impl Sim {
                         } else {
                             Vector2::new(1.0, 0.0)
                         };
-                        let push = dir * ((min_dist - d) * 0.5);
+                        let push = dir * ((min_dist - d) * 0.5 * SEPARATION_RELAX);
                         s.disp[i] += push;
                         s.disp[j] -= push;
                     }
@@ -583,7 +589,7 @@ impl Sim {
             if len2 == 0.0 {
                 continue;
             }
-            let max_step = s.speeds[i] * DT;
+            let max_step = s.speeds[i] * DT * SEPARATION_MAX_FRAC;
             let len = len2.sqrt();
             let d = if len > max_step {
                 d * (max_step / len)
@@ -1049,6 +1055,39 @@ mod tests {
                     d >= min - 0.1,
                     "units {i},{j} still overlap: dist {d} < {min}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_separation_disperses_without_ping_pong() {
+        // Soft separation: while a stacked clump eases apart, no unit may
+        // reverse direction tick to tick (the visual jitter signature of
+        // overshooting hard resolution).
+        let mut sim = rooms_sim(2, 2, 5);
+        for i in 0..9 {
+            spawn(
+                &mut sim,
+                v(100.0 + 0.01 * i as f32, 100.0 + 0.013 * i as f32),
+                4.0,
+                30.0,
+            );
+        }
+        let mut prev_disp: Vec<Vector2> = vec![Vector2::ZERO; 9];
+        for tick in 0..100 {
+            sim.step(&[]);
+            for (i, (_, u)) in sim.units().iter().enumerate() {
+                let d = u.pos - u.prev_pos;
+                let moved = d.length_squared() > 1e-6;
+                let was_moving = prev_disp[i].length_squared() > 1e-6;
+                if moved && was_moving {
+                    assert!(
+                        d.dot(prev_disp[i]) >= 0.0,
+                        "unit {i} reversed direction at tick {tick}: {:?} -> {d:?}",
+                        prev_disp[i]
+                    );
+                }
+                prev_disp[i] = d;
             }
         }
     }
