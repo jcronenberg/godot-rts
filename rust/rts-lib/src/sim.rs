@@ -499,9 +499,8 @@ impl Sim {
             }
             let mut remaining = unit.max_speed * DT;
             while remaining > 0.0 {
+                // Waypoints exhausted: the post-loop guard clears the path.
                 let Some(&target) = unit.path.get(unit.path_i as usize) else {
-                    unit.path.clear();
-                    unit.path_i = 0;
                     break;
                 };
                 let delta = target - unit.pos;
@@ -635,15 +634,14 @@ impl Sim {
                                 unit.pos = closest + delta * (unit.radius / d);
                                 pushed = true;
                             }
-                        } else {
+                        } else if let Some(twin) = cdt.he_twin(he) {
                             // Circle reaches past a free edge: also check the
                             // neighbor face's walls.
-                            cdt.for_each_neighbor(face, |nb, nb_he| {
-                                if nb_he == he && !s.visited.contains(&nb) {
-                                    s.visited.push(nb);
-                                    s.faces.push(nb);
-                                }
-                            });
+                            let nb = cdt.face_of_he(twin);
+                            if !s.visited.contains(&nb) {
+                                s.visited.push(nb);
+                                s.faces.push(nb);
+                            }
                         }
                     }
                 }

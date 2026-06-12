@@ -47,7 +47,12 @@ impl Simulation {
     /// Build the sim over static map geometry (constraint index pairs into
     /// `points`) and start the sim thread.
     #[func]
-    pub fn load_map(&mut self, points: PackedVector2Array, constraints: PackedInt32Array, seed: i64) {
+    pub fn load_map(
+        &mut self,
+        points: PackedVector2Array,
+        constraints: PackedInt32Array,
+        seed: i64,
+    ) {
         let constraints: Vec<(u32, u32)> = constraints
             .as_slice()
             .chunks_exact(2)

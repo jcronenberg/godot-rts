@@ -1773,6 +1773,12 @@ impl CDT {
         face_of(he)
     }
 
+    /// Twin of half-edge `he`, or `None` on the boundary.
+    pub fn he_twin(&self, he: u32) -> Option<u32> {
+        let twin = self.half_edges[he as usize].twin;
+        (twin != NONE).then_some(twin)
+    }
+
     /// Origin vertex index of half-edge `he`.
     pub fn he_origin(&self, he: u32) -> u32 {
         self.origin(he)

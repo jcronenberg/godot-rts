@@ -90,7 +90,11 @@ impl RenderClock {
     /// Call when a new snapshot becomes current (one interval consumed).
     pub fn on_swap(&mut self) {
         let leftover = self.ticks - 1.0;
-        self.ticks = if leftover < 1.0 { leftover.max(0.0) } else { 0.0 };
+        self.ticks = if leftover < 1.0 {
+            leftover.max(0.0)
+        } else {
+            0.0
+        };
     }
 
     /// Advance by elapsed ticks (`delta * speed * TICK_RATE`); returns alpha.
@@ -240,9 +244,9 @@ impl Drop for SimHandle {
 }
 
 /// Deadline loop: sleep to the next tick deadline, drain the queue, step,
-/// publish. On overrun the deadline advances tick by tick, but never falls
-/// more than one period behind wall clock — late ticks are dropped instead
-/// of replayed (capped catch-up).
+/// publish. On overrun the loop catches up by at most one extra tick; once
+/// it falls more than one period behind wall clock the deadline resets and
+/// the lost ticks are dropped instead of replayed.
 fn run_loop(mut sim: Sim, shared: &Shared) {
     // Queue report_error! messages instead of engine-printing (main-thread only).
     crate::report::install_collector();
@@ -256,7 +260,7 @@ fn run_loop(mut sim: Sim, shared: &Shared) {
         if let Some(wait) = deadline.checked_duration_since(now) {
             std::thread::sleep(wait);
         } else if now - deadline > period {
-            deadline = now; // overrun: drop lost ticks instead of bursting
+            deadline = now; // >1 period behind: drop lost ticks instead of bursting
         }
         if shared.paused.load(Ordering::Relaxed) {
             continue;
