@@ -16,11 +16,44 @@ use crate::navmesh::{DynamicNavmesh, Obstacle, ObstacleId};
 pub const TICK_RATE: u32 = 30;
 /// Fixed timestep in seconds.
 pub const DT: f32 = 1.0 / TICK_RATE as f32;
-/// Fraction of pairwise overlap corrected per tick: soft separation, since
-/// full correction overshoots in clumps (summed pushes) and ping-pongs.
-const SEPARATION_RELAX: f32 = 0.2;
+/// Fraction of pairwise overlap corrected per tick. Firm enough to keep pace
+/// with path convergence (so groups pack without lingering overlap), but below
+/// the point where summed pushes in a clump overshoot and ping-pong.
+const SEPARATION_RELAX: f32 = 0.6;
 /// Per-tick separation displacement cap, as a fraction of the unit's speed.
-const SEPARATION_MAX_FRAC: f32 = 0.5;
+/// Above a full step, so separation can out-push a unit's own path/cohesion
+/// convergence and resolve overlap rather than tolerate it.
+const SEPARATION_MAX_FRAC: f32 = 1.5;
+/// Cohesion radius as a multiple of the largest unit radius: same-group
+/// neighbours within it pull toward their shared centroid.
+const COHESION_RADIUS_FRAC: f32 = 5.0;
+/// Per-tick fraction of the centroid offset applied as a cohesion pull.
+const COHESION_GAIN: f32 = 0.05;
+/// Per-tick cohesion displacement cap, as a fraction of the unit's speed. Kept
+/// well below the path step (and the separation cap) so cohesion stays a gentle
+/// bias and never pulls group-mates back into overlap.
+const COHESION_MAX_FRAC: f32 = 0.15;
+/// A moving unit joins a parked group-mate's cluster (and stops) when within
+/// this multiple of touching distance of it — *and* within its arrival radius
+/// of the goal (below). So a group settles into a blob around its goal instead
+/// of every unit driving to the exact goal point and crushing inward.
+const ARRIVAL_TOUCH_FRAC: f32 = 1.15;
+/// A group's arrival radius is `r * max(ARRIVAL_MIN_RADII, FACTOR*sqrt(N))`.
+/// A unit only crowd-stops once inside it; units still outside keep pushing
+/// toward the goal, so they pack into a tight central core (which separation
+/// then expands cleanly and symmetrically) and the blob centres on the goal
+/// instead of tailing back toward the approach side. Below the packed radius
+/// on purpose; the `MIN` floor keeps small groups (whose followers sit ~2r
+/// out) able to stop at all.
+const ARRIVAL_RADIUS_FACTOR: f32 = 0.7;
+const ARRIVAL_MIN_RADII: f32 = 3.0;
+/// Wall-clamped ticks without progress before a moving unit is treated as stuck
+/// (shoved off its path onto a corner) and repathed from its current position.
+/// ~0.27 s at 30 Hz — long enough to ignore transient clamps.
+const STALL_REPATH_TICKS: u8 = 8;
+/// Remaining-path-length improvement that counts as real progress (and resets
+/// the stall counter); below it the unit is treated as not advancing.
+const STALL_PROGRESS_EPS: f32 = 0.1;
 
 // ── RNG ───────────────────────────────────────────────────────────────────────
 
@@ -98,6 +131,24 @@ pub struct Unit {
     pub path: Vec<Vector2>,
     /// Index of the next waypoint to reach.
     pub path_i: u32,
+    /// Cohesion group, stamped per `Move` command; 0 = ungrouped (no cohesion).
+    pub group: u32,
+    /// Settled at the goal — either reached it, or joined a parked group-mate's
+    /// cluster (crowd-arrival). Cleared on a new `Move`. Distinguishes a real
+    /// goal arrival from a unit that merely idles (e.g. unreachable goal), so
+    /// only true arrivals seed the cluster others stop against.
+    pub parked: bool,
+    /// Distance from the goal within which this unit may crowd-stop — sized to
+    /// the group so the settled blob centres on the goal. Stamped per `Move`.
+    pub arrival_r: f32,
+    /// Ticks wall-clamped without beating [`Unit::min_remaining`]. A group
+    /// shove can push a unit off its cleared path so its line to the next
+    /// waypoint cuts a corner; once this trips it repaths from where it
+    /// actually is. Reset on real progress or a new path.
+    pub stall: u8,
+    /// Best (smallest) remaining path length seen since the path was set — the
+    /// jitter-proof progress yardstick for the stall detector (`MAX` = unset).
+    pub min_remaining: f32,
 }
 
 impl Unit {
@@ -111,6 +162,20 @@ impl Unit {
             Some(&w) => w,
             None => self.pos,
         }
+    }
+
+    /// Polyline distance from the current position through all remaining
+    /// waypoints — monotonically decreasing with real progress, so a flat value
+    /// means the unit isn't advancing. Cheap: paths hold a handful of points.
+    fn remaining_len(&self) -> f32 {
+        let mut total = 0.0;
+        let mut prev = self.pos;
+        for &p in &self.path[self.path_i as usize..] {
+            let (dx, dy) = (p.x - prev.x, p.y - prev.y);
+            total += (dx * dx + dy * dy).sqrt();
+            prev = p;
+        }
+        total
     }
 }
 
@@ -351,11 +416,25 @@ struct StepScratch {
     positions: Vec<Vector2>,
     radii: Vec<f32>,
     speeds: Vec<f32>,
-    /// Separation displacement accumulator, parallel to the dense arrays.
+    /// Separation+cohesion displacement accumulator, parallel to the dense arrays.
     disp: Vec<Vector2>,
+    /// Per dense unit: its group, and whether it is moving / parked at goal.
+    groups: Vec<u32>,
+    moving: Vec<bool>,
+    parked: Vec<bool>,
+    /// Whether a moving unit is within its arrival radius of its goal (so it
+    /// may crowd-stop); false for idle/parked units.
+    within_arrival: Vec<bool>,
+    /// Crowd-arrival marks: set when a moving unit touches a parked group-mate.
+    arrive: Vec<bool>,
+    /// Sum of same-group moving-neighbour positions, and their count, per unit.
+    coh_sum: Vec<Vector2>,
+    coh_n: Vec<u32>,
     /// Wall-clamp face frontier and visited list (tiny per unit).
     faces: Vec<u32>,
     visited: Vec<u32>,
+    /// Units the wall clamp found stuck this tick, to repath (usually empty).
+    repath: Vec<UnitId>,
 }
 
 pub struct Sim {
@@ -369,6 +448,8 @@ pub struct Sim {
     rng: Pcg32,
     grid: SpatialGrid,
     step_scratch: StepScratch,
+    /// Monotonic group id; bumped per `Move`, stamped onto its units.
+    group_seq: u32,
 }
 
 impl Sim {
@@ -387,6 +468,7 @@ impl Sim {
             rng: Pcg32::new(seed),
             grid: SpatialGrid::default(),
             step_scratch: StepScratch::default(),
+            group_seq: 0,
         }
     }
 
@@ -411,7 +493,8 @@ impl Sim {
     ///
     /// Order: store prev positions → apply commands → rebuild navmesh if the
     /// obstacle set changed (refresh abstraction, repath all moving units) →
-    /// integrate along paths → separation → wall clamp → advance tick.
+    /// integrate along paths → flock (separation + cohesion) → wall clamp →
+    /// repath units stuck against a corner → advance tick.
     pub fn step(&mut self, commands: &[Command]) {
         for (_, u) in self.units.iter_mut() {
             u.prev_pos = u.pos;
@@ -421,8 +504,9 @@ impl Sim {
         }
         let mesh_changed = self.rebuild_and_repath();
         self.integrate();
-        self.separate();
+        self.flock();
         self.wall_clamp(mesh_changed);
+        self.repath_stalled();
         self.tick += 1;
     }
 
@@ -436,9 +520,24 @@ impl Sim {
                     max_speed: *speed,
                     path: Vec::new(),
                     path_i: 0,
+                    group: 0,
+                    parked: false,
+                    arrival_r: 0.0,
+                    stall: 0,
+                    min_remaining: f32::MAX,
                 });
             }
             Command::Move { units, goal } => {
+                // One group per Move: its units cohere, separate orders don't.
+                // wrapping_add keeps group_seq away from 0 (the ungrouped sentinel).
+                self.group_seq = self.group_seq.wrapping_add(1).max(1);
+                let group = self.group_seq;
+                // Arrival radius: scales with the live group's packed-disk radius,
+                // floored so small groups can still crowd-stop. Count only IDs that
+                // resolve to live units — stale IDs are silently skipped below.
+                let live_n = units.iter().filter(|&&id| self.units.get(id).is_some()).count();
+                let radii = (ARRIVAL_RADIUS_FACTOR * (live_n as f32).sqrt())
+                    .max(ARRIVAL_MIN_RADII);
                 let cdt = self.nav.navmesh();
                 for &id in units {
                     let Some(unit) = self.units.get_mut(id) else {
@@ -452,6 +551,8 @@ impl Sim {
                         &mut self.scratch,
                         unit.radius,
                     );
+                    unit.group = group;
+                    unit.arrival_r = unit.radius * radii;
                     set_path(unit, path);
                 }
             }
@@ -522,22 +623,41 @@ impl Sim {
             if unit.path_i as usize >= unit.path.len() {
                 unit.path.clear();
                 unit.path_i = 0;
+                unit.parked = true; // reached the goal: seed for crowd-arrival
             }
         }
     }
 
-    /// Pairwise soft push-out of overlapping unit circles: each tick corrects
-    /// [`SEPARATION_RELAX`] of the remaining overlap, capped at
-    /// [`SEPARATION_MAX_FRAC`] of the unit's own step. Forces are computed
-    /// from start-of-tick positions into a displacement buffer and applied
-    /// afterwards, so slot order can't leak into the result.
-    fn separate(&mut self) {
+    /// One grid pass over start-of-tick positions, deriving three per-unit
+    /// effects applied afterwards (fixed order = bit-exact):
+    ///
+    /// - **Separation** (all neighbours, at `r_i + r_j`): corrects
+    ///   [`SEPARATION_RELAX`] of each overlap per tick.
+    /// - **Cohesion** (same-group moving neighbours, at [`COHESION_RADIUS_FRAC`]
+    ///   radii): pulls toward the neighbour centroid by [`COHESION_GAIN`], with
+    ///   any heading-opposing component dropped so stragglers rejoin but
+    ///   leaders are never braked.
+    /// - **Crowd-arrival** (same-group, at [`ARRIVAL_TOUCH_FRAC`] of touching):
+    ///   a moving unit touching a *parked* group-mate parks too, so a group
+    ///   settles into a blob at its goal rather than each unit crushing toward
+    ///   the exact goal point.
+    ///
+    /// The combined displacement is capped at [`SEPARATION_MAX_FRAC`] of the
+    /// unit's own step, well below the path advance, so pathing always wins.
+    fn flock(&mut self) {
         let s = &mut self.step_scratch;
         s.ids.clear();
         s.positions.clear();
         s.radii.clear();
         s.speeds.clear();
         s.disp.clear();
+        s.groups.clear();
+        s.moving.clear();
+        s.parked.clear();
+        s.within_arrival.clear();
+        s.arrive.clear();
+        s.coh_sum.clear();
+        s.coh_n.clear();
         let mut max_radius = 0.0f32;
         for (id, u) in self.units.iter() {
             s.ids.push(id);
@@ -545,17 +665,38 @@ impl Sim {
             s.radii.push(u.radius);
             s.speeds.push(u.max_speed);
             s.disp.push(Vector2::ZERO);
+            s.groups.push(u.group);
+            s.moving.push(u.is_moving());
+            s.parked.push(u.parked);
+            // Within arrival radius of the goal? (Moving units only.)
+            let within = match u.path.last() {
+                Some(&g) if u.arrival_r > 0.0 => {
+                    let (dx, dy) = (u.pos.x - g.x, u.pos.y - g.y);
+                    dx * dx + dy * dy < u.arrival_r * u.arrival_r
+                }
+                _ => false,
+            };
+            s.within_arrival.push(within);
+            s.arrive.push(false);
+            s.coh_sum.push(Vector2::ZERO);
+            s.coh_n.push(0);
             max_radius = max_radius.max(u.radius);
         }
         if s.ids.len() < 2 || max_radius <= 0.0 {
             return;
         }
         let max_diameter = max_radius * 2.0;
-        self.grid.rebuild(&s.positions, max_diameter);
+        let r_coh = max_radius * COHESION_RADIUS_FRAC;
+        let r_coh2 = r_coh * r_coh;
+        // Cell covers the larger radius so the 3×3 scan still finds every pair.
+        self.grid.rebuild(&s.positions, max_diameter.max(r_coh));
 
         for i in 0..s.ids.len() {
             let p = s.positions[i];
             let r_i = s.radii[i];
+            let g_i = s.groups[i];
+            let mv_i = s.moving[i];
+            let pk_i = s.parked[i];
             let (cx, cy) = self.grid.cell_coords(p);
             for ny in cy.saturating_sub(1)..=(cy + 1).min(self.grid.rows - 1) {
                 for nx in cx.saturating_sub(1)..=(cx + 1).min(self.grid.cols - 1) {
@@ -565,40 +706,90 @@ impl Sim {
                             continue;
                         }
                         let delta = p - s.positions[j];
-                        let min_dist = r_i + s.radii[j];
                         let d2 = delta.x * delta.x + delta.y * delta.y;
-                        if d2 >= min_dist * min_dist {
-                            continue;
+                        let min_dist = r_i + s.radii[j];
+                        if d2 < min_dist * min_dist {
+                            let d = d2.sqrt();
+                            // Coincident circles: deterministic x-axis tiebreak.
+                            let dir = if d > 1e-6 {
+                                delta * (1.0 / d)
+                            } else {
+                                Vector2::new(1.0, 0.0)
+                            };
+                            let push = dir * ((min_dist - d) * 0.5 * SEPARATION_RELAX);
+                            s.disp[i] += push;
+                            s.disp[j] -= push;
                         }
-                        let d = d2.sqrt();
-                        // Coincident circles: deterministic x-axis tiebreak.
-                        let dir = if d > 1e-6 {
-                            delta * (1.0 / d)
-                        } else {
-                            Vector2::new(1.0, 0.0)
-                        };
-                        let push = dir * ((min_dist - d) * 0.5 * SEPARATION_RELAX);
-                        s.disp[i] += push;
-                        s.disp[j] -= push;
+                        if g_i == 0 || g_i != s.groups[j] {
+                            continue; // remaining effects are same-group only
+                        }
+                        // Cohesion: between two moving group-mates.
+                        // Store the offset (neighbor - self) so the apply loop can
+                        // compute the pull directly without subtracting own position.
+                        if mv_i && s.moving[j] && d2 < r_coh2 {
+                            s.coh_sum[i] += s.positions[j] - p;
+                            s.coh_sum[j] += p - s.positions[j];
+                            s.coh_n[i] += 1;
+                            s.coh_n[j] += 1;
+                        }
+                        // Crowd-arrival: a moving unit that is within its
+                        // arrival radius of the goal and touches a parked
+                        // group-mate parks too (whichever side is moving). The
+                        // radius gate lets units still far from the goal keep
+                        // pushing in, so the blob centres rather than tailing
+                        // back along the approach.
+                        let touch = min_dist * ARRIVAL_TOUCH_FRAC;
+                        if d2 < touch * touch {
+                            if mv_i && s.within_arrival[i] && s.parked[j] {
+                                s.arrive[i] = true;
+                            } else if pk_i && s.moving[j] && s.within_arrival[j] {
+                                s.arrive[j] = true;
+                            }
+                        }
                     }
                 }
             }
         }
 
         for i in 0..s.ids.len() {
-            let d = s.disp[i];
+            let unit = self.units.get_mut(s.ids[i]).expect("dense id alive");
+            if s.arrive[i] {
+                // Stop where it is, against the cluster — don't drive to centre.
+                unit.path.clear();
+                unit.path_i = 0;
+                unit.parked = true;
+            }
+            let mut d = s.disp[i];
+            if !s.arrive[i] && s.coh_n[i] > 0 {
+                let mut pull = s.coh_sum[i] * (COHESION_GAIN / s.coh_n[i] as f32);
+                // Zero any pull opposing the heading: rejoin laterally/forward,
+                // never brake. coh_n[i] > 0 implies the unit is moving.
+                let h = unit.waypoint() - unit.pos;
+                let h2 = h.x * h.x + h.y * h.y;
+                if h2 > 1e-12 {
+                    let along = (pull.x * h.x + pull.y * h.y) / h2;
+                    if along < 0.0 {
+                        pull -= h * along;
+                    }
+                }
+                // Cap cohesion on its own (small) budget so it can't overpower
+                // separation and pull group-mates back into overlap.
+                let coh_cap = s.speeds[i] * DT * COHESION_MAX_FRAC;
+                let pl2 = pull.x * pull.x + pull.y * pull.y;
+                if pl2 > coh_cap * coh_cap {
+                    pull *= coh_cap / pl2.sqrt();
+                }
+                d += pull;
+            }
             let len2 = d.x * d.x + d.y * d.y;
             if len2 == 0.0 {
                 continue;
             }
             let max_step = s.speeds[i] * DT * SEPARATION_MAX_FRAC;
             let len = len2.sqrt();
-            let d = if len > max_step {
-                d * (max_step / len)
-            } else {
-                d
-            };
-            let unit = self.units.get_mut(s.ids[i]).expect("dense id alive");
+            if len > max_step {
+                d *= max_step / len;
+            }
             unit.pos += d;
         }
     }
@@ -610,13 +801,18 @@ impl Sim {
     fn wall_clamp(&mut self, mesh_changed: bool) {
         let cdt = self.nav.navmesh();
         let s = &mut self.step_scratch;
-        for (_, unit) in self.units.iter_mut() {
+        for (id, unit) in self.units.iter_mut() {
             if unit.radius <= 0.0 || (!mesh_changed && unit.pos == unit.prev_pos) {
                 continue;
             }
             // A push moves the circle and changes which faces it overlaps,
             // invalidating the walk in progress; re-walk until a pass applies
-            // no push (bounded against corner ping-pong).
+            // no push (bounded against corner ping-pong). `out` accumulates the
+            // outward wall normals so we can tell a wall the unit faces from one
+            // merely beside it. `pushed_any` tracks whether any pass pushed, so
+            // the stall detector fires even when opposite normals cancel in `out`.
+            let mut out = Vector2::ZERO;
+            let mut pushed_any = false;
             for _ in 0..4 {
                 let Some(start) = cdt.locate_face(unit.pos) else {
                     break;
@@ -641,6 +837,8 @@ impl Sim {
                             if d > 1e-6 {
                                 unit.pos = closest + delta * (unit.radius / d);
                                 pushed = true;
+                                pushed_any = true;
+                                out += delta * (1.0 / d);
                             }
                         } else if let Some(twin) = cdt.he_twin(he) {
                             // Circle reaches past a free edge: also check the
@@ -657,7 +855,69 @@ impl Sim {
                     break;
                 }
             }
+            // Stuck-on-corner detection: a moving unit shoved off its cleared
+            // route so its line to the next waypoint cuts a wall — i.e. it's
+            // pressed against a wall (`pushed_any`), heading *into* that wall
+            // (waypoint on its far side), and not shrinking its remaining path.
+            // The wall-facing test is what separates this from a unit merely
+            // jammed sideways against a wall by neighbours (where a repath
+            // wouldn't help). Skipped in the arrival zone (crowding, not walls,
+            // holds it). After a few such ticks, repath from where it now is.
+            // Free ticks (no wall contact) reset the counter so only consecutive
+            // clamped ticks accumulate toward the threshold.
+            if pushed_any && unit.is_moving() {
+                let goal = *unit.path.last().expect("moving ⇒ non-empty path");
+                let (gx, gy) = (goal.x - unit.pos.x, goal.y - unit.pos.y);
+                let in_arrival = gx * gx + gy * gy <= unit.arrival_r * unit.arrival_r;
+                let rem = unit.remaining_len();
+                let w = unit.waypoint();
+                let into_wall = (w.x - unit.pos.x) * out.x + (w.y - unit.pos.y) * out.y < 0.0;
+                if in_arrival {
+                    unit.stall = 0;
+                    unit.min_remaining = rem;
+                } else if rem < unit.min_remaining - STALL_PROGRESS_EPS {
+                    unit.min_remaining = rem;
+                    unit.stall = 0;
+                } else if into_wall {
+                    unit.stall = unit.stall.saturating_add(1);
+                    if unit.stall >= STALL_REPATH_TICKS {
+                        s.repath.push(id);
+                        unit.stall = 0;
+                    }
+                }
+            } else {
+                unit.stall = 0; // no wall contact this tick: don't carry stall forward
+            }
         }
+    }
+
+    /// Repath units the wall clamp flagged as stuck against a corner, from
+    /// their current (shoved) positions, so their next waypoint is reachable in
+    /// a straight line again. Usually a no-op (empty list).
+    fn repath_stalled(&mut self) {
+        if self.step_scratch.repath.is_empty() {
+            return;
+        }
+        let cdt = self.nav.navmesh();
+        for i in 0..self.step_scratch.repath.len() {
+            let id = self.step_scratch.repath[i];
+            let Some(unit) = self.units.get_mut(id) else {
+                continue;
+            };
+            let Some(&goal) = unit.path.last() else {
+                continue;
+            };
+            let path = find_path_abstract(
+                cdt,
+                &self.abstraction,
+                unit.pos,
+                goal,
+                &mut self.scratch,
+                unit.radius,
+            );
+            set_path(unit, path);
+        }
+        self.step_scratch.repath.clear();
     }
 
     /// FNV-1a over tick, unit slots (slot order) and RNG — divergence detector
@@ -665,6 +925,7 @@ impl Sim {
     pub fn state_hash(&self) -> u64 {
         let mut h = Fnv::new();
         h.write_u64(self.tick);
+        h.write_u64(self.group_seq as u64);
         h.write_u64(self.nav.num_obstacles() as u64);
         h.write_u64(self.units.slots.len() as u64);
         for (i, slot) in self.units.slots.iter().enumerate() {
@@ -677,6 +938,11 @@ impl Sim {
             h.write_v2(u.prev_pos);
             h.write_f32(u.radius);
             h.write_f32(u.max_speed);
+            h.write_u64(u.group as u64);
+            h.write_u64(u.parked as u64);
+            h.write_f32(u.arrival_r);
+            h.write_u64(u.stall as u64);
+            h.write_f32(u.min_remaining);
             h.write_u64(u.path_i as u64);
             h.write_u64(u.path.len() as u64);
             for &p in &u.path {
@@ -693,6 +959,9 @@ impl Sim {
 /// means idle.
 fn set_path(unit: &mut Unit, mut path: Vec<Vector2>) {
     unit.path_i = 0;
+    unit.parked = false; // re-tasked: no longer settled at a goal
+    unit.stall = 0; // fresh path: clear any stuck-on-corner accrual
+    unit.min_remaining = f32::MAX;
     if path.len() >= 2 {
         path.remove(0);
         unit.path = path;
@@ -735,16 +1004,6 @@ mod tests {
         ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
     }
 
-    /// Polyline length from the unit's position through its remaining waypoints.
-    fn remaining_len(u: &Unit) -> f32 {
-        let mut prev = u.pos;
-        let mut total = 0.0;
-        for &p in &u.path[u.path_i as usize..] {
-            total += dist(prev, p);
-            prev = p;
-        }
-        total
-    }
 
     #[test]
     fn test_spawn_and_idle() {
@@ -765,7 +1024,7 @@ mod tests {
             units: vec![id],
             goal,
         }]);
-        let len = remaining_len(unit(&sim, id));
+        let len = unit(&sim, id).remaining_len();
         assert!(len > 0.0, "path must exist");
         let bound = (len / (30.0 * DT)).ceil() as usize + 2;
         step_n(&mut sim, bound);
@@ -784,7 +1043,7 @@ mod tests {
         }]);
         // While en route (not the arrival tick), each tick moves exactly
         // speed * DT of polyline distance, including across corners.
-        let total = remaining_len(unit(&sim, id));
+        let total = unit(&sim, id).remaining_len();
         let full_ticks = (total / (25.0 * DT)) as usize - 1;
         for _ in 0..full_ticks {
             let before = unit(&sim, id).pos;
@@ -915,7 +1174,7 @@ mod tests {
             units: vec![id],
             goal,
         }]);
-        let base_len = remaining_len(unit(&sim, id));
+        let base_len = unit(&sim, id).remaining_len();
 
         // Narrow the doorway (gap x=100, y in [35, 65]).
         sim.step(&[Command::AddObstacle {
@@ -923,7 +1182,7 @@ mod tests {
         }]);
         let u = unit(&sim, id);
         assert!(u.is_moving(), "detour must exist");
-        let detour_len = remaining_len(u);
+        let detour_len = u.remaining_len();
         assert!(
             detour_len > base_len,
             "detour {detour_len} not longer than base {base_len}"
@@ -1125,24 +1384,343 @@ mod tests {
         }
     }
 
+    /// Mean distance of the alive units from their centroid (group spread).
+    fn spread(sim: &Sim) -> f32 {
+        let ps: Vec<Vector2> = sim.units().iter().map(|(_, u)| u.pos).collect();
+        let n = ps.len() as f32;
+        let mut c = Vector2::ZERO;
+        for &p in &ps {
+            c += p;
+        }
+        c *= 1.0 / n;
+        ps.iter().map(|&p| dist(p, c)).sum::<f32>() / n
+    }
+
+    /// Ticks until `id` stops moving (arrives); panics if it never does.
+    fn arrival_tick(sim: &mut Sim, id: UnitId, max: u64) -> u64 {
+        for t in 1..=max {
+            sim.step(&[]);
+            if !unit(sim, id).is_moving() {
+                return t;
+            }
+        }
+        panic!("unit did not arrive within {max} ticks");
+    }
+
+
+    #[test]
+    fn test_crowd_arrival_stops_short_of_goal() {
+        // A reaches the goal and parks; B, behind it and same group, stops on
+        // contact instead of driving onto the exact goal point.
+        let mut sim = rooms_sim(2, 1, 8);
+        let goal = v(150.0, 50.0);
+        let a = spawn(&mut sim, v(135.0, 50.0), 5.0, 30.0);
+        let b = spawn(&mut sim, v(110.0, 50.0), 5.0, 30.0);
+        sim.step(&[Command::Move {
+            units: vec![a, b],
+            goal,
+        }]);
+        step_n(&mut sim, 200);
+        let (ua, ub) = (unit(&sim, a), unit(&sim, b));
+        assert!(ua.parked && ub.parked, "both must settle (parked)");
+        assert!(!ua.is_moving() && !ub.is_moving());
+        let (da, db) = (dist(ua.pos, goal), dist(ub.pos, goal));
+        assert!(da.min(db) < 6.0, "one unit settles at the goal: {}", da.min(db));
+        assert!(
+            da.max(db) > 7.0,
+            "the other stops short, not crammed onto the goal: {}",
+            da.max(db)
+        );
+        assert!(dist(ua.pos, ub.pos) >= 9.5, "must not hard-overlap");
+    }
+
+    #[test]
+    fn test_group_settles_as_blob_without_crush() {
+        // A group arriving at one goal settles into a packed blob around it,
+        // not a hard pile crammed onto the goal point.
+        let mut sim = rooms_sim(1, 1, 13);
+        let goal = v(50.0, 50.0);
+        let mut ids = Vec::new();
+        for i in 0..16 {
+            ids.push(spawn(
+                &mut sim,
+                v(12.0 + 4.0 * (i % 4) as f32, 12.0 + 4.0 * (i / 4) as f32),
+                5.0,
+                30.0,
+            ));
+        }
+        sim.step(&[Command::Move { units: ids, goal }]);
+        step_n(&mut sim, 300);
+        let us: Vec<&Unit> = sim.units().iter().map(|(_, u)| u).collect();
+        assert!(
+            us.iter().all(|u| u.parked && !u.is_moving()),
+            "whole group must settle"
+        );
+        // No hard clump: nothing overlaps beyond tolerance.
+        for i in 0..us.len() {
+            for j in (i + 1)..us.len() {
+                let d = dist(us[i].pos, us[j].pos);
+                assert!(
+                    d >= us[i].radius + us[j].radius - 0.5,
+                    "units {i},{j} overlap: {d}"
+                );
+            }
+        }
+        // Only a couple reach the goal centre; the rest stop around it.
+        let at_goal = us.iter().filter(|u| dist(u.pos, goal) < 5.0).count();
+        assert!(at_goal <= 2, "units crammed onto the goal centre: {at_goal}");
+        // The blob is *centred* on the goal — the radius-gated crowd-stop lets
+        // units pack around it rather than tailing back along the approach, so
+        // the centroid lands within ~one unit-diameter of the goal.
+        let mut c = Vector2::ZERO;
+        for u in &us {
+            c += u.pos;
+        }
+        c *= 1.0 / us.len() as f32;
+        assert!(
+            dist(c, goal) < 12.0,
+            "group centre not at the goal: {}",
+            dist(c, goal)
+        );
+    }
+
+    #[test]
+    fn test_new_move_unparks_settled_group() {
+        // A re-order clears `parked` and the group moves off again.
+        let mut sim = rooms_sim(2, 1, 2);
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            ids.push(spawn(&mut sim, v(120.0 + 5.0 * i as f32, 50.0), 5.0, 30.0));
+        }
+        sim.step(&[Command::Move {
+            units: ids.clone(),
+            goal: v(150.0, 50.0),
+        }]);
+        step_n(&mut sim, 150);
+        assert!(sim.units().iter().all(|(_, u)| u.parked), "group settles");
+        sim.step(&[Command::Move {
+            units: ids,
+            goal: v(50.0, 50.0),
+        }]);
+        assert!(
+            sim.units().iter().all(|(_, u)| !u.parked),
+            "re-move must clear parked"
+        );
+        step_n(&mut sim, 250);
+        let (mut c, n) = (Vector2::ZERO, sim.units().len() as f32);
+        for (_, u) in sim.units().iter() {
+            c += u.pos;
+        }
+        c *= 1.0 / n;
+        assert!(dist(c, v(50.0, 50.0)) < 20.0, "group reaches the new goal");
+    }
+
+    #[test]
+    fn test_group_rounding_corner_none_stuck() {
+        // A group rounding the end of a wall: the pack shoves some units onto
+        // the wall's face, where their straight line to the next waypoint cuts
+        // through it and the wall clamp pins them — stuck. The stall-repath
+        // (heading-into-wall, no progress) must route them around and every
+        // unit must reach the goal. Without it ~2 units stay pinned on the wall.
+        let mut sim = rooms_sim(1, 1, 1);
+        sim.step(&[Command::AddObstacle {
+            points: vec![v(72.0, 10.0), v(78.0, 10.0), v(78.0, 75.0), v(72.0, 75.0)],
+        }]);
+        let goal = v(90.0, 40.0);
+        let mut ids = Vec::new();
+        for i in 0..12 {
+            ids.push(spawn(
+                &mut sim,
+                v(20.0 + 5.0 * (i % 6) as f32, 35.0 + 5.0 * (i / 6) as f32),
+                5.0,
+                25.0,
+            ));
+        }
+        sim.step(&[Command::Move { units: ids, goal }]);
+        step_n(&mut sim, 900);
+        for (_, u) in sim.units().iter() {
+            assert!(
+                dist(u.pos, goal) < 45.0,
+                "unit stuck short of the goal at {:?} (dist {:.1})",
+                u.pos,
+                dist(u.pos, goal)
+            );
+        }
+    }
+
+    #[test]
+    fn test_cohesion_tightens_group_spread() {
+        // Same scenario twice: one Move groups all units (cohesion on); one
+        // Move per unit gives each its own group (no shared group → cohesion
+        // off). Paths and separation are identical, so the spread difference
+        // is cohesion alone. Both variants are a single tick, so timing aligns.
+        let run = |grouped: bool| -> f32 {
+            let mut sim = rooms_sim(3, 1, 7);
+            let mut ids = Vec::new();
+            for i in 0..6 {
+                ids.push(spawn(&mut sim, v(30.0, 20.0 + 12.0 * i as f32), 5.0, 40.0));
+            }
+            let goal = v(250.0, 50.0);
+            let cmds: Vec<Command> = if grouped {
+                vec![Command::Move { units: ids, goal }]
+            } else {
+                ids.into_iter()
+                    .map(|id| Command::Move {
+                        units: vec![id],
+                        goal,
+                    })
+                    .collect()
+            };
+            sim.step(&cmds);
+            step_n(&mut sim, 70);
+            spread(&sim)
+        };
+        let tight = run(true);
+        let loose = run(false);
+        assert!(
+            tight < loose,
+            "cohesion must tighten the group: grouped {tight} vs ungrouped {loose}"
+        );
+    }
+
+    #[test]
+    fn test_cohesion_does_not_brake_leader() {
+        // A fast leader grouped with slow units behind it must arrive about
+        // when it would solo: the cohesion pull toward the lagging group is
+        // backward, and the heading-opposing component is dropped.
+        let goal = v(250.0, 50.0);
+        let solo = {
+            let mut sim = rooms_sim(3, 1, 3);
+            let lead = spawn(&mut sim, v(30.0, 50.0), 5.0, 60.0);
+            sim.step(&[Command::Move {
+                units: vec![lead],
+                goal,
+            }]);
+            arrival_tick(&mut sim, lead, 400)
+        };
+        let grouped = {
+            let mut sim = rooms_sim(3, 1, 3);
+            let lead = spawn(&mut sim, v(30.0, 50.0), 5.0, 60.0);
+            let mut ids = vec![lead];
+            for i in 0..5 {
+                ids.push(spawn(&mut sim, v(20.0 - 3.0 * i as f32, 50.0), 5.0, 12.0));
+            }
+            sim.step(&[Command::Move { units: ids, goal }]);
+            arrival_tick(&mut sim, lead, 400)
+        };
+        assert!(
+            grouped.abs_diff(solo) <= 1,
+            "cohesion braked the leader: solo {solo}, grouped {grouped}"
+        );
+    }
+
+    #[test]
+    fn test_stragglers_do_not_drag_group() {
+        // The front of a moving pack must not wait for a slow straggler added
+        // to its group: its arrival barely changes whether the straggler is
+        // present (backward pull dropped, no group-speed coupling).
+        let goal = v(250.0, 50.0);
+        let front_arrival = |with_straggler: bool| -> u64 {
+            let mut sim = rooms_sim(3, 1, 11);
+            let mut ids = Vec::new();
+            for i in 0..4 {
+                ids.push(spawn(&mut sim, v(30.0 + 12.0 * i as f32, 50.0), 5.0, 50.0));
+            }
+            let front = ids[3];
+            if with_straggler {
+                ids.push(spawn(&mut sim, v(10.0, 50.0), 5.0, 8.0));
+            }
+            sim.step(&[Command::Move { units: ids, goal }]);
+            arrival_tick(&mut sim, front, 600)
+        };
+        let alone = front_arrival(false);
+        let dragged = front_arrival(true);
+        assert!(
+            dragged.abs_diff(alone) <= 2,
+            "straggler dragged the group: without {alone}, with {dragged}"
+        );
+    }
+
+    #[test]
+    fn test_cross_group_independence() {
+        // Two units within cohesion range marching to a shared goal. Same
+        // group: cohesion pulls them together beyond what their converging
+        // paths do. Different groups: no cross-group pull, so they stay as
+        // far apart as the paths alone leave them.
+        let gap_after = |same_group: bool| -> f32 {
+            let mut sim = rooms_sim(3, 1, 4);
+            let a = spawn(&mut sim, v(30.0, 40.0), 5.0, 30.0);
+            let b = spawn(&mut sim, v(30.0, 60.0), 5.0, 30.0);
+            let goal = v(250.0, 50.0);
+            let cmds = if same_group {
+                vec![Command::Move {
+                    units: vec![a, b],
+                    goal,
+                }]
+            } else {
+                vec![
+                    Command::Move {
+                        units: vec![a],
+                        goal,
+                    },
+                    Command::Move {
+                        units: vec![b],
+                        goal,
+                    },
+                ]
+            };
+            sim.step(&cmds);
+            step_n(&mut sim, 20);
+            dist(unit(&sim, a).pos, unit(&sim, b).pos)
+        };
+        let same = gap_after(true);
+        let cross = gap_after(false);
+        assert!(
+            same < cross,
+            "different groups must not cohere: same-group gap {same}, cross-group {cross}"
+        );
+    }
+
+    #[test]
+    fn test_idle_units_do_not_cohere() {
+        // An idle unit (never commanded → group 0, no path) ignores cohesion:
+        // a group marching within cohesion range must not drag it.
+        let mut sim = rooms_sim(3, 1, 6);
+        let idle = spawn(&mut sim, v(60.0, 82.0), 5.0, 30.0);
+        let idle_pos = unit(&sim, idle).pos;
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(spawn(&mut sim, v(30.0 + 8.0 * i as f32, 60.0), 5.0, 30.0));
+        }
+        sim.step(&[Command::Move {
+            units: ids,
+            goal: v(250.0, 60.0),
+        }]);
+        step_n(&mut sim, 20);
+        assert_eq!(unit(&sim, idle).pos, idle_pos, "idle unit was dragged");
+    }
+
     #[test]
     fn test_steady_state_step_is_allocation_free() {
-        let mut sim = rooms_sim(4, 4, 3);
+        // Open single room (no interior corners → no stuck-on-corner repaths,
+        // which legitimately allocate a fresh path and aren't steady state).
+        let mut sim = rooms_sim(1, 1, 3);
         let mut ids = Vec::new();
         for i in 0..32 {
             ids.push(spawn(
                 &mut sim,
-                v(20.0 + 10.0 * (i % 8) as f32, 20.0 + 15.0 * (i / 8) as f32),
+                v(15.0 + 6.0 * (i % 8) as f32, 25.0 + 6.0 * (i / 8) as f32),
                 5.0,
                 20.0,
             ));
         }
         sim.step(&[Command::Move {
             units: ids,
-            goal: v(350.0, 350.0),
+            goal: v(50.0, 50.0),
         }]);
-        // Warm scratch buffers (grid, dense arrays, locate paths).
-        step_n(&mut sim, 10);
+        // Warm scratch buffers (grid, dense arrays, locate paths) and let the
+        // group settle into its blob, so the measured window is steady state.
+        step_n(&mut sim, 40);
         let allocs = crate::alloc_counter::count_allocs(|| {
             for _ in 0..20 {
                 sim.step(&[]);
@@ -1183,6 +1761,11 @@ mod tests {
             max_speed: 1.0,
             path: Vec::new(),
             path_i: 0,
+            group: 0,
+            parked: false,
+            arrival_r: 0.0,
+            stall: 0,
+            min_remaining: f32::MAX,
         });
         assert!(units.despawn(a));
         assert!(!units.despawn(a), "double despawn must fail");
@@ -1193,6 +1776,11 @@ mod tests {
             max_speed: 1.0,
             path: Vec::new(),
             path_i: 0,
+            group: 0,
+            parked: false,
+            arrival_r: 0.0,
+            stall: 0,
+            min_remaining: f32::MAX,
         });
         assert_eq!(a.index, b.index);
         assert_ne!(a.generation, b.generation);

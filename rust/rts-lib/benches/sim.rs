@@ -210,11 +210,56 @@ fn bench_separation(c: &mut Criterion) {
     group.finish();
 }
 
+/// Worst case for cohesion: a dense, same-group, *moving* clump, where the
+/// flock broad-phase scans the most same-group neighbours per cell. Short
+/// chunks — the clump streams toward its goal and thins out.
+fn bench_flock(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sim/flock");
+    group.sample_size(20);
+    for &n in &[100usize, 500, 1_000, 2_000] {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_custom(|iters| {
+                let make = || {
+                    let (points, constraints) = rooms_map(SIDE, SIDE);
+                    let mut sim = Sim::new(points, &constraints, 0xF10C);
+                    // ~60 units per room centre — heavily overlapping clumps.
+                    let spawns: Vec<Command> = (0..n)
+                        .map(|i| {
+                            let room = i / 60;
+                            let (rx, ry) = (room % SIDE, room / SIDE % SIDE);
+                            let j = (i % 60) as f32;
+                            Command::Spawn {
+                                pos: Vector2::new(
+                                    (rx as f32 + 0.5) * ROOM_SIZE + 0.13 * j,
+                                    (ry as f32 + 0.5) * ROOM_SIZE + 0.07 * j,
+                                ),
+                                radius: RADIUS,
+                                speed: SPEED,
+                            }
+                        })
+                        .collect();
+                    sim.step(&spawns);
+                    // One Move groups every unit, so the whole clump coheres.
+                    sim.step(&[Command::Move {
+                        units: unit_ids(&sim),
+                        goal: Vector2::new(50.0, 50.0),
+                    }]);
+                    sim.step(&[]);
+                    sim
+                };
+                chunked(iters, 64, make, |_, _| Vec::new())
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_step,
     bench_step_burst,
     bench_step_repath,
     bench_separation,
+    bench_flock,
 );
 criterion_main!(benches);
