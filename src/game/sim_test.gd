@@ -180,7 +180,15 @@ func _unhandled_input(event: InputEvent) -> void:
 	elif event is InputEventMouseMotion and _dragging:
 		_drag_end = get_global_mouse_position()
 	elif event is InputEventKey and event.is_pressed() and event.keycode == KEY_U:
-		_sim.spawn_unit(get_global_mouse_position(), unit_radius, unit_speed)
+		var count := 50 if event.ctrl_pressed else (10 if event.shift_pressed else 1)
+		var center := get_global_mouse_position()
+		var spacing := unit_radius * 2.0 + 2.0
+		var pack_r := spacing * sqrt(count / PI)
+		var golden_angle := PI * (3.0 - sqrt(5.0))
+		for i in count:
+			var r := sqrt(float(i + 0.5) / count) * pack_r
+			var a := i * golden_angle
+			_sim.spawn_unit(center + Vector2(cos(a), sin(a)) * r, unit_radius, unit_speed)
 
 
 func _select(world: Vector2) -> void:
@@ -270,7 +278,7 @@ func _build_debug_ui() -> void:
 	col.add_child(row)
 
 	var hint := Label.new()
-	hint.text = "U: spawn unit | drag: select | RMB: move"
+	hint.text = "U: spawn | Shift+U: x10 | Ctrl+U: x50 | drag: select | RMB: move"
 	row.add_child(hint)
 
 	var build := Button.new()
@@ -292,6 +300,7 @@ func _build_debug_ui() -> void:
 			_sim.set_debug_overlay(on)
 	)
 	row.add_child(overlay)
+	overlay.button_pressed = true
 
 	var pause := Button.new()
 	pause.toggle_mode = true
