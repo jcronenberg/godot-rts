@@ -98,6 +98,7 @@ func _ready() -> void:
 	add_child(_sim)
 	_sim.load_map(_editor.points, _editor.constraints, 42)
 	_build_debug_ui()
+	_build_unit_props_ui()
 
 
 func _process(delta: float) -> void:
@@ -337,3 +338,85 @@ func _build_debug_ui() -> void:
 	_graph_step = PerfGraph.new("sim step", " ms", Color(1.0, 0.7, 0.3))
 	for graph in [_graph_fps, _graph_frame, _graph_step]:
 		_graphs.add_child(graph)
+
+
+func _build_unit_props_ui() -> void:
+	var layer := CanvasLayer.new()
+	add_child(layer)
+
+	var panel := PanelContainer.new()
+	panel.anchor_left = 1.0
+	panel.anchor_right = 1.0
+	panel.offset_left = -228.0
+	panel.offset_right = -8.0
+	panel.offset_top = 8.0
+	layer.add_child(panel)
+
+	var col := VBoxContainer.new()
+	panel.add_child(col)
+
+	var header := HBoxContainer.new()
+	col.add_child(header)
+
+	var title := Label.new()
+	title.text = "Unit Properties"
+	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	header.add_child(title)
+
+	var collapse_btn := Button.new()
+	collapse_btn.text = "-"
+	collapse_btn.toggle_mode = true
+	collapse_btn.button_pressed = true
+	collapse_btn.flat = true
+	header.add_child(collapse_btn)
+
+	var content := VBoxContainer.new()
+	content.add_theme_constant_override("separation", 4)
+	col.add_child(content)
+
+	collapse_btn.toggled.connect(func(on: bool) -> void:
+		content.visible = on
+		collapse_btn.text = "-" if on else "+"
+	)
+
+	_add_prop_slider(content, "Radius", unit_radius, 2.0, 30.0, 0.5,
+		func(v: float) -> void: unit_radius = v)
+	_add_prop_slider(content, "Speed", unit_speed, 10.0, 300.0, 5.0,
+		func(v: float) -> void: unit_speed = v)
+
+
+func _add_prop_slider(
+	parent: Control,
+	label: String,
+	initial: float,
+	min_val: float,
+	max_val: float,
+	step: float,
+	on_change: Callable,
+) -> void:
+	var row := HBoxContainer.new()
+	parent.add_child(row)
+
+	var lbl := Label.new()
+	lbl.text = label
+	lbl.custom_minimum_size = Vector2(52, 0)
+	row.add_child(lbl)
+
+	var val_lbl := Label.new()
+	val_lbl.text = "%.1f" % initial
+	val_lbl.custom_minimum_size = Vector2(36, 0)
+	row.add_child(val_lbl)
+
+	var slider := HSlider.new()
+	slider.min_value = min_val
+	slider.max_value = max_val
+	slider.step = step
+	slider.value = initial
+	slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	slider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	row.add_child(slider)
+
+	slider.value_changed.connect(func(v: float) -> void:
+		val_lbl.text = "%.1f" % v
+		on_change.call(v)
+	)
