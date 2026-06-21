@@ -726,26 +726,10 @@ impl Sim {
                     };
                     build_offset_path(cdt, pos[i], &corners, &outward, goal, offset, radius)
                         .unwrap_or_else(|| {
-                            // Couldn't follow the shared corners (its leg to the
-                            // first one is blocked). Route onto the flock's route
-                            // via that corner rather than down a private shortest
-                            // path — otherwise an outer unit whose own shortest
-                            // rounds an obstacle the *other* way splits off from
-                            // the group.
-                            let mut p = if corners.is_empty() {
-                                Vec::new()
-                            } else {
-                                find_path_abstract(
-                                    cdt, &self.abstraction, pos[i], corners[0], &mut self.scratch, radius,
-                                )
-                            };
-                            if p.len() >= 2 {
-                                p.extend_from_slice(&corners[1..]);
-                                p.push(goal);
-                                p
-                            } else {
-                                find_path_abstract(cdt, &self.abstraction, pos[i], goal, &mut self.scratch, radius)
-                            }
+                            route_onto_channel(
+                                cdt, &self.abstraction, &mut self.scratch, pos[i], &corners, goal,
+                                radius,
+                            )
                         })
                 };
                 let unit = self.units.get_mut(sel[i]).expect("filtered to live");
@@ -1299,6 +1283,35 @@ fn build_offset_path(
         }
     }
     None
+}
+
+/// Fallback when a unit can't follow the flock's shared corners (its leg to the
+/// first one is blocked): route it onto the flock's route *via* that first
+/// corner, rather than down a private shortest path — otherwise an outer unit
+/// whose own shortest rounds an obstacle the *other* way splits off from the
+/// group. With no corners (straight shot), or if even the leg to the first
+/// corner is blocked, fall back to a plain shortest path to the goal.
+fn route_onto_channel(
+    cdt: &CDT,
+    abstraction: &Abstraction,
+    scratch: &mut AStarScratch,
+    start: Vector2,
+    corners: &[Vector2],
+    goal: Vector2,
+    radius: f32,
+) -> Vec<Vector2> {
+    let mut p = if corners.is_empty() {
+        Vec::new()
+    } else {
+        find_path_abstract(cdt, abstraction, start, corners[0], scratch, radius)
+    };
+    if p.len() >= 2 {
+        p.extend_from_slice(&corners[1..]);
+        p.push(goal);
+        p
+    } else {
+        find_path_abstract(cdt, abstraction, start, goal, scratch, radius)
+    }
 }
 
 /// Union-find root with path halving (over dense indices, for `do_move`'s
