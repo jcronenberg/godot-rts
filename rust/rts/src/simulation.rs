@@ -3,7 +3,7 @@ use std::sync::Arc;
 use godot::classes::Node;
 use godot::prelude::*;
 use rts_lib::navmesh::ObstacleId;
-use rts_lib::sim::{Command, Sim, TICK_RATE, UnitId};
+use rts_lib::sim::{Command, Order, Sim, TICK_RATE, UnitId};
 use rts_lib::sim_runner::{Interpolator, SimHandle, Snapshot, display_pos};
 
 /// Godot view of the Rust sim thread: commands in, snapshots out.
@@ -74,15 +74,31 @@ impl Simulation {
         self.enqueue(Command::Spawn { pos, radius, speed });
     }
 
-    /// Order the given units (ids from `get_unit_ids`) to `goal`.
+    /// Order the given units (ids from `get_unit_ids`) to `goal`, interrupting
+    /// and clearing any queued orders.
     #[func]
     pub fn move_units(&self, ids: PackedInt64Array, goal: Vector2) {
-        let units = ids
-            .as_slice()
+        self.enqueue(Command::Move {
+            units: Self::unit_ids(&ids),
+            goal,
+        });
+    }
+
+    /// Append a move order to the given units' queues; they path to it after
+    /// finishing their current and earlier-queued orders.
+    #[func]
+    pub fn queue_move(&self, ids: PackedInt64Array, goal: Vector2) {
+        self.enqueue(Command::Queue {
+            units: Self::unit_ids(&ids),
+            order: Order::Move { goal },
+        });
+    }
+
+    fn unit_ids(ids: &PackedInt64Array) -> Vec<UnitId> {
+        ids.as_slice()
             .iter()
             .map(|&raw| UnitId::from_raw(raw as u64))
-            .collect();
-        self.enqueue(Command::Move { units, goal });
+            .collect()
     }
 
     /// Queue a closed-polygon obstacle; returns the id the sim will assign
@@ -217,6 +233,19 @@ impl Simulation {
         if let Some(paths) = &self.interp.cur().debug_paths {
             for path in paths {
                 out.push(&PackedVector2Array::from(path.as_slice()));
+            }
+        }
+        out
+    }
+
+    /// Queued (not-yet-started) order goals per unit; empty unless the debug
+    /// overlay is on. Rows align with `get_unit_ids`.
+    #[func]
+    pub fn get_unit_order_goals(&self) -> Array<PackedVector2Array> {
+        let mut out = Array::new();
+        if let Some(goals) = &self.interp.cur().debug_order_goals {
+            for unit_goals in goals {
+                out.push(&PackedVector2Array::from(unit_goals.as_slice()));
             }
         }
         out

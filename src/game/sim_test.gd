@@ -33,6 +33,7 @@ var _build_mode: bool = false
 var _overlay: bool = false
 var _mesh_version: int = -1
 var _paths: Array[PackedVector2Array] = []
+var _order_goals: Array[PackedVector2Array] = []
 
 var _stats_label: Label
 var _graphs: VBoxContainer
@@ -154,6 +155,7 @@ func _refresh_overlay() -> void:
 			_mesh_version = dump["version"]
 			_editor.show_mesh_dump(dump["points"], dump["indices"], dump["edges"])
 	_paths.assign(_sim.get_unit_paths())
+	_order_goals.assign(_sim.get_unit_order_goals())
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -177,7 +179,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				if _build_mode:
 					_remove_building_at(world)
 				elif not _selected.is_empty():
-					_move_selected(world)
+					_move_selected(world, event.shift_pressed)
 	elif event is InputEventMouseMotion and _dragging:
 		_drag_end = get_global_mouse_position()
 	elif event is InputEventKey and event.is_pressed() and event.keycode == KEY_U:
@@ -207,11 +209,14 @@ func _select(world: Vector2) -> void:
 			_selected[_ids[i]] = true
 
 
-func _move_selected(goal: Vector2) -> void:
+func _move_selected(goal: Vector2, queued: bool) -> void:
 	var ids := PackedInt64Array()
 	for id in _selected.keys():
 		ids.append(id)
-	_sim.move_units(ids, goal)
+	if queued:
+		_sim.queue_move(ids, goal)
+	else:
+		_sim.move_units(ids, goal)
 	# Instant view-side ack, independent of sim latency.
 	_ack_pos = goal
 	_ack_time = ACK_DURATION
@@ -245,6 +250,7 @@ func _draw() -> void:
 		for path in _paths:
 			if path.size() >= 2:
 				draw_polyline(path, Color(1, 1, 0, 0.6), 1.0)
+		_draw_queued_orders()
 
 	for id in _buildings:
 		draw_rect(_buildings[id], Color(0.5, 0.3, 0.2))
@@ -266,6 +272,22 @@ func _draw() -> void:
 		draw_arc(_ack_pos, 4.0 + 8.0 * t, 0, TAU, 16, Color(0.2, 1.0, 0.2, t), 2.0)
 
 
+## Faint cyan polyline + dots from each unit's current goal through its queued
+## waypoints, so the order queue is visible while the overlay is on.
+func _draw_queued_orders() -> void:
+	for i in _order_goals.size():
+		var goals := _order_goals[i]
+		if goals.is_empty():
+			continue
+		var has_path := i < _paths.size() and _paths[i].size() >= 2
+		var start: Vector2 = _paths[i][_paths[i].size() - 1] if has_path else _positions[i]
+		var line := PackedVector2Array([start])
+		line.append_array(goals)
+		draw_polyline(line, Color(0.2, 0.9, 1.0, 0.5), 1.0)
+		for g in goals:
+			draw_circle(g, 3.0, Color(0.2, 0.9, 1.0, 0.7))
+
+
 func _build_debug_ui() -> void:
 	var layer := CanvasLayer.new()
 	add_child(layer)
@@ -279,7 +301,7 @@ func _build_debug_ui() -> void:
 	col.add_child(row)
 
 	var hint := Label.new()
-	hint.text = "U: spawn | Shift+U: x10 | Ctrl+U: x50 | drag: select | RMB: move"
+	hint.text = "U: spawn | Shift+U: x10 | Ctrl+U: x50 | drag: select | RMB: move | Shift+RMB: queue"
 	row.add_child(hint)
 
 	var build := Button.new()
@@ -297,6 +319,7 @@ func _build_debug_ui() -> void:
 			_overlay = on
 			_mesh_version = -1  # force a fresh dump on re-toggle
 			_paths = []
+			_order_goals = []
 			_editor.visible = on
 			_sim.set_debug_overlay(on)
 	)

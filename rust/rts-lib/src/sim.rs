@@ -5,6 +5,8 @@
 //! f32 add/mul/div/sqrt only, slot-order iteration, no hash iteration over
 //! state, pairwise forces buffered before application, one seeded RNG.
 
+use std::collections::VecDeque;
+
 use godot::prelude::Vector2;
 
 use crate::abstraction::Abstraction;
@@ -142,6 +144,9 @@ pub struct Unit {
     pub path: Vec<Vector2>,
     /// Index of the next waypoint to reach.
     pub path_i: u32,
+    /// Pending orders, executed in turn once the current action finishes. The
+    /// currently-active order isn't stored here — it's reflected in `path` etc.
+    pub orders: VecDeque<Order>,
     /// Cohesion group, stamped per `Move` command; 0 = ungrouped (no cohesion).
     pub group: u32,
     /// Settled at the goal — either reached it, or joined a parked group-mate's
@@ -285,6 +290,17 @@ impl Units {
     }
 }
 
+// ── Orders ────────────────────────────────────────────────────────────────────
+
+/// A task a unit works through. Units hold a FIFO queue of these; the front one
+/// drives behaviour until it completes, then the next begins (see
+/// [`Sim::advance_orders`]). Extend with `Attack`, `HoldPosition`, … — each new
+/// variant adds an arm to [`Sim::begin_order`] and to the order hash/snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Order {
+    Move { goal: Vector2 },
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 /// All sim mutation goes through commands, batched per tick — the replay,
@@ -296,9 +312,17 @@ pub enum Command {
         radius: f32,
         speed: f32,
     },
+    /// Move now: clears each unit's order queue and paths immediately (a plain
+    /// right-click that interrupts whatever the unit was doing).
     Move {
         units: Vec<UnitId>,
         goal: Vector2,
+    },
+    /// Append an order to each unit's queue (a shift-click). The general
+    /// queue-append seam — every future order type queues through here.
+    Queue {
+        units: Vec<UnitId>,
+        order: Order,
     },
     AddObstacle {
         points: Vec<Vector2>,
@@ -509,8 +533,9 @@ impl Sim {
     ///
     /// Order: store prev positions → apply commands → rebuild navmesh if the
     /// obstacle set changed (refresh abstraction, repath all moving units) →
-    /// integrate along paths → flock (separation + cohesion) → wall clamp →
-    /// repath units stuck against a corner → advance tick.
+    /// integrate along paths → flock (separation + cohesion) → start the next
+    /// queued order for any unit that just finished → wall clamp → repath units
+    /// stuck against a corner → advance tick.
     pub fn step(&mut self, commands: &[Command]) {
         for (_, u) in self.units.iter_mut() {
             u.prev_pos = u.pos;
@@ -521,6 +546,7 @@ impl Sim {
         let mesh_changed = self.rebuild_and_repath();
         self.integrate();
         self.flock();
+        self.advance_orders();
         self.wall_clamp(mesh_changed);
         self.repath_stalled();
         self.tick += 1;
@@ -536,6 +562,7 @@ impl Sim {
                     max_speed: *speed,
                     path: Vec::new(),
                     path_i: 0,
+                    orders: VecDeque::new(),
                     group: 0,
                     parked: false,
                     arrival_r: 0.0,
@@ -543,7 +570,22 @@ impl Sim {
                     min_remaining: f32::MAX,
                 });
             }
-            Command::Move { units, goal } => self.do_move(units, *goal),
+            Command::Move { units, goal } => {
+                // Plain move interrupts: drop any queued orders, path now.
+                for &id in units {
+                    if let Some(u) = self.units.get_mut(id) {
+                        u.orders.clear();
+                    }
+                }
+                self.start_move(units, *goal);
+            }
+            Command::Queue { units, order } => {
+                for &id in units {
+                    if let Some(u) = self.units.get_mut(id) {
+                        u.orders.push_back(order.clone());
+                    }
+                }
+            }
             Command::AddObstacle { points } => {
                 self.nav.add_obstacle(Obstacle::polygon(points.clone()));
             }
@@ -553,13 +595,13 @@ impl Sim {
         }
     }
 
-    /// Execute a `Move`: partition the live selection into spatial flocks, give
+    /// Execute a move now: partition the live selection into spatial flocks, give
     /// each its own group id and one shared channel, then string-pull that
     /// channel per unit so the flock spreads across corridor width instead of
     /// single-filing the inside corner. A unit whose first leg into the channel
     /// fails line-of-sight (straggler / no useful channel) paths individually.
     /// See `group_pathing_plan.md`.
-    fn do_move(&mut self, units: &[UnitId], goal: Vector2) {
+    fn start_move(&mut self, units: &[UnitId], goal: Vector2) {
         // Live selected units, slot order (stable, deterministic).
         let mut sel: Vec<UnitId> = Vec::new();
         for &id in units {
@@ -737,6 +779,47 @@ impl Sim {
                 unit.arrival_r = radius * arrival_mult;
                 set_path(unit, path);
             }
+        }
+    }
+
+    /// Begin one order for a batch of units, dispatching on its type. The
+    /// execution seam for queued orders — new `Order` variants add an arm here.
+    fn begin_order(&mut self, units: &[UnitId], order: &Order) {
+        match order {
+            Order::Move { goal } => self.start_move(units, *goal),
+        }
+    }
+
+    /// Start the next queued order for every unit that just finished its current
+    /// action (now idle with a non-empty queue). Units that finished on the same
+    /// tick with an *identical* front order are begun as one batch, so a group
+    /// re-clusters and re-channels around the next waypoint instead of single-
+    /// filing it; stragglers that finish a tick later re-merge via the flock
+    /// merge pass. Deterministic: slot-order scan, exact-order batching, no map
+    /// iteration.
+    fn advance_orders(&mut self) {
+        let mut batches: Vec<(Order, Vec<UnitId>)> = Vec::new();
+        for (id, u) in self.units.iter() {
+            if u.is_moving() {
+                continue;
+            }
+            let Some(order) = u.orders.front() else {
+                continue;
+            };
+            match batches.iter_mut().find(|(o, _)| o == order) {
+                Some((_, members)) => members.push(id),
+                None => batches.push((order.clone(), vec![id])),
+            }
+        }
+        for (order, members) in &batches {
+            for &id in members {
+                self.units
+                    .get_mut(id)
+                    .expect("batched id alive")
+                    .orders
+                    .pop_front();
+            }
+            self.begin_order(members, order);
         }
     }
 
@@ -1221,6 +1304,15 @@ impl Sim {
             for &p in &u.path {
                 h.write_v2(p);
             }
+            h.write_u64(u.orders.len() as u64);
+            for order in &u.orders {
+                match order {
+                    Order::Move { goal } => {
+                        h.write_u64(0);
+                        h.write_v2(*goal);
+                    }
+                }
+            }
         }
         self.rng.hash_into(&mut h);
         h.0
@@ -1314,7 +1406,7 @@ fn route_onto_channel(
     }
 }
 
-/// Union-find root with path halving (over dense indices, for `do_move`'s
+/// Union-find root with path halving (over dense indices, for `start_move`'s
 /// spatial clustering).
 fn uf_find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {
@@ -1514,6 +1606,60 @@ mod tests {
     }
 
     #[test]
+    fn test_queued_moves_run_consecutively() {
+        let mut sim = rooms_sim(3, 1, 1);
+        let id = spawn(&mut sim, v(50.0, 50.0), 5.0, 30.0);
+        let (g1, g2) = (v(250.0, 50.0), v(150.0, 50.0));
+        sim.step(&[Command::Move { units: vec![id], goal: g1 }]);
+        sim.step(&[Command::Queue { units: vec![id], order: Order::Move { goal: g2 } }]);
+        assert_eq!(unit(&sim, id).orders.len(), 1, "second move is queued, not run");
+
+        // The queue drains the tick g1 is reached; g2 must not begin before then.
+        let mut reached_g1 = false;
+        for _ in 0..1000 {
+            sim.step(&[]);
+            let u = unit(&sim, id);
+            if u.orders.is_empty() && !reached_g1 {
+                reached_g1 = true;
+                assert_eq!(u.pos, g1, "first goal must be reached before the second begins");
+            }
+            if reached_g1 && !u.is_moving() {
+                break;
+            }
+        }
+        assert!(reached_g1, "first queued goal was never reached");
+        assert_eq!(unit(&sim, id).pos, g2, "must end at the second queued goal");
+    }
+
+    #[test]
+    fn test_queue_on_idle_unit_starts_at_once() {
+        let mut sim = rooms_sim(3, 1, 1);
+        let id = spawn(&mut sim, v(50.0, 50.0), 5.0, 30.0);
+        let goal = v(150.0, 50.0);
+        // advance_orders runs in the same step the command lands, so an idle
+        // unit begins a queued order immediately (no idle tick).
+        sim.step(&[Command::Queue { units: vec![id], order: Order::Move { goal } }]);
+        let u = unit(&sim, id);
+        assert!(u.is_moving());
+        assert!(u.orders.is_empty());
+        assert_eq!(*u.path.last().unwrap(), goal);
+    }
+
+    #[test]
+    fn test_plain_move_clears_queue() {
+        let mut sim = rooms_sim(3, 1, 1);
+        let id = spawn(&mut sim, v(50.0, 50.0), 5.0, 30.0);
+        sim.step(&[Command::Move { units: vec![id], goal: v(250.0, 50.0) }]);
+        sim.step(&[Command::Queue { units: vec![id], order: Order::Move { goal: v(150.0, 50.0) } }]);
+        assert_eq!(unit(&sim, id).orders.len(), 1);
+        let new_goal = v(200.0, 50.0);
+        sim.step(&[Command::Move { units: vec![id], goal: new_goal }]);
+        let u = unit(&sim, id);
+        assert!(u.orders.is_empty(), "a plain move must cancel queued orders");
+        assert_eq!(*u.path.last().unwrap(), new_goal);
+    }
+
+    #[test]
     fn test_unreachable_goal_idles() {
         let mut sim = rooms_sim(2, 1, 1);
         let id = spawn(&mut sim, v(50.0, 50.0), 5.0, 20.0);
@@ -1611,6 +1757,11 @@ mod tests {
                     cmds.push(Command::Move {
                         units: ids.clone(),
                         goal: v(250.0, 150.0),
+                    });
+                    // Queue a follow-on order so the order queue is hashed too.
+                    cmds.push(Command::Queue {
+                        units: ids.clone(),
+                        order: Order::Move { goal: v(60.0, 60.0) },
                     });
                 }
                 if t == 40 {
@@ -2143,6 +2294,7 @@ mod tests {
             max_speed: 1.0,
             path: Vec::new(),
             path_i: 0,
+            orders: VecDeque::new(),
             group: 0,
             parked: false,
             arrival_r: 0.0,
@@ -2158,6 +2310,7 @@ mod tests {
             max_speed: 1.0,
             path: Vec::new(),
             path_i: 0,
+            orders: VecDeque::new(),
             group: 0,
             parked: false,
             arrival_r: 0.0,

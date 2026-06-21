@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use godot::prelude::Vector2;
 
-use crate::sim::{Command, DT, Sim, UnitId};
+use crate::sim::{Command, DT, Order, Sim, UnitId};
 
 /// Per-tick view state. Cheap parallel arrays; the view lerps two of these.
 #[derive(Default)]
@@ -27,6 +27,9 @@ pub struct Snapshot {
     pub radii: Vec<f32>,
     /// Full remaining path per unit; filled only while the debug overlay is on.
     pub debug_paths: Option<Vec<Vec<Vector2>>>,
+    /// Queued (not-yet-started) order goals per unit; filled only while the
+    /// debug overlay is on, so the view can draw a unit's pending waypoints.
+    pub debug_order_goals: Option<Vec<Vec<Vector2>>>,
     /// Wall-clock cost of the `step()` that produced this snapshot, in ms.
     /// Instrumentation only — never feeds back into sim state.
     pub step_ms: f32,
@@ -44,6 +47,7 @@ impl Snapshot {
             waypoints: Vec::with_capacity(n),
             radii: Vec::with_capacity(n),
             debug_paths: debug_overlay.then(|| Vec::with_capacity(n)),
+            debug_order_goals: debug_overlay.then(|| Vec::with_capacity(n)),
             step_ms: 0.0,
         };
         for (id, u) in sim.units().iter() {
@@ -64,6 +68,16 @@ impl Snapshot {
                     path.extend_from_slice(rest);
                 }
                 paths.push(path);
+            }
+            if let Some(order_goals) = &mut snap.debug_order_goals {
+                let goals = u
+                    .orders
+                    .iter()
+                    .map(|o| match o {
+                        Order::Move { goal } => *goal,
+                    })
+                    .collect();
+                order_goals.push(goals);
             }
         }
         snap
