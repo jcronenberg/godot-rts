@@ -10,6 +10,7 @@ script = ExtResource("1_simtst")
 [node name="Camera2D" type="Camera2D" parent="." unique_id=1730527083]
 position = Vector2(200, 275)
 script = ExtResource("2_rtscam")
+edge_pan_enabled = false
 
 [node name="DelaunayEditorNode" type="Node2D" parent="." unique_id=1268810141]
 z_index = -1
