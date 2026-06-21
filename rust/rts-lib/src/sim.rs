@@ -538,22 +538,24 @@ impl Sim {
         s.radii.clear();
         s.speeds.clear();
         s.disp.clear();
-        let mut max_diameter = 0.0f32;
+        let mut max_radius = 0.0f32;
         for (id, u) in self.units.iter() {
             s.ids.push(id);
             s.positions.push(u.prev_pos);
             s.radii.push(u.radius);
             s.speeds.push(u.max_speed);
             s.disp.push(Vector2::ZERO);
-            max_diameter = max_diameter.max(u.radius + u.radius);
+            max_radius = max_radius.max(u.radius);
         }
-        if s.ids.len() < 2 || max_diameter <= 0.0 {
+        if s.ids.len() < 2 || max_radius <= 0.0 {
             return;
         }
+        let max_diameter = max_radius * 2.0;
         self.grid.rebuild(&s.positions, max_diameter);
 
         for i in 0..s.ids.len() {
             let p = s.positions[i];
+            let r_i = s.radii[i];
             let (cx, cy) = self.grid.cell_coords(p);
             for ny in cy.saturating_sub(1)..=(cy + 1).min(self.grid.rows - 1) {
                 for nx in cx.saturating_sub(1)..=(cx + 1).min(self.grid.cols - 1) {
@@ -563,7 +565,7 @@ impl Sim {
                             continue;
                         }
                         let delta = p - s.positions[j];
-                        let min_dist = s.radii[i] + s.radii[j];
+                        let min_dist = r_i + s.radii[j];
                         let d2 = delta.x * delta.x + delta.y * delta.y;
                         if d2 >= min_dist * min_dist {
                             continue;
