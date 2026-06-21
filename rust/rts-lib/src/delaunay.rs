@@ -293,7 +293,7 @@ fn in_circumcircle_ccw(a: Vector2, b: Vector2, c: Vector2, p: Vector2) -> bool {
 }
 
 /// Returns true if `pt` is inside (or on the boundary of) triangle (p0, p1, p2).
-fn is_point_in_triangle(pt: Vector2, p0: Vector2, p1: Vector2, p2: Vector2) -> bool {
+pub(crate) fn is_point_in_triangle(pt: Vector2, p0: Vector2, p1: Vector2, p2: Vector2) -> bool {
     let d1 = orient2d(pt, p0, p1);
     let d2 = orient2d(pt, p1, p2);
     let d3 = orient2d(pt, p2, p0);

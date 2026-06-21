@@ -319,6 +319,76 @@ pub fn clear_los(cdt: &CDT, a: Vector2, b: Vector2, radius: f32) -> bool {
     walk_segment(cdt, fa, fb, a, b, radius, |_| {})
 }
 
+/// The farthest point along the centre ray `a → b` reachable without crossing
+/// a wall. Returns `b` when the whole segment is wall-clear, else the point
+/// just shy of the first wall crossing (so the move stops *at* the wall instead
+/// of tunnelling through it). A wall is any constrained edge *or* mesh-boundary
+/// edge (interior walls are hull edges — the rooms either side connect only
+/// through doors, not across the wall). Portal width is ignored (unlike
+/// [`clear_los`]), so a unit squeezed into a sub-radius gap near its goal can
+/// still slide along. Used to clip a point-like separation push out of a wall,
+/// not for radius-aware routing. Allocation-free.
+///
+/// `a` is assumed on the mesh (the unit's current position); if it isn't, the
+/// move is dropped (`a` returned).
+pub fn clip_ray_to_walls(cdt: &CDT, a: Vector2, b: Vector2) -> Vector2 {
+    let pts = cdt.points();
+    let Some(mut face) = cdt.locate_face(a) else {
+        return a;
+    };
+    // Half-edge of `face` we crossed in through; never an exit (no doubling back).
+    let mut entered = NONE;
+    for _ in 0..cdt.num_faces() {
+        let mut exit = NONE;
+        for he in face * 3..face * 3 + 3 {
+            if he == entered {
+                continue;
+            }
+            let p = pts[cdt.he_origin(he) as usize];
+            let q = pts[cdt.he_dest(he) as usize];
+            if crate::delaunay::segments_intersect_proper(a, b, p, q) {
+                exit = he;
+                break;
+            }
+        }
+        // No edge crosses the segment: either `b` lies in this face (move is
+        // clear) or the segment grazed a vertex out of it. Take the move only if
+        // `b` is actually inside — otherwise a graze toward the outside would
+        // return an off-mesh point. Cheap point-in-triangle (no extra locate).
+        if exit == NONE {
+            let p0 = pts[cdt.he_origin(face * 3) as usize];
+            let p1 = pts[cdt.he_origin(face * 3 + 1) as usize];
+            let p2 = pts[cdt.he_origin(face * 3 + 2) as usize];
+            return if crate::delaunay::is_point_in_triangle(b, p0, p1, p2) { b } else { a };
+        }
+        match cdt.he_twin(exit) {
+            // Interior portal (a door): cross into the neighbour face.
+            Some(tw) if !cdt.he_is_constrained(exit) => {
+                entered = tw;
+                face = cdt.face_of_he(tw);
+            }
+            // Constrained or boundary edge = wall: stop just shy of it.
+            _ => {
+                let p = pts[cdt.he_origin(exit) as usize];
+                let q = pts[cdt.he_dest(exit) as usize];
+                let t = segment_cross_param(a, b, p, q);
+                return a + (b - a) * (t * 0.999);
+            }
+        }
+    }
+    a
+}
+
+/// Parameter `t ∈ [0,1]` where `a→b` crosses line `p→q` (caller guarantees a
+/// proper crossing, so the denominator is non-zero).
+fn segment_cross_param(a: Vector2, b: Vector2, p: Vector2, q: Vector2) -> f32 {
+    let r = b - a;
+    let s = q - p;
+    let denom = r.x * s.y - r.y * s.x;
+    let pa = p - a;
+    (pa.x * s.y - pa.y * s.x) / denom
+}
+
 /// Phase 1: face-keyed A* over centroid-to-centroid costs.  Cheap and
 /// complete, but its channel is not necessarily the shortest — the centroid
 /// polyline mis-measures real path length by up to the triangle size.

@@ -10,7 +10,9 @@ use std::collections::VecDeque;
 use godot::prelude::Vector2;
 
 use crate::abstraction::Abstraction;
-use crate::astar::{AStarScratch, clear_los, closest_on_segment, find_path_abstract};
+use crate::astar::{
+    AStarScratch, clear_los, clip_ray_to_walls, closest_on_segment, find_path_abstract,
+};
 use crate::delaunay::{CDT, FNV_OFFSET, FNV_PRIME};
 use crate::navmesh::{DynamicNavmesh, Obstacle, ObstacleId};
 
@@ -701,6 +703,24 @@ impl Sim {
             let seed_path =
                 find_path_abstract(cdt, &self.abstraction, pos[seed], goal, &mut self.scratch, flock_r);
 
+            // Empty seed path ⇒ the goal is unreachable for the seed (the member
+            // nearest it). Cluster members are mutually clear-LoS, so they share
+            // the seed's navmesh component and the goal is unreachable for all of
+            // them: idle the whole cluster. Skipping this would fall through to
+            // the straight-shot branch below, which can't tell "unreachable" from
+            // "direct clear shot" — it would synthesise a converge waypoint on the
+            // reachable side and route_onto_channel would append the unreachable
+            // goal leg, handing non-seed units a path that pokes across the wall.
+            if seed_path.is_empty() {
+                for &i in members {
+                    let unit = self.units.get_mut(sel[i]).expect("filtered to live");
+                    unit.group = *group;
+                    unit.arrival_r = rad[i] * arrival_mult;
+                    set_path(unit, Vec::new());
+                }
+                continue;
+            }
+
             // Corner apexes (drop start and goal) and the outward direction at
             // each — the external bisector, pointing into the bend's free side
             // (away from the wall vertex the apex hugs). Units fan along it.
@@ -1093,7 +1113,13 @@ impl Sim {
             if len > max_step {
                 d *= max_step / len;
             }
-            unit.pos += d;
+            // Anti-tunnel: a flock push is a raw position add with no path/LoS
+            // guarantee, so it can shove a unit clean across a constrained edge —
+            // wall_clamp only inspects the final position and would then amplify
+            // the tunnel (projecting the centre out the *wrong* side). It bites
+            // when the goal sits near a wall, so integrate has already driven the
+            // centre to within a radius of it. Clip the move to stop at the wall.
+            unit.pos = clip_ray_to_walls(cdt, unit.pos, unit.pos + d);
         }
 
         if !self.step_scratch.merge_pairs.is_empty() {
@@ -1885,6 +1911,46 @@ mod tests {
     }
 
     #[test]
+    fn test_group_packed_against_edge_stays_inside() {
+        // A large, fast group ordered to a goal hard against the map's right
+        // edge (x=200 wall), with the same move re-issued repeatedly (the
+        // player spam-clicking the same spot). The crowd packs against the wall
+        // and the per-tick separation push — large for fast units — must never
+        // shove a unit clean across the boundary to the outside of the map.
+        let (points, constraints) = rooms_map(2, 2); // 200×200 open-ish map
+        let walls = wall_segments(&points, &constraints);
+        let mut sim = Sim::new(points, &constraints, 5);
+        let goal = v(197.0, 100.0); // ~3 px from the x=200 boundary
+        let mut ids = Vec::new();
+        for i in 0..50 {
+            ids.push(spawn(
+                &mut sim,
+                v(110.0 + 6.0 * (i % 10) as f32, 70.0 + 6.0 * (i / 10) as f32),
+                5.0,
+                200.0, // fast: large per-tick separation push
+            ));
+        }
+        for _ in 0..400 {
+            // Re-issue the same move every few ticks (spam-click).
+            let cmd = if sim.tick() % 5 == 0 {
+                vec![Command::Move { units: ids.clone(), goal }]
+            } else {
+                vec![]
+            };
+            sim.step(&cmd);
+            assert_no_wall_crossing(&sim, &walls);
+            // Every unit centre must stay inside the map (no unit past x=200).
+            for (_, u) in sim.units().iter() {
+                assert!(
+                    u.pos.x <= 200.0 + 1e-3,
+                    "unit pushed across the edge wall to {:?}",
+                    u.pos
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_separation_never_pushes_through_walls() {
         let (points, constraints) = rooms_map(2, 2);
         let walls = wall_segments(&points, &constraints);
@@ -2342,6 +2408,89 @@ mod tests {
         ];
         let cons = vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)];
         (pts, cons)
+    }
+
+    /// 200×200 box split by a solid interior wall at x=100 (no door): the left
+    /// half (x<100) and right half (x>100) are fully disconnected.
+    fn partitioned_map() -> (Vec<Vector2>, Vec<(u32, u32)>) {
+        let pts = vec![
+            v(0.0, 0.0),     // 0
+            v(200.0, 0.0),   // 1
+            v(200.0, 200.0), // 2
+            v(0.0, 200.0),   // 3
+            v(100.0, 0.0),   // 4
+            v(100.0, 200.0), // 5
+        ];
+        let cons = vec![
+            (0, 4), (4, 1), // bottom, split at the wall foot
+            (1, 2),         // right
+            (2, 5), (5, 3), // top, split at the wall head
+            (3, 0),         // left
+            (4, 5),         // interior wall
+        ];
+        (pts, cons)
+    }
+
+    #[test]
+    fn test_move_into_sealed_region_never_crosses_wall() {
+        // A goal inside a fully sealed-off region (no door) is unreachable.
+        // Whatever the units do (idle, or shuffle on their own side), none may
+        // end up across the sealing wall — a move toward an unreachable spot
+        // must never tunnel units into the closed-off area.
+        let (points, constraints) = partitioned_map();
+        let walls = wall_segments(&points, &constraints);
+        let mut sim = Sim::new(points, &constraints, 3);
+        let goal = v(150.0, 100.0); // right half — sealed off from the units
+        let mut ids = Vec::new();
+        for i in 0..16 {
+            ids.push(spawn(
+                &mut sim,
+                v(70.0 + 6.0 * (i % 4) as f32, 80.0 + 6.0 * (i / 4) as f32),
+                5.0,
+                30.0,
+            ));
+        }
+        sim.step(&[Command::Move { units: ids.clone(), goal }]);
+        for _ in 0..400 {
+            sim.step(&[]);
+            assert_no_wall_crossing(&sim, &walls);
+            for (_, u) in sim.units().iter() {
+                assert!(
+                    u.pos.x <= 100.0 + 1e-3,
+                    "unit crossed the sealing wall into the closed-off area: {:?}",
+                    u.pos
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_group_move_to_sealed_goal_near_edge_does_not_cross() {
+        // Goal just inside a sealed-off area, close to the constraint edge. A
+        // single unit correctly idles (it is its own seed and gets the empty
+        // path), but a *group*'s fan synthesises a converge waypoint backed off
+        // toward the seed — which for a near-edge goal lands on the reachable
+        // side — and route_onto_channel then appends the unreachable goal leg,
+        // producing a path that pokes across the wall. Fast units follow it
+        // through. No unit may ever cross the sealing wall.
+        let (points, constraints) = partitioned_map(); // solid wall x=100, no door
+        let walls = wall_segments(&points, &constraints);
+        let mut sim = Sim::new(points, &constraints, 1);
+        let goal = v(103.0, 100.0); // just inside the sealed right half
+        let a = spawn(&mut sim, v(88.0, 100.0), 5.0, 300.0); // fast
+        let b = spawn(&mut sim, v(94.0, 100.0), 5.0, 300.0);
+        sim.step(&[Command::Move { units: vec![a, b], goal }]);
+        for _ in 0..120 {
+            sim.step(&[]);
+            assert_no_wall_crossing(&sim, &walls);
+            for (_, u) in sim.units().iter() {
+                assert!(
+                    u.pos.x <= 100.0 + 1e-3,
+                    "unit crossed the sealing wall into the closed area: {:?}",
+                    u.pos
+                );
+            }
+        }
     }
 
     #[test]
