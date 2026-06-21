@@ -246,6 +246,23 @@ fn straight_channel(
     portals: &mut Vec<u32>,
 ) -> bool {
     portals.clear();
+    walk_segment(cdt, start_face, goal_face, start, goal, radius, |he| {
+        portals.push(he)
+    })
+}
+
+/// Walk the faces crossed by `start → goal`, invoking `on_portal(he)` for each
+/// crossed half-edge in order; returns `true` iff every crossing is a passable
+/// portal (same predicate and conservatism as [`straight_channel`]).
+fn walk_segment(
+    cdt: &CDT,
+    start_face: u32,
+    goal_face: u32,
+    start: Vector2,
+    goal: Vector2,
+    radius: f32,
+    mut on_portal: impl FnMut(u32),
+) -> bool {
     let pts = cdt.points();
     let mut face = start_face;
     let mut prev = NONE;
@@ -279,11 +296,27 @@ fn straight_channel(
         if exit_he == NONE {
             return false;
         }
-        portals.push(exit_he);
+        on_portal(exit_he);
         prev = face;
         face = exit_nb;
     }
     true
+}
+
+/// Radius-aware capsule line-of-sight: `true` iff the segment `a → b` crosses
+/// only passable portals (any constrained or too-narrow edge blocks). Reuses
+/// the [`straight_channel`] walk but discards the portal list. Allocation-free.
+///
+/// The validity-gate workhorse for shared-channel assignment and the merge
+/// adjacency test (see `group_pathing_plan.md`).
+pub fn clear_los(cdt: &CDT, a: Vector2, b: Vector2, radius: f32) -> bool {
+    let Some(fa) = cdt.locate_face(a) else {
+        return false;
+    };
+    let Some(fb) = cdt.locate_face(b) else {
+        return false;
+    };
+    walk_segment(cdt, fa, fb, a, b, radius, |_| {})
 }
 
 /// Phase 1: face-keyed A* over centroid-to-centroid costs.  Cheap and

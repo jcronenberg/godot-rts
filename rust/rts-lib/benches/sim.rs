@@ -130,6 +130,37 @@ fn bench_step_burst(c: &mut Criterion) {
     group.finish();
 }
 
+/// Grouped move every tick: one `Move` over the whole selection, exercising
+/// the clustering + one-funnel-per-flock + per-unit corner-offset path (the
+/// group-pathing command cost), vs `step_burst`'s per-unit moves.
+fn bench_group_move(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sim/group_move");
+    group.sample_size(10);
+    for &n in &[500usize, 2_000] {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_custom(|iters| {
+                chunked(
+                    iters,
+                    256,
+                    || marching_sim(n),
+                    |k, sim| {
+                        let goal = if k % 2 == 0 {
+                            Vector2::new(50.0, 50.0)
+                        } else {
+                            Vector2::new(SIDE as f32 * ROOM_SIZE - 50.0, SIDE as f32 * ROOM_SIZE - 50.0)
+                        };
+                        vec![Command::Move {
+                            units: unit_ids(sim),
+                            goal,
+                        }]
+                    },
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
 /// One obstacle change per tick: navmesh rebuild + abstraction refresh +
 /// repath-all. Decides whether repath-all needs staggering.
 fn bench_step_repath(c: &mut Criterion) {
@@ -258,6 +289,7 @@ criterion_group!(
     benches,
     bench_step,
     bench_step_burst,
+    bench_group_move,
     bench_step_repath,
     bench_separation,
     bench_flock,

@@ -8,7 +8,7 @@
 use godot::prelude::Vector2;
 
 use crate::abstraction::Abstraction;
-use crate::astar::{AStarScratch, closest_on_segment, find_path_abstract};
+use crate::astar::{AStarScratch, clear_los, closest_on_segment, find_path_abstract};
 use crate::delaunay::{CDT, FNV_OFFSET, FNV_PRIME};
 use crate::navmesh::{DynamicNavmesh, Obstacle, ObstacleId};
 
@@ -16,10 +16,12 @@ use crate::navmesh::{DynamicNavmesh, Obstacle, ObstacleId};
 pub const TICK_RATE: u32 = 30;
 /// Fixed timestep in seconds.
 pub const DT: f32 = 1.0 / TICK_RATE as f32;
-/// Fraction of pairwise overlap corrected per tick. Firm enough to keep pace
-/// with path convergence (so groups pack without lingering overlap), but below
-/// the point where summed pushes in a clump overshoot and ping-pong.
-const SEPARATION_RELAX: f32 = 0.6;
+/// Fraction of pairwise overlap corrected per tick — the separation push force.
+/// Soft enough that path pressure wins while units are *moving* (they tolerate a
+/// little transient overlap squeezing through crowds/funnels), but with no path
+/// pull at rest it still converges to a fully non-overlapping packing. Below the
+/// point where summed pushes in a clump overshoot and ping-pong.
+const SEPARATION_RELAX: f32 = 0.4;
 /// Per-tick separation displacement cap, as a fraction of the unit's speed.
 /// Above a full step, so separation can out-push a unit's own path/cohesion
 /// convergence and resolve overlap rather than tolerate it.
@@ -39,18 +41,27 @@ const COHESION_MAX_FRAC: f32 = 0.15;
 /// of every unit driving to the exact goal point and crushing inward.
 const ARRIVAL_TOUCH_FRAC: f32 = 1.15;
 /// A group's arrival radius is `r * max(ARRIVAL_MIN_RADII, FACTOR*sqrt(N))`.
-/// A unit only crowd-stops once inside it; units still outside keep pushing
-/// toward the goal, so they pack into a tight central core (which separation
-/// then expands cleanly and symmetrically) and the blob centres on the goal
-/// instead of tailing back toward the approach side. Below the packed radius
-/// on purpose; the `MIN` floor keeps small groups (whose followers sit ~2r
-/// out) able to stop at all.
-const ARRIVAL_RADIUS_FACTOR: f32 = 0.7;
+/// A unit only crowd-stops once inside it. Sized to ≈ the packed-disk radius of
+/// `N` circles (`~sqrt(N)` radii) so units crowd-stop at the blob's outer edge
+/// rather than shoving through to the core to reach the goal; the `MIN` floor
+/// keeps small groups (whose followers sit ~2r out) able to stop at all.
+const ARRIVAL_RADIUS_FACTOR: f32 = 1.0;
 const ARRIVAL_MIN_RADII: f32 = 3.0;
-/// Wall-clamped ticks without progress before a moving unit is treated as stuck
-/// (shoved off its path onto a corner) and repathed from its current position.
-/// ~0.27 s at 30 Hz — long enough to ignore transient clamps.
-const STALL_REPATH_TICKS: u8 = 8;
+/// Fraction of a flock's lateral spread applied as corner-fan offset. Below 1.0
+/// so outer units round a touch tighter and their separation doesn't shove them
+/// onto the corridor edge.
+const FAN_FRAC: f32 = 0.34;
+/// Fraction of a flock's lateral spread held while marching a straight (corner-
+/// free) leg. Unlike the bend fan (which spreads units *out* from the apex), here
+/// units start at full spread, so this *relaxes* it: <1 lets them draw a bit
+/// closer than their start formation while still marching side-by-side instead of
+/// single-filing the line.
+const STRAIGHT_FAN_FRAC: f32 = 0.6;
+/// Wall-clamped ticks heading into a wall without progress before a moving unit
+/// is treated as stuck (shoved off its path onto a corner) and repathed from its
+/// current position. Eager (~0.1 s at 30 Hz) so displaced units recover a valid
+/// route quickly; transient clamps self-resolve before they trip it.
+const STALL_REPATH_TICKS: u8 = 3;
 /// Remaining-path-length improvement that counts as real progress (and resets
 /// the stall counter); below it the unit is treated as not advancing.
 const STALL_PROGRESS_EPS: f32 = 0.1;
@@ -430,6 +441,11 @@ struct StepScratch {
     /// Sum of same-group moving-neighbour positions, and their count, per unit.
     coh_sum: Vec<Vector2>,
     coh_n: Vec<u32>,
+    /// Goal (last waypoint) per dense unit; junk for non-moving units, only read
+    /// when both sides of a pair are moving (merge detection).
+    goals: Vec<Vector2>,
+    /// Group-id pairs to merge this tick, as `(min, max)`; usually empty.
+    merge_pairs: Vec<(u32, u32)>,
     /// Wall-clamp face frontier and visited list (tiny per unit).
     faces: Vec<u32>,
     visited: Vec<u32>,
@@ -527,40 +543,215 @@ impl Sim {
                     min_remaining: f32::MAX,
                 });
             }
-            Command::Move { units, goal } => {
-                // One group per Move: its units cohere, separate orders don't.
-                // wrapping_add keeps group_seq away from 0 (the ungrouped sentinel).
-                self.group_seq = self.group_seq.wrapping_add(1).max(1);
-                let group = self.group_seq;
-                // Arrival radius: scales with the live group's packed-disk radius,
-                // floored so small groups can still crowd-stop. Count only IDs that
-                // resolve to live units — stale IDs are silently skipped below.
-                let live_n = units.iter().filter(|&&id| self.units.get(id).is_some()).count();
-                let radii = (ARRIVAL_RADIUS_FACTOR * (live_n as f32).sqrt())
-                    .max(ARRIVAL_MIN_RADII);
-                let cdt = self.nav.navmesh();
-                for &id in units {
-                    let Some(unit) = self.units.get_mut(id) else {
-                        continue;
-                    };
-                    let path = find_path_abstract(
-                        cdt,
-                        &self.abstraction,
-                        unit.pos,
-                        *goal,
-                        &mut self.scratch,
-                        unit.radius,
-                    );
-                    unit.group = group;
-                    unit.arrival_r = unit.radius * radii;
-                    set_path(unit, path);
-                }
-            }
+            Command::Move { units, goal } => self.do_move(units, *goal),
             Command::AddObstacle { points } => {
                 self.nav.add_obstacle(Obstacle::polygon(points.clone()));
             }
             Command::RemoveObstacle { id } => {
                 self.nav.remove_obstacle(*id);
+            }
+        }
+    }
+
+    /// Execute a `Move`: partition the live selection into spatial flocks, give
+    /// each its own group id and one shared channel, then string-pull that
+    /// channel per unit so the flock spreads across corridor width instead of
+    /// single-filing the inside corner. A unit whose first leg into the channel
+    /// fails line-of-sight (straggler / no useful channel) paths individually.
+    /// See `group_pathing_plan.md`.
+    fn do_move(&mut self, units: &[UnitId], goal: Vector2) {
+        // Live selected units, slot order (stable, deterministic).
+        let mut sel: Vec<UnitId> = Vec::new();
+        for &id in units {
+            if self.units.get(id).is_some() {
+                sel.push(id);
+            }
+        }
+        let n = sel.len();
+        if n == 0 {
+            return;
+        }
+        let mut pos: Vec<Vector2> = Vec::with_capacity(n);
+        let mut rad: Vec<f32> = Vec::with_capacity(n);
+        for &id in &sel {
+            let u = self.units.get(id).expect("filtered to live");
+            pos.push(u.pos);
+            rad.push(u.radius);
+        }
+        let max_radius = rad.iter().copied().fold(0.0f32, f32::max);
+        let r_coh = max_radius * COHESION_RADIUS_FRAC;
+
+        // Connected components under "same radius, within R_COH and clear
+        // line-of-sight", via the spatial grid. Keying on radius lets each unit
+        // size route by its own clearance, so a smaller unit can take a narrower,
+        // shorter corridor the larger ones can't. Union-find over dense indices.
+        let cdt = self.nav.navmesh();
+        let mut parent: Vec<u32> = (0..n as u32).collect();
+        let cell = r_coh.max(max_radius * 2.0).max(1.0);
+        self.grid.rebuild(&pos, cell);
+        for i in 0..n {
+            let (cx, cy) = self.grid.cell_coords(pos[i]);
+            for ny in cy.saturating_sub(1)..=(cy + 1).min(self.grid.rows - 1) {
+                for nx in cx.saturating_sub(1)..=(cx + 1).min(self.grid.cols - 1) {
+                    for &j in self.grid.cell_entries(nx, ny) {
+                        let j = j as usize;
+                        if j <= i {
+                            continue;
+                        }
+                        if rad[i] != rad[j] {
+                            continue; // different sizes route as separate flocks
+                        }
+                        let d = pos[i] - pos[j];
+                        if d.x * d.x + d.y * d.y > r_coh * r_coh {
+                            continue;
+                        }
+                        if uf_find(&mut parent, i as u32) == uf_find(&mut parent, j as u32) {
+                            continue;
+                        }
+                        if clear_los(cdt, pos[i], pos[j], rad[i]) {
+                            uf_union(&mut parent, i as u32, j as u32);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Assign a fresh group id per component, in first-appearance (slot)
+        // order, and collect each component's member indices.
+        let mut comps: Vec<(u32, Vec<usize>)> = Vec::new();
+        let mut roots: Vec<(u32, usize)> = Vec::new(); // (root, comps index)
+        for i in 0..n {
+            let r = uf_find(&mut parent, i as u32);
+            match roots.iter().find(|&&(rr, _)| rr == r) {
+                Some(&(_, ci)) => comps[ci].1.push(i),
+                None => {
+                    self.group_seq = self.group_seq.wrapping_add(1).max(1);
+                    roots.push((r, comps.len()));
+                    comps.push((self.group_seq, vec![i]));
+                }
+            }
+        }
+
+        // Reusable per-corner geometry of the seed's funnel path.
+        let mut corners: Vec<Vector2> = Vec::new();
+        let mut outward: Vec<Vector2> = Vec::new();
+        let mut lanes: Vec<f32> = Vec::new();
+        for (group, members) in &comps {
+            let size = members.len();
+            // All members share one radius (clustering keys on it), so the flock's
+            // channel fits them and smaller units cluster — and route — separately.
+            let flock_r = rad[members[0]];
+            let arrival_mult =
+                (ARRIVAL_RADIUS_FACTOR * (size as f32).sqrt()).max(ARRIVAL_MIN_RADII);
+            // One shortest (funnel) path for the flock, seeded from the member
+            // nearest the goal (a real unit position is on the navmesh). Its
+            // interior waypoints are the corner apexes every unit would otherwise
+            // single-file through.
+            let seed = *members
+                .iter()
+                .min_by(|&&a, &&b| {
+                    let da = pos[a] - goal;
+                    let db = pos[b] - goal;
+                    let (da, db) = (da.x * da.x + da.y * da.y, db.x * db.x + db.y * db.y);
+                    da.partial_cmp(&db).unwrap()
+                })
+                .expect("non-empty component");
+            let seed_path =
+                find_path_abstract(cdt, &self.abstraction, pos[seed], goal, &mut self.scratch, flock_r);
+
+            // Corner apexes (drop start and goal) and the outward direction at
+            // each — the external bisector, pointing into the bend's free side
+            // (away from the wall vertex the apex hugs). Units fan along it.
+            corners.clear();
+            outward.clear();
+            if seed_path.len() > 2 {
+                for w in seed_path.windows(3) {
+                    let (prev, cur, next) = (w[0], w[1], w[2]);
+                    corners.push(cur);
+                    outward.push(external_bisector(prev, cur, next));
+                }
+            }
+
+            // No corners ⇒ a straight shot to the goal, where the flock would
+            // otherwise single-file the line and crush together. Synthesise one
+            // waypoint near the goal with a perpendicular axis so each unit holds
+            // its lateral lane until the final approach: it marches parallel and
+            // only converges over the last leg (the blob zone). The waypoint sits
+            // a converge distance (≈ the arrival radius, capped to half the path)
+            // back from the goal along the line. Fanning is symmetric about the
+            // line (both sides), unlike a bend's one-sided fan into its free side.
+            let straight = corners.is_empty() && {
+                let dir = goal - pos[seed];
+                let len2 = dir.x * dir.x + dir.y * dir.y;
+                if len2 > 1e-6 {
+                    let len = len2.sqrt();
+                    let converge = (flock_r * arrival_mult).min(len * 0.5);
+                    corners.push(goal - dir * (converge / len));
+                    outward.push(Vector2::new(-dir.y, dir.x) * (1.0 / len));
+                    true
+                } else {
+                    false
+                }
+            };
+
+            // Each unit's lane = its lateral offset from the flock along the fan
+            // axis. At a bend, shift so the most wall-ward unit sits at the apex
+            // (offset 0) and the rest fan into the free side; on a straight leg,
+            // keep the sign so they fan symmetrically and hold their spread.
+            let has_corners = !corners.is_empty();
+            let axis = if has_corners { outward[0] } else { Vector2::ZERO };
+            lanes.clear();
+            let mut lane_min = f32::INFINITY;
+            for &i in members {
+                let d = pos[i] - pos[seed];
+                let l = d.x * axis.x + d.y * axis.y;
+                lanes.push(l);
+                lane_min = lane_min.min(l);
+            }
+
+            for (k, &i) in members.iter().enumerate() {
+                let radius = rad[i];
+                // The seed already has its shortest path (offset 0, same start);
+                // reuse it (this also covers singleton clusters with no fan).
+                let path = if i == seed {
+                    seed_path.clone()
+                } else {
+                    let offset = if straight {
+                        // Hold most of the marching spread, relaxed a touch.
+                        lanes[k] * STRAIGHT_FAN_FRAC
+                    } else if has_corners {
+                        (lanes[k] - lane_min) * FAN_FRAC
+                    } else {
+                        0.0
+                    };
+                    build_offset_path(cdt, pos[i], &corners, &outward, goal, offset, radius)
+                        .unwrap_or_else(|| {
+                            // Couldn't follow the shared corners (its leg to the
+                            // first one is blocked). Route onto the flock's route
+                            // via that corner rather than down a private shortest
+                            // path — otherwise an outer unit whose own shortest
+                            // rounds an obstacle the *other* way splits off from
+                            // the group.
+                            let mut p = if corners.is_empty() {
+                                Vec::new()
+                            } else {
+                                find_path_abstract(
+                                    cdt, &self.abstraction, pos[i], corners[0], &mut self.scratch, radius,
+                                )
+                            };
+                            if p.len() >= 2 {
+                                p.extend_from_slice(&corners[1..]);
+                                p.push(goal);
+                                p
+                            } else {
+                                find_path_abstract(cdt, &self.abstraction, pos[i], goal, &mut self.scratch, radius)
+                            }
+                        })
+                };
+                let unit = self.units.get_mut(sel[i]).expect("filtered to live");
+                unit.group = *group;
+                unit.arrival_r = radius * arrival_mult;
+                set_path(unit, path);
             }
         }
     }
@@ -598,10 +789,30 @@ impl Sim {
 
     /// Advance each moving unit `max_speed * DT` along its polyline, carrying
     /// leftover distance across waypoints; snap and idle at the end.
+    ///
+    /// Each unit first **re-anchors**: it advances past any intermediate waypoint
+    /// it has already rounded, so crowd pressure that shoves it *through* a
+    /// waypoint doesn't make it double back to the one it overshot. A waypoint is
+    /// rounded once the unit is past its gate (on the next leg's side) *and* has
+    /// clear line-of-sight to the following waypoint — the LoS test is what stops
+    /// it cutting an unrounded corner.
     fn integrate(&mut self) {
+        let cdt = self.nav.navmesh();
         for (_, unit) in self.units.iter_mut() {
             if unit.path.is_empty() {
                 continue;
+            }
+            while (unit.path_i as usize) + 1 < unit.path.len() {
+                let i = unit.path_i as usize;
+                let (w, nxt) = (unit.path[i], unit.path[i + 1]);
+                let (d, seg) = (unit.pos - w, nxt - w);
+                if d.x * seg.x + d.y * seg.y >= 0.0
+                    && clear_los(cdt, unit.pos, nxt, unit.radius)
+                {
+                    unit.path_i += 1;
+                } else {
+                    break;
+                }
             }
             let mut remaining = unit.max_speed * DT;
             while remaining > 0.0 {
@@ -658,6 +869,8 @@ impl Sim {
         s.arrive.clear();
         s.coh_sum.clear();
         s.coh_n.clear();
+        s.goals.clear();
+        s.merge_pairs.clear();
         let mut max_radius = 0.0f32;
         for (id, u) in self.units.iter() {
             s.ids.push(id);
@@ -680,6 +893,7 @@ impl Sim {
             s.arrive.push(false);
             s.coh_sum.push(Vector2::ZERO);
             s.coh_n.push(0);
+            s.goals.push(u.path.last().copied().unwrap_or(Vector2::ZERO));
             max_radius = max_radius.max(u.radius);
         }
         if s.ids.len() < 2 || max_radius <= 0.0 {
@@ -690,6 +904,7 @@ impl Sim {
         let r_coh2 = r_coh * r_coh;
         // Cell covers the larger radius so the 3×3 scan still finds every pair.
         self.grid.rebuild(&s.positions, max_diameter.max(r_coh));
+        let cdt = self.nav.navmesh();
 
         for i in 0..s.ids.len() {
             let p = s.positions[i];
@@ -720,7 +935,28 @@ impl Sim {
                             s.disp[i] += push;
                             s.disp[j] -= push;
                         }
-                        if g_i == 0 || g_i != s.groups[j] {
+                        // Merge: two adjacent, both-moving, same-goal, same-size
+                        // units from *different* flocks continue as one. R_COH +
+                        // clear-LoS adjacency (the wall gate stops merging flocks
+                        // that are close but wall-separated); exact-goal match is
+                        // the deterministic "commanded together" test; same radius
+                        // keeps differently-sized flocks (which route apart) from
+                        // fusing. Recorded as (min, max), unioned after the pass (v1).
+                        let g_j = s.groups[j];
+                        if g_i != 0
+                            && g_j != 0
+                            && g_i != g_j
+                            && mv_i
+                            && s.moving[j]
+                            && r_i == s.radii[j]
+                            && d2 < r_coh2
+                            && s.goals[i] == s.goals[j]
+                            && clear_los(cdt, p, s.positions[j], r_i)
+                        {
+                            let pair = if g_i < g_j { (g_i, g_j) } else { (g_j, g_i) };
+                            s.merge_pairs.push(pair);
+                        }
+                        if g_i == 0 || g_i != g_j {
                             continue; // remaining effects are same-group only
                         }
                         // Cohesion: between two moving group-mates.
@@ -792,6 +1028,59 @@ impl Sim {
             }
             unit.pos += d;
         }
+
+        if !self.step_scratch.merge_pairs.is_empty() {
+            self.apply_merges();
+        }
+    }
+
+    /// Relabel converging flocks recorded this tick (`flock`'s merge pass) onto
+    /// one group id: union the `(min, max)` pairs and rewrite each member to its
+    /// canonical (min) id. Each merged unit keeps its own already-valid path —
+    /// only its group changes, so it coheres / crowd-arrives with the joined
+    /// flock from next tick (v1; no re-channel). Deterministic: sorted-pair
+    /// order, min canonicalisation, slot-order relabel, no map iteration.
+    fn apply_merges(&mut self) {
+        use std::collections::HashMap;
+        let pairs = &mut self.step_scratch.merge_pairs;
+        pairs.sort_unstable();
+        pairs.dedup();
+
+        // Union-find over the (few) involved group ids. The map is only ever
+        // point-queried, never iterated, so its order can't affect results.
+        let mut parent: HashMap<u32, u32> = HashMap::new();
+        fn find(parent: &mut HashMap<u32, u32>, x: u32) -> u32 {
+            let mut r = x;
+            while let Some(&p) = parent.get(&r) {
+                if p == r {
+                    break;
+                }
+                r = p;
+            }
+            let mut c = x;
+            while c != r {
+                let next = *parent.get(&c).unwrap_or(&c);
+                parent.insert(c, r);
+                c = next;
+            }
+            r
+        }
+        for &(a, b) in pairs.iter() {
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            if ra != rb {
+                let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+                parent.insert(hi, lo);
+            }
+        }
+        for (_, u) in self.units.iter_mut() {
+            if u.group != 0 {
+                let g = find(&mut parent, u.group);
+                if g != u.group {
+                    u.group = g;
+                }
+            }
+        }
+        self.step_scratch.merge_pairs.clear();
     }
 
     /// Project unit circles out of nearby constrained edges. Paths already
@@ -951,6 +1240,83 @@ impl Sim {
         }
         self.rng.hash_into(&mut h);
         h.0
+    }
+}
+
+fn norm(v: Vector2) -> Vector2 {
+    let l2 = v.x * v.x + v.y * v.y;
+    if l2 > 1e-12 {
+        v * (1.0 / l2.sqrt())
+    } else {
+        Vector2::ZERO
+    }
+}
+
+/// Outward direction at a path corner `cur` between `prev` and `next`: the unit
+/// vector pointing away from the wall vertex the shortest-path apex wraps, into
+/// the bend's free side. `norm(prev−cur)+norm(next−cur)` bisects toward the
+/// inside (the vertex), so negate it. `ZERO` for a (near-)straight corner.
+fn external_bisector(prev: Vector2, cur: Vector2, next: Vector2) -> Vector2 {
+    -norm(norm(prev - cur) + norm(next - cur))
+}
+
+/// A unit's path through the flock's shared corner apexes, each displaced
+/// `outward[j] * offset` into the bend's free side so the flock fans out and
+/// rounds bends side-by-side instead of single-filing the apex. Tries the full
+/// offset, then halves toward the apex; returns the first polyline whose every
+/// leg clears walls, or `None` so the caller paths the unit alone.
+///
+/// Fanned legs (offset > 0) are validated at an inflated radius so a unit only
+/// takes a lane where the corridor has room for parallel lanes — in a tight
+/// squeeze every offset fails the inflated check and it falls back to the apex
+/// (single-file, the only thing that fits). The apex itself (scale 0) is
+/// validated at the true radius, so the real shortest route is always allowed.
+fn build_offset_path(
+    cdt: &CDT,
+    start: Vector2,
+    corners: &[Vector2],
+    outward: &[Vector2],
+    goal: Vector2,
+    offset: f32,
+    radius: f32,
+) -> Option<Vec<Vector2>> {
+    // One extra radius of clearance ⇒ a fanned lane has ≈ a full diameter of
+    // room beside the apex before it's accepted.
+    let fan_radius = radius * 2.0;
+    for &scale in &[1.0f32, 0.5, 0.25, 0.0] {
+        let o = offset * scale;
+        // Offset can be signed (straight-leg fanning spreads to both sides of the
+        // line); the inflated lane check keys on magnitude, not direction.
+        let check_r = if o.abs() > 1e-6 { fan_radius } else { radius };
+        let mut path = Vec::with_capacity(corners.len() + 2);
+        path.push(start);
+        for (c, n) in corners.iter().zip(outward) {
+            path.push(*c + *n * o);
+        }
+        path.push(goal);
+        if path.windows(2).all(|w| clear_los(cdt, w[0], w[1], check_r)) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Union-find root with path halving (over dense indices, for `do_move`'s
+/// spatial clustering).
+fn uf_find(parent: &mut [u32], mut x: u32) -> u32 {
+    while parent[x as usize] != x {
+        parent[x as usize] = parent[parent[x as usize] as usize];
+        x = parent[x as usize];
+    }
+    x
+}
+
+/// Union two sets, keeping the smaller root as canonical (deterministic).
+fn uf_union(parent: &mut [u32], a: u32, b: u32) {
+    let (ra, rb) = (uf_find(parent, a), uf_find(parent, b));
+    if ra != rb {
+        let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+        parent[hi as usize] = lo;
     }
 }
 
@@ -1312,6 +1678,7 @@ mod tests {
             for j in (i + 1)..units.len() {
                 let d = dist(units[i].pos, units[j].pos);
                 let min = units[i].radius + units[j].radius;
+                // At rest (no path pull), separation resolves overlap fully.
                 assert!(
                     d >= min - 0.1,
                     "units {i},{j} still overlap: dist {d} < {min}"
@@ -1643,14 +2010,15 @@ mod tests {
 
     #[test]
     fn test_cross_group_independence() {
-        // Two units within cohesion range marching to a shared goal. Same
-        // group: cohesion pulls them together beyond what their converging
-        // paths do. Different groups: no cross-group pull, so they stay as
-        // far apart as the paths alone leave them.
+        // A trailing unit in line behind a leader, both marching to a shared goal
+        // (placed along the travel axis so the straight-line fan stays neutral and
+        // cohesion is the only differing effect). Same group: cohesion pulls the
+        // straggler forward and it closes the gap. Different groups: no cross-group
+        // pull, so the gap holds at what the parallel paths leave it.
         let gap_after = |same_group: bool| -> f32 {
             let mut sim = rooms_sim(3, 1, 4);
-            let a = spawn(&mut sim, v(30.0, 40.0), 5.0, 30.0);
-            let b = spawn(&mut sim, v(30.0, 60.0), 5.0, 30.0);
+            let a = spawn(&mut sim, v(50.0, 50.0), 5.0, 30.0);
+            let b = spawn(&mut sim, v(30.0, 50.0), 5.0, 30.0);
             let goal = v(250.0, 50.0);
             let cmds = if same_group {
                 vec![Command::Move {
@@ -1670,7 +2038,7 @@ mod tests {
                 ]
             };
             sim.step(&cmds);
-            step_n(&mut sim, 20);
+            step_n(&mut sim, 40);
             dist(unit(&sim, a).pos, unit(&sim, b).pos)
         };
         let same = gap_after(true);
@@ -1719,8 +2087,9 @@ mod tests {
             goal: v(50.0, 50.0),
         }]);
         // Warm scratch buffers (grid, dense arrays, locate paths) and let the
-        // group settle into its blob, so the measured window is steady state.
-        step_n(&mut sim, 40);
+        // group fully settle into its blob, so the measured window is steady
+        // state (the soft separation push settles gradually).
+        step_n(&mut sim, 120);
         let allocs = crate::alloc_counter::count_allocs(|| {
             for _ in 0..20 {
                 sim.step(&[]);
@@ -1786,6 +2155,302 @@ mod tests {
         assert_ne!(a.generation, b.generation);
         assert!(units.get(a).is_none());
         assert!(units.get(b).is_some());
+    }
+
+    // ── Group pathing (shared channel / clustering / merge) ──────────────────
+
+    fn group_of(sim: &Sim, id: UnitId) -> u32 {
+        unit(sim, id).group
+    }
+
+    /// L-bend: horizontal arm [0,200]×[0,50] joined to vertical arm
+    /// [150,200]×[0,200]; inside corner at (150,50). Single boundary polygon.
+    fn lbend_map() -> (Vec<Vector2>, Vec<(u32, u32)>) {
+        let pts = vec![
+            v(0.0, 0.0),
+            v(200.0, 0.0),
+            v(200.0, 200.0),
+            v(150.0, 200.0),
+            v(150.0, 50.0),
+            v(0.0, 50.0),
+        ];
+        let cons = vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)];
+        (pts, cons)
+    }
+
+    #[test]
+    fn test_lbend_flock_fans_across_bend() {
+        let (points, constraints) = lbend_map();
+        let walls = wall_segments(&points, &constraints);
+        let mut sim = Sim::new(points, &constraints, 1);
+        let goal = v(175.0, 190.0);
+        // A row across the corridor width (y = 10..40); the inside lane (y=40,
+        // nearest the inside corner) should round tight, the outside (y=10) wide.
+        let ids: Vec<_> = (0..4)
+            .map(|i| spawn(&mut sim, v(15.0, 10.0 + 10.0 * i as f32), 5.0, 25.0))
+            .collect();
+        sim.step(&[Command::Move { units: ids.clone(), goal }]);
+
+        // Bend waypoint (the apex unit-0 would single-file through) fans out, one
+        // distinct crossing per lane, monotone in spawn (lateral) order.
+        let bend_x: Vec<f32> = ids
+            .iter()
+            .map(|&id| {
+                let p = &unit(&sim, id).path;
+                p[p.len() - 2].x
+            })
+            .collect();
+        assert!(
+            bend_x[0] > bend_x[1] && bend_x[1] > bend_x[2] && bend_x[2] > bend_x[3],
+            "bend crossings must fan monotonically across the corridor: {bend_x:?}"
+        );
+        assert!(
+            bend_x[0] - bend_x[3] > 4.0,
+            "flock must spread across the bend, got {}",
+            bend_x[0] - bend_x[3]
+        );
+
+        for _ in 0..400 {
+            sim.step(&[]);
+            assert_no_wall_crossing(&sim, &walls);
+        }
+        for &id in &ids {
+            assert!(
+                dist(unit(&sim, id).pos, goal) < 40.0,
+                "unit short of goal: {:?}",
+                unit(&sim, id).pos
+            );
+        }
+    }
+
+    #[test]
+    fn test_straight_flock_fans_into_lanes() {
+        // On open ground (no corners) a flock heading straight to the goal must
+        // still fan into parallel lanes instead of single-filing the line and
+        // crushing together — the same spread a corridor bend gives.
+        let mut sim = rooms_sim(1, 1, 1);
+        let goal = v(85.0, 40.0);
+        // A column spread laterally to the (horizontal) travel direction.
+        let ids: Vec<_> = (0..3)
+            .map(|i| spawn(&mut sim, v(15.0, 20.0 + 20.0 * i as f32), 5.0, 25.0))
+            .collect();
+        sim.step(&[Command::Move {
+            units: ids.clone(),
+            goal,
+        }]);
+        // Each non-seed unit holds a near-goal waypoint at most of its lane, so a
+        // good fraction of the start spread (40) is kept rather than collapsing.
+        let mid_y: Vec<f32> = ids.iter().map(|&id| unit(&sim, id).path[0].y).collect();
+        let spread = mid_y.iter().cloned().fold(f32::MIN, f32::max)
+            - mid_y.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(
+            spread > 20.0,
+            "flock collapsed instead of holding its lanes: {mid_y:?}"
+        );
+    }
+
+    #[test]
+    fn test_outer_unit_does_not_split_around_obstacle() {
+        // A wide flock vs a central obstacle with two ways around. The flock
+        // commits to one side (the seed's); an outer unit whose own shortest
+        // path rounds the *other* way must still follow the group, not split off
+        // onto a private path. (Regression: build_offset_path failed for that
+        // unit and the fallback gave it an individual, other-side route.)
+        let mut sim = rooms_sim(1, 1, 1);
+        sim.step(&[Command::AddObstacle {
+            points: vec![v(47.0, 30.0), v(53.0, 30.0), v(53.0, 70.0), v(47.0, 70.0)],
+        }]);
+        let goal = v(90.0, 50.0);
+        let ids: Vec<_> = (0..10)
+            .map(|i| spawn(&mut sim, v(15.0, 18.0 + 7.0 * i as f32), 5.0, 25.0))
+            .collect();
+        sim.step(&[Command::Move { units: ids.clone(), goal }]);
+        // The flock rounds the bottom (below y=30); no unit detours over the top
+        // (above y=70) on a private route.
+        for (k, &id) in ids.iter().enumerate() {
+            let maxy = unit(&sim, id).path.iter().fold(0.0f32, |m, p| m.max(p.y));
+            assert!(maxy < 70.0, "unit {k} split to the far side of the obstacle: maxy {maxy}");
+        }
+    }
+
+    /// Box 0..200 x 0..100 with a vertical wall at x=100: wide passages around
+    /// the ends (y<25, y>75) and a narrow middle gap (y 45..55). Small units fit
+    /// the gap (short straight route); big units must detour around an end.
+    fn narrow_gap_map() -> (Vec<Vector2>, Vec<(u32, u32)>) {
+        let pts = vec![
+            v(0.0, 0.0), v(200.0, 0.0), v(200.0, 100.0), v(0.0, 100.0),
+            v(100.0, 25.0), v(100.0, 45.0), v(100.0, 55.0), v(100.0, 75.0),
+        ];
+        let cons = vec![(0,1),(1,2),(2,3),(3,0),(4,5),(6,7)];
+        (pts, cons)
+    }
+
+    #[test]
+    fn test_mixed_sizes_route_by_clearance() {
+        // Big and small units commanded together: the small ones fit the narrow
+        // middle gap (short, straight) while the big ones must detour around an
+        // end. The group must not all adhere to the largest size.
+        let (points, constraints) = narrow_gap_map();
+        let mut sim = Sim::new(points, &constraints, 1);
+        let goal = v(185.0, 50.0);
+        let big: Vec<_> = (0..3)
+            .map(|i| spawn(&mut sim, v(15.0, 44.0 + 4.0 * i as f32), 8.0, 25.0))
+            .collect();
+        let small: Vec<_> = (0..3)
+            .map(|i| spawn(&mut sim, v(30.0, 44.0 + 4.0 * i as f32), 4.0, 25.0))
+            .collect();
+        let mut all = big.clone();
+        all.extend(small.clone());
+        sim.step(&[Command::Move { units: all, goal }]);
+
+        // Small units cross straight through the gap (y stays in 45..55).
+        for &id in &small {
+            for w in &unit(&sim, id).path {
+                assert!(
+                    (45.0..=55.0).contains(&w.y),
+                    "small unit left the gap route at {w:?}"
+                );
+            }
+        }
+        // Big units can't fit the gap, so they detour past an end (below y=30).
+        for &id in &big {
+            let miny = unit(&sim, id).path.iter().fold(999.0f32, |m, p| m.min(p.y));
+            assert!(miny < 30.0, "big unit didn't detour around the end: miny {miny}");
+        }
+        // Different sizes are separate flocks.
+        assert_ne!(group_of(&sim, big[0]), group_of(&sim, small[0]));
+    }
+
+    #[test]
+    fn test_move_clusters_separate_far_groups() {
+        // One Move over two clusters far apart (> R_COH and wall-separated):
+        // each cluster gets its own group id and shared channel.
+        let mut sim = rooms_sim(3, 1, 1);
+        let goal = v(150.0, 50.0);
+        let a: Vec<_> = (0..3)
+            .map(|i| spawn(&mut sim, v(20.0 + 6.0 * i as f32, 50.0), 5.0, 30.0))
+            .collect();
+        let b: Vec<_> = (0..3)
+            .map(|i| spawn(&mut sim, v(260.0 + 6.0 * i as f32, 50.0), 5.0, 30.0))
+            .collect();
+        let all: Vec<_> = a.iter().chain(&b).copied().collect();
+        sim.step(&[Command::Move { units: all, goal }]);
+        let (ga, gb) = (group_of(&sim, a[0]), group_of(&sim, b[0]));
+        assert!(a.iter().all(|&id| group_of(&sim, id) == ga), "cluster A split");
+        assert!(b.iter().all(|&id| group_of(&sim, id) == gb), "cluster B split");
+        assert_ne!(ga, gb, "far clusters must get distinct groups");
+    }
+
+    #[test]
+    fn test_no_cluster_across_wall() {
+        // Two units within R_COH but separated by a wall (not the door) must not
+        // share a flock — the clear-LoS gate keeps them apart.
+        let mut sim = rooms_sim(2, 1, 1); // wall x=100, door y∈[35,65]
+        let a = spawn(&mut sim, v(90.0, 20.0), 5.0, 30.0);
+        let b = spawn(&mut sim, v(110.0, 20.0), 5.0, 30.0);
+        sim.step(&[Command::Move {
+            units: vec![a, b],
+            goal: v(150.0, 50.0),
+        }]);
+        assert_ne!(
+            group_of(&sim, a),
+            group_of(&sim, b),
+            "wall-separated units must not cluster"
+        );
+    }
+
+    #[test]
+    fn test_convergence_merge_same_goal() {
+        // Two distinct same-goal flocks that meet relabel to one group and stay
+        // merged thereafter.
+        let mut sim = rooms_sim(1, 1, 1); // open 100×100 room
+        let goal = v(50.0, 50.0);
+        let a: Vec<_> = (0..4)
+            .map(|i| spawn(&mut sim, v(15.0 + 6.0 * i as f32, 20.0), 5.0, 25.0))
+            .collect();
+        let b: Vec<_> = (0..4)
+            .map(|i| spawn(&mut sim, v(15.0 + 6.0 * i as f32, 80.0), 5.0, 25.0))
+            .collect();
+        sim.step(&[Command::Move { units: a.clone(), goal }]);
+        sim.step(&[Command::Move { units: b.clone(), goal }]);
+        assert_ne!(group_of(&sim, a[0]), group_of(&sim, b[0]), "start distinct");
+        step_n(&mut sim, 120);
+        let g = group_of(&sim, a[0]);
+        assert!(
+            a.iter().chain(&b).all(|&id| group_of(&sim, id) == g),
+            "converging same-goal flocks must merge to one group"
+        );
+    }
+
+    #[test]
+    fn test_no_merge_different_goals() {
+        // Flocks that cross paths but head to different goals never merge.
+        let mut sim = rooms_sim(1, 1, 1);
+        let a: Vec<_> = (0..3)
+            .map(|i| spawn(&mut sim, v(15.0, 40.0 + 6.0 * i as f32), 5.0, 25.0))
+            .collect();
+        let b: Vec<_> = (0..3)
+            .map(|i| spawn(&mut sim, v(40.0 + 6.0 * i as f32, 15.0), 5.0, 25.0))
+            .collect();
+        sim.step(&[Command::Move { units: a.clone(), goal: v(85.0, 50.0) }]);
+        sim.step(&[Command::Move { units: b.clone(), goal: v(50.0, 85.0) }]);
+        let (ga, gb) = (group_of(&sim, a[0]), group_of(&sim, b[0]));
+        assert_ne!(ga, gb);
+        for _ in 0..60 {
+            sim.step(&[]);
+            assert_eq!(group_of(&sim, a[0]), ga, "flock A group changed");
+            assert_eq!(group_of(&sim, b[0]), gb, "flock B group changed");
+        }
+    }
+
+    #[test]
+    fn test_reanchor_skips_overshot_waypoint() {
+        // A unit shoved past an intermediate waypoint advances onto the next leg
+        // instead of doubling back to the waypoint it overshot.
+        let (points, constraints) = lbend_map();
+        let mut sim = Sim::new(points, &constraints, 1);
+        let goal = v(175.0, 190.0);
+        let id = spawn(&mut sim, v(15.0, 25.0), 5.0, 25.0);
+        sim.step(&[Command::Move { units: vec![id], goal }]);
+        assert!(unit(&sim, id).path.len() >= 2, "need an intermediate waypoint");
+        let corner = unit(&sim, id).path[0];
+        let next = unit(&sim, id).path[1];
+        // Teleport just past the corner toward the next waypoint (a crowd shove).
+        let dir = norm(next - corner);
+        {
+            let u = sim.units.get_mut(id).unwrap();
+            u.pos = corner + dir * 3.0;
+            u.prev_pos = u.pos;
+        }
+        sim.step(&[]);
+        assert!(
+            unit(&sim, id).path_i >= 1,
+            "must advance past the overshot waypoint, not steer back to it"
+        );
+    }
+
+    #[test]
+    fn test_determinism_multicluster_and_merge() {
+        // A two-cluster move that converges and merges replays bit-identically.
+        let script = || -> Vec<u64> {
+            let mut sim = rooms_sim(1, 1, 42);
+            let goal = v(50.0, 50.0);
+            let a: Vec<_> = (0..4)
+                .map(|i| spawn(&mut sim, v(15.0 + 6.0 * i as f32, 25.0), 5.0, 25.0))
+                .collect();
+            let b: Vec<_> = (0..4)
+                .map(|i| spawn(&mut sim, v(15.0 + 6.0 * i as f32, 75.0), 5.0, 25.0))
+                .collect();
+            sim.step(&[Command::Move { units: a, goal }]);
+            sim.step(&[Command::Move { units: b, goal }]);
+            (0..150)
+                .map(|_| {
+                    sim.step(&[]);
+                    sim.state_hash()
+                })
+                .collect()
+        };
+        assert_eq!(script(), script(), "multi-cluster + merge must be deterministic");
     }
 }
 
