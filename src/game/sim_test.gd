@@ -36,7 +36,6 @@ var _paths: Array[PackedVector2Array] = []
 var _order_goals: Array[PackedVector2Array] = []
 
 var _stats_label: Label
-var _graphs: VBoxContainer
 var _graph_fps: PerfGraph
 var _graph_frame: PerfGraph
 var _graph_step: PerfGraph
@@ -44,6 +43,14 @@ var _stats_timer: float = 0.0
 var _frame_ms_acc: float = 0.0
 var _frame_count: int = 0
 var _last_stat_tick: int = -1
+
+# Floating panel drag state
+var _dragged_panel: Control = null
+var _drag_panel_offset: Vector2
+
+# Panel references for initial bottom-edge positioning
+var _keymap_panel: Control
+var _controls_panel: Control
 
 
 ## Scrolling history graph for one metric.
@@ -98,11 +105,28 @@ func _ready() -> void:
 	_sim = Simulation.new()
 	add_child(_sim)
 	_sim.load_map(_editor.points, _editor.constraints, 42)
-	_build_debug_ui()
-	_build_unit_props_ui()
+
+	var layer := CanvasLayer.new()
+	add_child(layer)
+	_build_perf_ui(layer)
+	_build_keymap_ui(layer)
+	_build_controls_ui(layer)
+
+	# Defer bottom-edge positioning until after first layout pass.
+	_reposition_bottom_panels.call_deferred()
+
+
+func _reposition_bottom_panels() -> void:
+	await get_tree().process_frame
+	var vp := get_viewport_rect().size
+	_keymap_panel.position = Vector2(8.0, vp.y - _keymap_panel.size.y - 8.0)
+	_controls_panel.position = Vector2(vp.x - _controls_panel.size.x - 8.0,
+			vp.y - _controls_panel.size.y - 8.0)
 
 
 func _process(delta: float) -> void:
+	if _dragged_panel:
+		_dragged_panel.position = get_viewport().get_mouse_position() + _drag_panel_offset
 	_alpha = _sim.poll(delta)
 	_ids = _sim.get_unit_ids()
 	_positions = _sim.get_positions(_alpha)
@@ -112,6 +136,11 @@ func _process(delta: float) -> void:
 		_refresh_overlay()
 	_update_stats(delta)
 	queue_redraw()
+
+
+func _input(event: InputEvent) -> void:
+	if _dragged_panel and event is InputEventMouseButton and not event.pressed:
+		_dragged_panel = null
 
 
 func _update_stats(delta: float) -> void:
@@ -288,119 +317,161 @@ func _draw_queued_orders() -> void:
 			draw_circle(g, 3.0, Color(0.2, 0.9, 1.0, 0.7))
 
 
-func _build_debug_ui() -> void:
-	var layer := CanvasLayer.new()
-	add_child(layer)
+## Creates a draggable, collapsible floating panel. Returns [panel, content].
+## pin_bottom: keep the bottom edge fixed when expanding/collapsing (use for
+## panels anchored to the bottom of the screen).
+func _make_floating_panel(
+	parent: Node,
+	title_text: String,
+	collapsed: bool = false,
+	pin_bottom: bool = false,
+) -> Array:
 	var panel := PanelContainer.new()
-	panel.position = Vector2(8, 8)
-	layer.add_child(panel)
-	var col := VBoxContainer.new()
-	panel.add_child(col)
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 8)
-	col.add_child(row)
+	parent.add_child(panel)
 
-	var hint := Label.new()
-	hint.text = "U: spawn | Shift+U: x10 | Ctrl+U: x50 | drag: select | RMB: move | Shift+RMB: queue"
-	row.add_child(hint)
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 2)
+	panel.add_child(vbox)
+
+	var title_row := HBoxContainer.new()
+	vbox.add_child(title_row)
+
+	# Dragging is triggered by holding the title button.
+	var drag_btn := Button.new()
+	drag_btn.flat = true
+	drag_btn.text = title_text
+	drag_btn.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	drag_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	drag_btn.button_down.connect(func() -> void:
+		_dragged_panel = panel
+		_drag_panel_offset = panel.position - get_viewport().get_mouse_position()
+	)
+	title_row.add_child(drag_btn)
+
+	var collapse_btn := Button.new()
+	collapse_btn.text = "+" if collapsed else "−"
+	collapse_btn.toggle_mode = true
+	collapse_btn.button_pressed = not collapsed
+	collapse_btn.flat = true
+	title_row.add_child(collapse_btn)
+
+	var content := VBoxContainer.new()
+	content.add_theme_constant_override("separation", 4)
+	content.visible = not collapsed
+	vbox.add_child(content)
+
+	collapse_btn.toggled.connect(func(on: bool) -> void:
+		var old_bottom := panel.position.y + panel.size.y
+		content.visible = on
+		collapse_btn.text = "−" if on else "+"
+		panel.reset_size()
+		if pin_bottom:
+			panel.position.y = old_bottom - panel.size.y
+	)
+
+	return [panel, content]
+
+
+func _build_perf_ui(layer: CanvasLayer) -> void:
+	var r := _make_floating_panel(layer, "Performance", false)
+	var panel: Control = r[0]
+	var content: VBoxContainer = r[1]
+	panel.position = Vector2(8.0, 8.0)
+
+	_stats_label = Label.new()
+	_stats_label.add_theme_font_size_override("font_size", 12)
+	content.add_child(_stats_label)
+
+	var graphs := VBoxContainer.new()
+	content.add_child(graphs)
+	_graph_fps = PerfGraph.new("fps", "", Color(0.4, 1.0, 0.4))
+	_graph_frame = PerfGraph.new("frame", " ms", Color(0.4, 0.7, 1.0))
+	_graph_step = PerfGraph.new("sim step", " ms", Color(1.0, 0.7, 0.3))
+	for graph in [_graph_fps, _graph_frame, _graph_step]:
+		graphs.add_child(graph)
+
+
+func _build_keymap_ui(layer: CanvasLayer) -> void:
+	var r := _make_floating_panel(layer, "Keymap", true, true)
+	_keymap_panel = r[0]
+	var content: VBoxContainer = r[1]
+	_keymap_panel.position = Vector2(8.0, 400.0)  # corrected in _reposition_bottom_panels
+
+	var entries: Array[String] = [
+		"U — spawn unit at cursor",
+		"Shift+U — spawn ×10",
+		"Ctrl+U — spawn ×50",
+		"Drag (LMB) — box-select units",
+		"Click (LMB) — select unit",
+		"RMB — move selected",
+		"Shift+RMB — queue move",
+		"LMB (build mode) — place building",
+		"RMB (build mode) — remove building",
+	]
+	for entry in entries:
+		var lbl := Label.new()
+		lbl.text = entry
+		lbl.add_theme_font_size_override("font_size", 11)
+		content.add_child(lbl)
+
+
+func _build_controls_ui(layer: CanvasLayer) -> void:
+	var r := _make_floating_panel(layer, "Controls", false, true)
+	_controls_panel = r[0]
+	var content: VBoxContainer = r[1]
+	_controls_panel.position = Vector2(400.0, 400.0)  # corrected in _reposition_bottom_panels
 
 	var build := Button.new()
 	build.toggle_mode = true
 	build.text = "Place building"
-	build.tooltip_text = "While on, LMB places a building, RMB removes one"
+	build.tooltip_text = "LMB places a building, RMB removes one"
 	build.toggled.connect(func(on: bool) -> void: _build_mode = on)
-	row.add_child(build)
+	content.add_child(build)
 
 	var overlay := Button.new()
 	overlay.toggle_mode = true
 	overlay.text = "Debug overlay"
-	overlay.toggled.connect(
-		func(on: bool) -> void:
-			_overlay = on
-			_mesh_version = -1  # force a fresh dump on re-toggle
-			_paths = []
-			_order_goals = []
-			_editor.visible = on
-			_sim.set_debug_overlay(on)
+	overlay.toggled.connect(func(on: bool) -> void:
+		_overlay = on
+		_mesh_version = -1
+		_paths = []
+		_order_goals = []
+		_editor.visible = on
+		_sim.set_debug_overlay(on)
 	)
-	row.add_child(overlay)
 	overlay.button_pressed = true
+	content.add_child(overlay)
 
 	var pause := Button.new()
 	pause.toggle_mode = true
 	pause.text = "Pause"
 	pause.toggled.connect(func(on: bool) -> void: _sim.set_paused(on))
-	row.add_child(pause)
+	content.add_child(pause)
 
+	var speed_row := HBoxContainer.new()
+	content.add_child(speed_row)
+	var speed_lbl := Label.new()
+	speed_lbl.text = "Speed"
+	speed_lbl.custom_minimum_size = Vector2(40, 0)
+	speed_row.add_child(speed_lbl)
 	var speed := HSlider.new()
 	speed.min_value = 0.1
 	speed.max_value = 4.0
 	speed.step = 0.1
 	speed.value = 1.0
 	speed.custom_minimum_size = Vector2(120, 0)
+	speed.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	speed.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	speed.tooltip_text = "Sim speed"
+	speed.tooltip_text = "Sim speed multiplier"
 	speed.value_changed.connect(func(value: float) -> void: _sim.set_speed(value))
-	row.add_child(speed)
+	speed_row.add_child(speed)
 
-	var graphs_btn := Button.new()
-	graphs_btn.toggle_mode = true
-	graphs_btn.text = "Graphs"
-	graphs_btn.toggled.connect(func(on: bool) -> void: _graphs.visible = on)
-	row.add_child(graphs_btn)
+	var sep := HSeparator.new()
+	content.add_child(sep)
 
-	_stats_label = Label.new()
-	_stats_label.add_theme_font_size_override("font_size", 12)
-	col.add_child(_stats_label)
-
-	_graphs = VBoxContainer.new()
-	_graphs.visible = false
-	col.add_child(_graphs)
-	_graph_fps = PerfGraph.new("fps", "", Color(0.4, 1.0, 0.4))
-	_graph_frame = PerfGraph.new("frame", " ms", Color(0.4, 0.7, 1.0))
-	_graph_step = PerfGraph.new("sim step", " ms", Color(1.0, 0.7, 0.3))
-	for graph in [_graph_fps, _graph_frame, _graph_step]:
-		_graphs.add_child(graph)
-
-
-func _build_unit_props_ui() -> void:
-	var layer := CanvasLayer.new()
-	add_child(layer)
-
-	var panel := PanelContainer.new()
-	panel.anchor_left = 1.0
-	panel.anchor_right = 1.0
-	panel.offset_left = -228.0
-	panel.offset_right = -8.0
-	panel.offset_top = 8.0
-	layer.add_child(panel)
-
-	var col := VBoxContainer.new()
-	panel.add_child(col)
-
-	var header := HBoxContainer.new()
-	col.add_child(header)
-
-	var title := Label.new()
-	title.text = "Unit Properties"
-	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	header.add_child(title)
-
-	var collapse_btn := Button.new()
-	collapse_btn.text = "-"
-	collapse_btn.toggle_mode = true
-	collapse_btn.button_pressed = true
-	collapse_btn.flat = true
-	header.add_child(collapse_btn)
-
-	var content := VBoxContainer.new()
-	content.add_theme_constant_override("separation", 4)
-	col.add_child(content)
-
-	collapse_btn.toggled.connect(func(on: bool) -> void:
-		content.visible = on
-		collapse_btn.text = "-" if on else "+"
-	)
+	var unit_title := Label.new()
+	unit_title.text = "Unit Properties"
+	content.add_child(unit_title)
 
 	_add_prop_slider(content, "Radius", unit_radius, 2.0, 30.0, 0.5,
 		func(v: float) -> void: unit_radius = v)
