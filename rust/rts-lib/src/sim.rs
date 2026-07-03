@@ -2124,17 +2124,34 @@ mod tests {
         // Only a couple reach the goal centre; the rest stop around it.
         let at_goal = us.iter().filter(|u| dist(u.pos, goal) < 5.0).count();
         assert!(at_goal <= 2, "units crammed onto the goal centre: {at_goal}");
-        // The blob is *centred* on the goal — the radius-gated crowd-stop lets
-        // units pack around it rather than tailing back along the approach, so
-        // the centroid lands within ~one unit-diameter of the goal.
+        // The blob is built *around* the goal, not short of it: the radius-gated
+        // crowd-stop lets units pack past the goal rather than all piling up on
+        // the approach side. Measured along the approach axis the blob straddles
+        // the goal (some behind, some past it), and the centroid sits inside the
+        // group's own arrival radius. Both are radius-scaled, so this tests the
+        // concept rather than the current ARRIVAL_RADIUS_FACTOR value.
+        let axis = (goal - v(12.0, 12.0)).normalized();
+        let (mut behind, mut past) = (f32::MAX, f32::MIN);
+        for u in &us {
+            let t = (u.pos - goal).dot(axis);
+            behind = behind.min(t);
+            past = past.max(t);
+        }
+        assert!(
+            behind < 0.0 && past > 0.0,
+            "blob must straddle the goal, not stop short: behind={behind} past={past}"
+        );
+        let r = us[0].radius;
+        let arrival_r =
+            r * (ARRIVAL_RADIUS_FACTOR.get() * (us.len() as f32).sqrt()).max(ARRIVAL_MIN_RADII.get());
         let mut c = Vector2::ZERO;
         for u in &us {
             c += u.pos;
         }
         c *= 1.0 / us.len() as f32;
         assert!(
-            dist(c, goal) < 12.0,
-            "group centre not at the goal: {}",
+            dist(c, goal) < arrival_r,
+            "group centre outside its arrival radius: {} (arrival_r={arrival_r})",
             dist(c, goal)
         );
     }
