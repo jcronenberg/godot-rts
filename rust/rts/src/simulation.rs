@@ -154,6 +154,13 @@ impl Simulation {
         rts_lib::sim::set_tuning(&name.to_string(), value)
     }
 
+    /// Reads a sim tunable's current value by name (see
+    /// `rts_lib::sim::get_tuning`); returns 0.0 if `name` doesn't match one.
+    #[func]
+    pub fn get_tuning(&self, name: GString) -> f32 {
+        rts_lib::sim::get_tuning(&name.to_string()).unwrap_or(0.0)
+    }
+
     /// Fetch the latest snapshot and advance the render clock by `delta`
     /// seconds. Returns the interpolation alpha for `get_positions`.
     #[func]

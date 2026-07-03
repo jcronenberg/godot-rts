@@ -128,6 +128,27 @@ pub fn set_tuning(name: &str, value: f32) -> bool {
     true
 }
 
+/// Reads a tunable above by its lowercased name; `None` if `name` doesn't
+/// match one. Lets UI (or anything else) start from the live value instead of
+/// a second hardcoded copy of the default.
+pub fn get_tuning(name: &str) -> Option<f32> {
+    Some(match name {
+        "separation_relax" => SEPARATION_RELAX.get(),
+        "separation_max_frac" => SEPARATION_MAX_FRAC.get(),
+        "cohesion_radius_frac" => COHESION_RADIUS_FRAC.get(),
+        "cohesion_gain" => COHESION_GAIN.get(),
+        "cohesion_max_frac" => COHESION_MAX_FRAC.get(),
+        "arrival_touch_frac" => ARRIVAL_TOUCH_FRAC.get(),
+        "arrival_radius_factor" => ARRIVAL_RADIUS_FACTOR.get(),
+        "arrival_min_radii" => ARRIVAL_MIN_RADII.get(),
+        "fan_frac" => FAN_FRAC.get(),
+        "straight_fan_frac" => STRAIGHT_FAN_FRAC.get(),
+        "stall_repath_ticks" => STALL_REPATH_TICKS.get() as f32,
+        "stall_progress_eps" => STALL_PROGRESS_EPS.get(),
+        _ => return None,
+    })
+}
+
 // ── RNG ───────────────────────────────────────────────────────────────────────
 
 /// PCG-XSH-RR 32-bit generator (O'Neill 2014); the sim's only randomness.
@@ -1050,6 +1071,8 @@ impl Sim {
         // Cell covers the larger radius so the 3×3 scan still finds every pair.
         self.grid.rebuild(&s.positions, max_diameter.max(r_coh));
         let cdt = self.nav.navmesh();
+        let separation_relax = SEPARATION_RELAX.get();
+        let arrival_touch_frac = ARRIVAL_TOUCH_FRAC.get();
 
         for i in 0..s.ids.len() {
             let p = s.positions[i];
@@ -1076,7 +1099,7 @@ impl Sim {
                             } else {
                                 Vector2::new(1.0, 0.0)
                             };
-                            let push = dir * ((min_dist - d) * 0.5 * SEPARATION_RELAX.get());
+                            let push = dir * ((min_dist - d) * 0.5 * separation_relax);
                             s.disp[i] += push;
                             s.disp[j] -= push;
                         }
@@ -1119,7 +1142,7 @@ impl Sim {
                         // radius gate lets units still far from the goal keep
                         // pushing in, so the blob centres rather than tailing
                         // back along the approach.
-                        let touch = min_dist * ARRIVAL_TOUCH_FRAC.get();
+                        let touch = min_dist * arrival_touch_frac;
                         if d2 < touch * touch {
                             if mv_i && s.within_arrival[i] && s.parked[j] {
                                 s.arrive[i] = true;

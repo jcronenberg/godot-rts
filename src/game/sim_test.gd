@@ -494,23 +494,25 @@ func _build_tuning_ui(layer: CanvasLayer) -> void:
 	var content: VBoxContainer = r[1]
 	_tuning_panel.position = Vector2(280.0, 8.0)  # corrected in _reposition_bottom_panels
 
+	# name, min, max, step — current value comes from Simulation.get_tuning,
+	# not a hardcoded copy of the sim.rs default.
 	var tunables := [
-		["separation_relax", 0.4, 0.0, 1.0, 0.05],
-		["separation_max_frac", 1.5, 0.0, 3.0, 0.1],
-		["cohesion_radius_frac", 5.0, 0.0, 10.0, 0.5],
-		["cohesion_gain", 0.05, 0.0, 0.3, 0.01],
-		["cohesion_max_frac", 0.15, 0.0, 0.5, 0.01],
-		["arrival_touch_frac", 1.15, 1.0, 2.0, 0.05],
-		["arrival_radius_factor", 1.0, 0.0, 3.0, 0.1],
-		["arrival_min_radii", 3.0, 0.0, 10.0, 0.5],
-		["fan_frac", 0.34, 0.0, 1.0, 0.02],
-		["straight_fan_frac", 0.6, 0.0, 1.0, 0.02],
-		["stall_repath_ticks", 3.0, 0.0, 20.0, 1.0],
-		["stall_progress_eps", 0.1, 0.0, 1.0, 0.05],
+		["separation_relax", 0.0, 1.0, 0.05],
+		["separation_max_frac", 0.0, 3.0, 0.1],
+		["cohesion_radius_frac", 0.0, 10.0, 0.5],
+		["cohesion_gain", 0.0, 0.3, 0.01],
+		["cohesion_max_frac", 0.0, 0.5, 0.01],
+		["arrival_touch_frac", 1.0, 2.0, 0.05],
+		["arrival_radius_factor", 0.0, 3.0, 0.1],
+		["arrival_min_radii", 0.0, 10.0, 0.5],
+		["fan_frac", 0.0, 1.0, 0.02],
+		["straight_fan_frac", 0.0, 1.0, 0.02],
+		["stall_repath_ticks", 0.0, 20.0, 1.0],
+		["stall_progress_eps", 0.0, 1.0, 0.05],
 	]
 	for t in tunables:
 		var tuning_name: String = t[0]
-		_add_prop_slider(content, tuning_name, t[1], t[2], t[3], t[4],
+		_add_prop_slider(content, tuning_name, _sim.get_tuning(tuning_name), t[1], t[2], t[3],
 			func(v: float) -> void: _sim.set_tuning(tuning_name, v))
 
 
