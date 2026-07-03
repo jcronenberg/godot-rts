@@ -51,10 +51,11 @@ pub static COHESION_MAX_FRAC: TunableF32 = TunableF32::new(0.15);
 /// of every unit driving to the exact goal point and crushing inward.
 pub static ARRIVAL_TOUCH_FRAC: TunableF32 = TunableF32::new(1.15);
 /// A group's arrival radius is `r * max(ARRIVAL_MIN_RADII, FACTOR*sqrt(N))`.
-/// A unit only crowd-stops once inside it. Sized to ≈ the packed-disk radius of
-/// `N` circles (`~sqrt(N)` radii) so units crowd-stop at the blob's outer edge
-/// rather than shoving through to the core to reach the goal; the `MIN` floor
-/// keeps small groups (whose followers sit ~2r out) able to stop at all.
+/// A unit only crowd-stops once inside it. `sqrt(N)` tracks the packed-disk
+/// radius of `N` circles; `FACTOR` > 1 pads it so units crowd-stop at the
+/// blob's outer edge rather than shoving through to the core to reach the
+/// goal; the `MIN` floor keeps small groups (whose followers sit ~2r out)
+/// able to stop at all.
 pub static ARRIVAL_RADIUS_FACTOR: TunableF32 = TunableF32::new(1.5);
 pub static ARRIVAL_MIN_RADII: TunableF32 = TunableF32::new(3.0);
 /// Fraction of a flock's lateral spread applied as corner-fan offset. Below 1.0
@@ -2147,12 +2148,8 @@ mod tests {
         // Only a couple reach the goal centre; the rest stop around it.
         let at_goal = us.iter().filter(|u| dist(u.pos, goal) < 5.0).count();
         assert!(at_goal <= 2, "units crammed onto the goal centre: {at_goal}");
-        // The blob is built *around* the goal, not short of it: the radius-gated
-        // crowd-stop lets units pack past the goal rather than all piling up on
-        // the approach side. Measured along the approach axis the blob straddles
-        // the goal (some behind, some past it), and the centroid sits inside the
-        // group's own arrival radius. Both are radius-scaled, so this tests the
-        // concept rather than the current ARRIVAL_RADIUS_FACTOR value.
+        // Blob straddles the goal (not piled up short of it), centroid within
+        // the group's own arrival radius.
         let axis = (goal - v(12.0, 12.0)).normalized();
         let (mut behind, mut past) = (f32::MAX, f32::MIN);
         for u in &us {
