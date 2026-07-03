@@ -145,6 +145,15 @@ impl Simulation {
         }
     }
 
+    /// Live-tweaks a sim tunable by name (see `rts_lib::sim::set_tuning` for
+    /// valid names); returns false if `name` doesn't match one. Applies
+    /// immediately — the tunables are read straight off the sim thread, no
+    /// map/handle needed.
+    #[func]
+    pub fn set_tuning(&self, name: GString, value: f32) -> bool {
+        rts_lib::sim::set_tuning(&name.to_string(), value)
+    }
+
     /// Fetch the latest snapshot and advance the render clock by `delta`
     /// seconds. Returns the interpolation alpha for `get_positions`.
     #[func]

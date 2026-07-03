@@ -48,9 +48,10 @@ var _last_stat_tick: int = -1
 var _dragged_panel: Control = null
 var _drag_panel_offset: Vector2
 
-# Panel references for initial bottom-edge positioning
+# Panel references for initial edge positioning
 var _keymap_panel: Control
 var _controls_panel: Control
+var _tuning_panel: Control
 
 
 ## Scrolling history graph for one metric.
@@ -111,6 +112,7 @@ func _ready() -> void:
 	_build_perf_ui(layer)
 	_build_keymap_ui(layer)
 	_build_controls_ui(layer)
+	_build_tuning_ui(layer)
 
 	# Defer bottom-edge positioning until after first layout pass.
 	_reposition_bottom_panels.call_deferred()
@@ -122,6 +124,7 @@ func _reposition_bottom_panels() -> void:
 	_keymap_panel.position = Vector2(8.0, vp.y - _keymap_panel.size.y - 8.0)
 	_controls_panel.position = Vector2(vp.x - _controls_panel.size.x - 8.0,
 			vp.y - _controls_panel.size.y - 8.0)
+	_tuning_panel.position = Vector2(vp.x - _tuning_panel.size.x - 8.0, 8.0)
 
 
 func _process(delta: float) -> void:
@@ -318,13 +321,14 @@ func _draw_queued_orders() -> void:
 
 
 ## Creates a draggable, collapsible floating panel. Returns [panel, content].
-## pin_bottom: keep the bottom edge fixed when expanding/collapsing (use for
-## panels anchored to the bottom of the screen).
+## pin_bottom/pin_right: keep that edge fixed when expanding/collapsing (use
+## for panels anchored to that edge of the screen).
 func _make_floating_panel(
 	parent: Node,
 	title_text: String,
 	collapsed: bool = false,
 	pin_bottom: bool = false,
+	pin_right: bool = false,
 ) -> Array:
 	var panel := PanelContainer.new()
 	parent.add_child(panel)
@@ -362,11 +366,14 @@ func _make_floating_panel(
 
 	collapse_btn.toggled.connect(func(on: bool) -> void:
 		var old_bottom := panel.position.y + panel.size.y
+		var old_right := panel.position.x + panel.size.x
 		content.visible = on
 		collapse_btn.text = "−" if on else "+"
 		panel.reset_size()
 		if pin_bottom:
 			panel.position.y = old_bottom - panel.size.y
+		if pin_right:
+			panel.position.x = old_right - panel.size.x
 	)
 
 	return [panel, content]
@@ -479,6 +486,34 @@ func _build_controls_ui(layer: CanvasLayer) -> void:
 		func(v: float) -> void: unit_speed = v)
 
 
+## Sliders for the sim's runtime-tunable flocking/pathing constants
+## (rust/rts-lib/src/sim.rs), applied live via Simulation.set_tuning.
+func _build_tuning_ui(layer: CanvasLayer) -> void:
+	var r := _make_floating_panel(layer, "Tuning", true, false, true)
+	_tuning_panel = r[0]
+	var content: VBoxContainer = r[1]
+	_tuning_panel.position = Vector2(280.0, 8.0)  # corrected in _reposition_bottom_panels
+
+	var tunables := [
+		["separation_relax", 0.4, 0.0, 1.0, 0.05],
+		["separation_max_frac", 1.5, 0.0, 3.0, 0.1],
+		["cohesion_radius_frac", 5.0, 0.0, 10.0, 0.5],
+		["cohesion_gain", 0.05, 0.0, 0.3, 0.01],
+		["cohesion_max_frac", 0.15, 0.0, 0.5, 0.01],
+		["arrival_touch_frac", 1.15, 1.0, 2.0, 0.05],
+		["arrival_radius_factor", 1.0, 0.0, 3.0, 0.1],
+		["arrival_min_radii", 3.0, 0.0, 10.0, 0.5],
+		["fan_frac", 0.34, 0.0, 1.0, 0.02],
+		["straight_fan_frac", 0.6, 0.0, 1.0, 0.02],
+		["stall_repath_ticks", 3.0, 0.0, 20.0, 1.0],
+		["stall_progress_eps", 0.1, 0.0, 1.0, 0.05],
+	]
+	for t in tunables:
+		var tuning_name: String = t[0]
+		_add_prop_slider(content, tuning_name, t[1], t[2], t[3], t[4],
+			func(v: float) -> void: _sim.set_tuning(tuning_name, v))
+
+
 func _add_prop_slider(
 	parent: Control,
 	label: String,
@@ -506,6 +541,7 @@ func _add_prop_slider(
 	slider.max_value = max_val
 	slider.step = step
 	slider.value = initial
+	slider.custom_minimum_size = Vector2(120, 0)
 	slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	slider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	row.add_child(slider)

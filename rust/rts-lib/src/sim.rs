@@ -20,55 +20,113 @@ use crate::navmesh::{DynamicNavmesh, Obstacle, ObstacleId};
 pub const TICK_RATE: u32 = 30;
 /// Fixed timestep in seconds.
 pub const DT: f32 = 1.0 / TICK_RATE as f32;
+
+// ── Tunables ─────────────────────────────────────────────────────────────────
+// Runtime-settable (via `.get()`/`.set()`) so values can be swept without
+// recompiling. If the atomic load ever shows up in profiles, these can drop
+// back to plain `const`s (call sites would lose the `.get()`).
+
 /// Fraction of pairwise overlap corrected per tick — the separation push force.
 /// Soft enough that path pressure wins while units are *moving* (they tolerate a
 /// little transient overlap squeezing through crowds/funnels), but with no path
 /// pull at rest it still converges to a fully non-overlapping packing. Below the
 /// point where summed pushes in a clump overshoot and ping-pong.
-const SEPARATION_RELAX: f32 = 0.4;
+pub static SEPARATION_RELAX: TunableF32 = TunableF32::new(0.4);
 /// Per-tick separation displacement cap, as a fraction of the unit's speed.
 /// Above a full step, so separation can out-push a unit's own path/cohesion
 /// convergence and resolve overlap rather than tolerate it.
-const SEPARATION_MAX_FRAC: f32 = 1.5;
+pub static SEPARATION_MAX_FRAC: TunableF32 = TunableF32::new(1.5);
 /// Cohesion radius as a multiple of the largest unit radius: same-group
 /// neighbours within it pull toward their shared centroid.
-const COHESION_RADIUS_FRAC: f32 = 5.0;
+pub static COHESION_RADIUS_FRAC: TunableF32 = TunableF32::new(5.0);
 /// Per-tick fraction of the centroid offset applied as a cohesion pull.
-const COHESION_GAIN: f32 = 0.05;
+pub static COHESION_GAIN: TunableF32 = TunableF32::new(0.05);
 /// Per-tick cohesion displacement cap, as a fraction of the unit's speed. Kept
 /// well below the path step (and the separation cap) so cohesion stays a gentle
 /// bias and never pulls group-mates back into overlap.
-const COHESION_MAX_FRAC: f32 = 0.15;
+pub static COHESION_MAX_FRAC: TunableF32 = TunableF32::new(0.15);
 /// A moving unit joins a parked group-mate's cluster (and stops) when within
 /// this multiple of touching distance of it — *and* within its arrival radius
 /// of the goal (below). So a group settles into a blob around its goal instead
 /// of every unit driving to the exact goal point and crushing inward.
-const ARRIVAL_TOUCH_FRAC: f32 = 1.15;
+pub static ARRIVAL_TOUCH_FRAC: TunableF32 = TunableF32::new(1.15);
 /// A group's arrival radius is `r * max(ARRIVAL_MIN_RADII, FACTOR*sqrt(N))`.
 /// A unit only crowd-stops once inside it. Sized to ≈ the packed-disk radius of
 /// `N` circles (`~sqrt(N)` radii) so units crowd-stop at the blob's outer edge
 /// rather than shoving through to the core to reach the goal; the `MIN` floor
 /// keeps small groups (whose followers sit ~2r out) able to stop at all.
-const ARRIVAL_RADIUS_FACTOR: f32 = 1.0;
-const ARRIVAL_MIN_RADII: f32 = 3.0;
+pub static ARRIVAL_RADIUS_FACTOR: TunableF32 = TunableF32::new(1.0);
+pub static ARRIVAL_MIN_RADII: TunableF32 = TunableF32::new(3.0);
 /// Fraction of a flock's lateral spread applied as corner-fan offset. Below 1.0
 /// so outer units round a touch tighter and their separation doesn't shove them
 /// onto the corridor edge.
-const FAN_FRAC: f32 = 0.34;
+pub static FAN_FRAC: TunableF32 = TunableF32::new(0.34);
 /// Fraction of a flock's lateral spread held while marching a straight (corner-
 /// free) leg. Unlike the bend fan (which spreads units *out* from the apex), here
 /// units start at full spread, so this *relaxes* it: <1 lets them draw a bit
 /// closer than their start formation while still marching side-by-side instead of
 /// single-filing the line.
-const STRAIGHT_FAN_FRAC: f32 = 0.6;
+pub static STRAIGHT_FAN_FRAC: TunableF32 = TunableF32::new(0.6);
 /// Wall-clamped ticks heading into a wall without progress before a moving unit
 /// is treated as stuck (shoved off its path onto a corner) and repathed from its
 /// current position. Eager (~0.1 s at 30 Hz) so displaced units recover a valid
 /// route quickly; transient clamps self-resolve before they trip it.
-const STALL_REPATH_TICKS: u8 = 3;
+pub static STALL_REPATH_TICKS: TunableU8 = TunableU8::new(3);
 /// Remaining-path-length improvement that counts as real progress (and resets
 /// the stall counter); below it the unit is treated as not advancing.
-const STALL_PROGRESS_EPS: f32 = 0.1;
+pub static STALL_PROGRESS_EPS: TunableF32 = TunableF32::new(0.1);
+
+/// Runtime-settable f32, stored as bits in an atomic. Backs the tunables above.
+pub struct TunableF32(std::sync::atomic::AtomicU32);
+impl TunableF32 {
+    const fn new(v: f32) -> Self {
+        Self(std::sync::atomic::AtomicU32::new(v.to_bits()))
+    }
+    #[inline]
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    pub fn set(&self, v: f32) {
+        self.0.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Runtime-settable u8, stored in an atomic. Backs [`STALL_REPATH_TICKS`].
+pub struct TunableU8(std::sync::atomic::AtomicU8);
+impl TunableU8 {
+    const fn new(v: u8) -> Self {
+        Self(std::sync::atomic::AtomicU8::new(v))
+    }
+    #[inline]
+    pub fn get(&self) -> u8 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set(&self, v: u8) {
+        self.0.store(v, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Sets a tunable above by its lowercased name (e.g. `"separation_relax"`);
+/// returns `false` if `name` doesn't match one. Used by the sim_test debug UI
+/// via `Simulation.set_tuning` — see `rust/rts/src/simulation.rs`.
+pub fn set_tuning(name: &str, value: f32) -> bool {
+    match name {
+        "separation_relax" => SEPARATION_RELAX.set(value),
+        "separation_max_frac" => SEPARATION_MAX_FRAC.set(value),
+        "cohesion_radius_frac" => COHESION_RADIUS_FRAC.set(value),
+        "cohesion_gain" => COHESION_GAIN.set(value),
+        "cohesion_max_frac" => COHESION_MAX_FRAC.set(value),
+        "arrival_touch_frac" => ARRIVAL_TOUCH_FRAC.set(value),
+        "arrival_radius_factor" => ARRIVAL_RADIUS_FACTOR.set(value),
+        "arrival_min_radii" => ARRIVAL_MIN_RADII.set(value),
+        "fan_frac" => FAN_FRAC.set(value),
+        "straight_fan_frac" => STRAIGHT_FAN_FRAC.set(value),
+        "stall_repath_ticks" => STALL_REPATH_TICKS.set(value.round().clamp(0.0, 255.0) as u8),
+        "stall_progress_eps" => STALL_PROGRESS_EPS.set(value),
+        _ => return false,
+    }
+    true
+}
 
 // ── RNG ───────────────────────────────────────────────────────────────────────
 
@@ -623,7 +681,7 @@ impl Sim {
             rad.push(u.radius);
         }
         let max_radius = rad.iter().copied().fold(0.0f32, f32::max);
-        let r_coh = max_radius * COHESION_RADIUS_FRAC;
+        let r_coh = max_radius * COHESION_RADIUS_FRAC.get();
 
         // Connected components under "same radius, within R_COH and clear
         // line-of-sight", via the spatial grid. Keying on radius lets each unit
@@ -686,7 +744,7 @@ impl Sim {
             // channel fits them and smaller units cluster — and route — separately.
             let flock_r = rad[members[0]];
             let arrival_mult =
-                (ARRIVAL_RADIUS_FACTOR * (size as f32).sqrt()).max(ARRIVAL_MIN_RADII);
+                (ARRIVAL_RADIUS_FACTOR.get() * (size as f32).sqrt()).max(ARRIVAL_MIN_RADII.get());
             // One shortest (funnel) path for the flock, seeded from the member
             // nearest the goal (a real unit position is on the navmesh). Its
             // interior waypoints are the corner apexes every unit would otherwise
@@ -780,9 +838,9 @@ impl Sim {
                 } else {
                     let offset = if straight {
                         // Hold most of the marching spread, relaxed a touch.
-                        lanes[k] * STRAIGHT_FAN_FRAC
+                        lanes[k] * STRAIGHT_FAN_FRAC.get()
                     } else if has_corners {
-                        (lanes[k] - lane_min) * FAN_FRAC
+                        (lanes[k] - lane_min) * FAN_FRAC.get()
                     } else {
                         0.0
                     };
@@ -987,7 +1045,7 @@ impl Sim {
             return;
         }
         let max_diameter = max_radius * 2.0;
-        let r_coh = max_radius * COHESION_RADIUS_FRAC;
+        let r_coh = max_radius * COHESION_RADIUS_FRAC.get();
         let r_coh2 = r_coh * r_coh;
         // Cell covers the larger radius so the 3×3 scan still finds every pair.
         self.grid.rebuild(&s.positions, max_diameter.max(r_coh));
@@ -1018,7 +1076,7 @@ impl Sim {
                             } else {
                                 Vector2::new(1.0, 0.0)
                             };
-                            let push = dir * ((min_dist - d) * 0.5 * SEPARATION_RELAX);
+                            let push = dir * ((min_dist - d) * 0.5 * SEPARATION_RELAX.get());
                             s.disp[i] += push;
                             s.disp[j] -= push;
                         }
@@ -1061,7 +1119,7 @@ impl Sim {
                         // radius gate lets units still far from the goal keep
                         // pushing in, so the blob centres rather than tailing
                         // back along the approach.
-                        let touch = min_dist * ARRIVAL_TOUCH_FRAC;
+                        let touch = min_dist * ARRIVAL_TOUCH_FRAC.get();
                         if d2 < touch * touch {
                             if mv_i && s.within_arrival[i] && s.parked[j] {
                                 s.arrive[i] = true;
@@ -1084,7 +1142,7 @@ impl Sim {
             }
             let mut d = s.disp[i];
             if !s.arrive[i] && s.coh_n[i] > 0 {
-                let mut pull = s.coh_sum[i] * (COHESION_GAIN / s.coh_n[i] as f32);
+                let mut pull = s.coh_sum[i] * (COHESION_GAIN.get() / s.coh_n[i] as f32);
                 // Zero any pull opposing the heading: rejoin laterally/forward,
                 // never brake. coh_n[i] > 0 implies the unit is moving.
                 let h = unit.waypoint() - unit.pos;
@@ -1097,7 +1155,7 @@ impl Sim {
                 }
                 // Cap cohesion on its own (small) budget so it can't overpower
                 // separation and pull group-mates back into overlap.
-                let coh_cap = s.speeds[i] * DT * COHESION_MAX_FRAC;
+                let coh_cap = s.speeds[i] * DT * COHESION_MAX_FRAC.get();
                 let pl2 = pull.x * pull.x + pull.y * pull.y;
                 if pl2 > coh_cap * coh_cap {
                     pull *= coh_cap / pl2.sqrt();
@@ -1108,7 +1166,7 @@ impl Sim {
             if len2 == 0.0 {
                 continue;
             }
-            let max_step = s.speeds[i] * DT * SEPARATION_MAX_FRAC;
+            let max_step = s.speeds[i] * DT * SEPARATION_MAX_FRAC.get();
             let len = len2.sqrt();
             if len > max_step {
                 d *= max_step / len;
@@ -1257,12 +1315,12 @@ impl Sim {
                 if in_arrival {
                     unit.stall = 0;
                     unit.min_remaining = rem;
-                } else if rem < unit.min_remaining - STALL_PROGRESS_EPS {
+                } else if rem < unit.min_remaining - STALL_PROGRESS_EPS.get() {
                     unit.min_remaining = rem;
                     unit.stall = 0;
                 } else if into_wall {
                     unit.stall = unit.stall.saturating_add(1);
-                    if unit.stall >= STALL_REPATH_TICKS {
+                    if unit.stall >= STALL_REPATH_TICKS.get() {
                         s.repath.push(id);
                         unit.stall = 0;
                     }
