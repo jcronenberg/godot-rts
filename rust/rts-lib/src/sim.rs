@@ -55,7 +55,7 @@ pub static ARRIVAL_TOUCH_FRAC: TunableF32 = TunableF32::new(1.15);
 /// `N` circles (`~sqrt(N)` radii) so units crowd-stop at the blob's outer edge
 /// rather than shoving through to the core to reach the goal; the `MIN` floor
 /// keeps small groups (whose followers sit ~2r out) able to stop at all.
-pub static ARRIVAL_RADIUS_FACTOR: TunableF32 = TunableF32::new(1.0);
+pub static ARRIVAL_RADIUS_FACTOR: TunableF32 = TunableF32::new(1.5);
 pub static ARRIVAL_MIN_RADII: TunableF32 = TunableF32::new(3.0);
 /// Fraction of a flock's lateral spread applied as corner-fan offset. Below 1.0
 /// so outer units round a touch tighter and their separation doesn't shove them
