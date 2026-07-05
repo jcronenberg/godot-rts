@@ -44,7 +44,6 @@ var _frame_ms_acc: float = 0.0
 var _frame_count: int = 0
 var _last_stat_tick: int = -1
 
-# Floating panel drag state
 var _dragged_panel: Control = null
 var _drag_panel_offset: Vector2
 
@@ -229,7 +228,7 @@ func _unhandled_input(event: InputEvent) -> void:
 func _select(world: Vector2) -> void:
 	_selected.clear()
 	if _drag_start.distance_to(_drag_end) < DRAG_THRESHOLD:
-		# Plain click: pick the topmost unit under the cursor.
+		# Plain click: select the first unit under the cursor.
 		for i in _ids.size():
 			if world.distance_to(_positions[i]) <= _radii[i] + 2.0:
 				_selected[_ids[i]] = true

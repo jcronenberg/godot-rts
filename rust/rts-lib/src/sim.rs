@@ -24,14 +24,14 @@ pub const DT: f32 = 1.0 / TICK_RATE as f32;
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 // Runtime-settable (via `.get()`/`.set()`) so values can be swept without
-// recompiling. If the atomic load ever shows up in profiles, these can drop
-// back to plain `const`s (call sites would lose the `.get()`).
+// recompiling; drop back to plain `const`s if the atomic load ever shows up
+// in profiles (call sites would lose the `.get()`).
 
 /// Fraction of pairwise overlap corrected per tick — the separation push force.
-/// Soft enough that path pressure wins while units are *moving* (they tolerate a
-/// little transient overlap squeezing through crowds/funnels), but with no path
-/// pull at rest it still converges to a fully non-overlapping packing. Below the
-/// point where summed pushes in a clump overshoot and ping-pong.
+/// Soft enough that path pressure wins while units are *moving* (tolerating a
+/// little transient overlap through crowds/funnels), but with no path pull at
+/// rest it still converges to a fully non-overlapping packing. Below the level
+/// where summed pushes in a clump overshoot and ping-pong.
 pub static SEPARATION_RELAX: TunableF32 = TunableF32::new(0.4);
 /// Per-tick separation displacement cap, as a fraction of the unit's speed.
 /// Above a full step, so separation can out-push a unit's own path/cohesion
@@ -51,12 +51,10 @@ pub static COHESION_MAX_FRAC: TunableF32 = TunableF32::new(0.15);
 /// of the goal (below). So a group settles into a blob around its goal instead
 /// of every unit driving to the exact goal point and crushing inward.
 pub static ARRIVAL_TOUCH_FRAC: TunableF32 = TunableF32::new(1.15);
-/// A group's arrival radius is `r * max(ARRIVAL_MIN_RADII, FACTOR*sqrt(N))`.
-/// A unit only crowd-stops once inside it. `sqrt(N)` tracks the packed-disk
-/// radius of `N` circles; `FACTOR` > 1 pads it so units crowd-stop at the
-/// blob's outer edge rather than shoving through to the core to reach the
-/// goal; the `MIN` floor keeps small groups (whose followers sit ~2r out)
-/// able to stop at all.
+/// Arrival radius = `r * max(ARRIVAL_MIN_RADII, FACTOR*sqrt(N))`; a unit only
+/// crowd-stops inside it. `sqrt(N)` ~ packed-disk radius of N circles; FACTOR>1
+/// pads it so units stop at the blob's edge, not the core; MIN keeps small
+/// groups (followers sit ~2r out) stoppable at all.
 pub static ARRIVAL_RADIUS_FACTOR: TunableF32 = TunableF32::new(1.5);
 pub static ARRIVAL_MIN_RADII: TunableF32 = TunableF32::new(3.0);
 /// Fraction of a flock's lateral spread applied as corner-fan offset. Below 1.0
@@ -64,10 +62,10 @@ pub static ARRIVAL_MIN_RADII: TunableF32 = TunableF32::new(3.0);
 /// onto the corridor edge.
 pub static FAN_FRAC: TunableF32 = TunableF32::new(0.34);
 /// Fraction of a flock's lateral spread held while marching a straight (corner-
-/// free) leg. Unlike the bend fan (which spreads units *out* from the apex), here
-/// units start at full spread, so this *relaxes* it: <1 lets them draw a bit
-/// closer than their start formation while still marching side-by-side instead of
-/// single-filing the line.
+/// free) leg. Unlike the bend fan (spreads units *out* from the apex), units
+/// already start at full spread here, so this *relaxes* it: <1 lets them draw
+/// closer than their start formation while still marching side-by-side, not
+/// single-file.
 pub static STRAIGHT_FAN_FRAC: TunableF32 = TunableF32::new(0.6);
 /// Wall-clamped ticks heading into a wall without progress before a moving unit
 /// is treated as stuck (shoved off its path onto a corner) and repathed from its
@@ -754,8 +752,7 @@ impl Sim {
             }
         }
 
-        // Assign a fresh group id per component, in first-appearance (slot)
-        // order, and collect each component's member indices.
+        // Fresh group id per component, first-appearance (slot) order — determinism.
         let mut comps: Vec<(u32, Vec<usize>)> = Vec::new();
         let mut roots: Vec<(u32, usize)> = Vec::new(); // (root, comps index)
         for i in 0..n {
@@ -803,14 +800,13 @@ impl Sim {
                 flock_r,
             );
 
-            // Empty seed path ⇒ the goal is unreachable for the seed (the member
-            // nearest it). Cluster members are mutually clear-LoS, so they share
-            // the seed's navmesh component and the goal is unreachable for all of
-            // them: idle the whole cluster. Skipping this would fall through to
-            // the straight-shot branch below, which can't tell "unreachable" from
-            // "direct clear shot" — it would synthesise a converge waypoint on the
-            // reachable side and route_onto_channel would append the unreachable
-            // goal leg, handing non-seed units a path that pokes across the wall.
+            // Empty seed path ⇒ goal unreachable for the seed; since cluster members
+            // share clear LoS (same navmesh component) it's unreachable for all —
+            // idle the whole cluster. Skipping this would fall through to the
+            // straight-shot branch, which can't tell "unreachable" from "direct
+            // clear shot": it would synthesise a converge waypoint on the reachable
+            // side and route_onto_channel would append the unreachable goal leg,
+            // handing non-seed units a path that pokes across the wall.
             if seed_path.is_empty() {
                 for &i in members {
                     let unit = self.units.get_mut(sel[i]).expect("filtered to live");
@@ -834,14 +830,12 @@ impl Sim {
                 }
             }
 
-            // No corners ⇒ a straight shot to the goal, where the flock would
-            // otherwise single-file the line and crush together. Synthesise one
-            // waypoint near the goal with a perpendicular axis so each unit holds
-            // its lateral lane until the final approach: it marches parallel and
-            // only converges over the last leg (the blob zone). The waypoint sits
-            // a converge distance (≈ the arrival radius, capped to half the path)
-            // back from the goal along the line. Fanning is symmetric about the
-            // line (both sides), unlike a bend's one-sided fan into its free side.
+            // No corners ⇒ straight shot: synthesise one waypoint near the goal,
+            // offset along the perpendicular axis, so each unit holds its lateral
+            // lane until the final approach and only converges over the last leg
+            // (the blob zone). It sits a converge distance (≈ arrival radius,
+            // capped to half the path) back from the goal. Fanning is symmetric
+            // (both sides), unlike a bend's one-sided fan into the free side.
             let straight = corners.is_empty() && {
                 let dir = goal - pos[seed];
                 let len2 = dir.x * dir.x + dir.y * dir.y;
@@ -856,10 +850,10 @@ impl Sim {
                 }
             };
 
-            // Each unit's lane = its lateral offset from the flock along the fan
-            // axis. At a bend, shift so the most wall-ward unit sits at the apex
-            // (offset 0) and the rest fan into the free side; on a straight leg,
-            // keep the sign so they fan symmetrically and hold their spread.
+            // Lane = lateral offset from the flock along the fan axis. At a bend,
+            // shift so the most wall-ward unit sits at the apex (offset 0) and the
+            // rest fan into the free side; on a straight leg, keep the sign so
+            // they fan symmetrically and hold their spread.
             let has_corners = !corners.is_empty();
             let axis = if has_corners {
                 outward[0]
@@ -920,12 +914,11 @@ impl Sim {
     }
 
     /// Start the next queued order for every unit that just finished its current
-    /// action (now idle with a non-empty queue). Units that finished on the same
-    /// tick with an *identical* front order are begun as one batch, so a group
-    /// re-clusters and re-channels around the next waypoint instead of single-
-    /// filing it; stragglers that finish a tick later re-merge via the flock
-    /// merge pass. Deterministic: slot-order scan, exact-order batching, no map
-    /// iteration.
+    /// one (now idle with a non-empty queue). Units finishing the same tick with
+    /// an *identical* front order begin as one batch, so a group re-clusters and
+    /// re-channels around the next waypoint instead of single-filing it;
+    /// stragglers finishing a tick later re-merge via the flock merge pass.
+    /// Deterministic: slot-order scan, exact-order batching, no map iteration.
     fn advance_orders(&mut self) {
         let mut batches: Vec<(Order, Vec<UnitId>)> = Vec::new();
         for (id, u) in self.units.iter() {
@@ -986,12 +979,11 @@ impl Sim {
     /// Advance each moving unit `max_speed * DT` along its polyline, carrying
     /// leftover distance across waypoints; snap and idle at the end.
     ///
-    /// Each unit first **re-anchors**: it advances past any intermediate waypoint
-    /// it has already rounded, so crowd pressure that shoves it *through* a
-    /// waypoint doesn't make it double back to the one it overshot. A waypoint is
-    /// rounded once the unit is past its gate (on the next leg's side) *and* has
-    /// clear line-of-sight to the following waypoint — the LoS test is what stops
-    /// it cutting an unrounded corner.
+    /// Each unit first **re-anchors**: it skips any waypoint already rounded, so
+    /// a crowd shove that pushes it *through* one doesn't make it double back.
+    /// A waypoint counts as rounded once the unit is past its gate (on the next
+    /// leg's side) *and* has clear line-of-sight to the following waypoint — the
+    /// LoS test is what stops it cutting an unrounded corner.
     fn integrate(&mut self) {
         let cdt = self.nav.navmesh();
         for (_, unit) in self.units.iter_mut() {
@@ -1075,7 +1067,6 @@ impl Sim {
             s.groups.push(u.group);
             s.moving.push(u.is_moving());
             s.parked.push(u.parked);
-            // Within arrival radius of the goal? (Moving units only.)
             let within = match u.path.last() {
                 Some(&g) if u.arrival_r > 0.0 => {
                     let (dx, dy) = (u.pos.x - g.x, u.pos.y - g.y);
@@ -1132,13 +1123,12 @@ impl Sim {
                             s.disp[i] += push;
                             s.disp[j] -= push;
                         }
-                        // Merge: two adjacent, both-moving, same-goal, same-size
-                        // units from *different* flocks continue as one. R_COH +
-                        // clear-LoS adjacency (the wall gate stops merging flocks
-                        // that are close but wall-separated); exact-goal match is
-                        // the deterministic "commanded together" test; same radius
-                        // keeps differently-sized flocks (which route apart) from
-                        // fusing. Recorded as (min, max), unioned after the pass (v1).
+                        // Merge: adjacent, both-moving, same-goal, same-size units
+                        // from *different* flocks continue as one. R_COH + clear-LoS
+                        // adjacency excludes flocks that are close but wall-separated;
+                        // exact-goal match is the deterministic "commanded together"
+                        // test; same radius keeps differently-routed flocks apart.
+                        // Recorded as (min, max), unioned after the pass (v1).
                         let g_j = s.groups[j];
                         if g_i != 0
                             && g_j != 0
@@ -1156,21 +1146,19 @@ impl Sim {
                         if g_i == 0 || g_i != g_j {
                             continue; // remaining effects are same-group only
                         }
-                        // Cohesion: between two moving group-mates.
-                        // Store the offset (neighbor - self) so the apply loop can
-                        // compute the pull directly without subtracting own position.
+                        // Cohesion between moving group-mates: store the offset
+                        // (neighbor - self) so the apply loop can pull directly
+                        // without re-subtracting own position.
                         if mv_i && s.moving[j] && d2 < r_coh2 {
                             s.coh_sum[i] += s.positions[j] - p;
                             s.coh_sum[j] += p - s.positions[j];
                             s.coh_n[i] += 1;
                             s.coh_n[j] += 1;
                         }
-                        // Crowd-arrival: a moving unit that is within its
-                        // arrival radius of the goal and touches a parked
-                        // group-mate parks too (whichever side is moving). The
-                        // radius gate lets units still far from the goal keep
-                        // pushing in, so the blob centres rather than tailing
-                        // back along the approach.
+                        // Crowd-arrival: a moving unit within arrival radius that
+                        // touches a parked group-mate parks too (whichever side is
+                        // moving). The radius gate lets units still far out keep
+                        // pushing in, so the blob centres rather than tailing back.
                         let touch = min_dist * arrival_touch_frac;
                         if d2 < touch * touch {
                             if mv_i && s.within_arrival[i] && s.parked[j] {
@@ -1226,9 +1214,8 @@ impl Sim {
             // Anti-tunnel: a flock push is a raw position add with no path/LoS
             // guarantee, so it can shove a unit clean across a constrained edge —
             // wall_clamp only inspects the final position and would then amplify
-            // the tunnel (projecting the centre out the *wrong* side). It bites
-            // when the goal sits near a wall, so integrate has already driven the
-            // centre to within a radius of it. Clip the move to stop at the wall.
+            // the tunnel (projecting the centre out the *wrong* side). Bites when
+            // the goal sits near a wall; clip the move to stop at it instead.
             unit.pos = clip_ray_to_walls(cdt, unit.pos, unit.pos + d);
         }
 
@@ -1241,8 +1228,8 @@ impl Sim {
     /// one group id: union the `(min, max)` pairs and rewrite each member to its
     /// canonical (min) id. Each merged unit keeps its own already-valid path —
     /// only its group changes, so it coheres / crowd-arrives with the joined
-    /// flock from next tick (v1; no re-channel). Deterministic: sorted-pair
-    /// order, min canonicalisation, slot-order relabel, no map iteration.
+    /// flock from next tick (v1; no re-channel). Deterministic: sorted pairs,
+    /// min canonicalisation, slot-order relabel, no map iteration.
     fn apply_merges(&mut self) {
         use std::collections::HashMap;
         let pairs = &mut self.step_scratch.merge_pairs;
@@ -1381,11 +1368,10 @@ impl Sim {
             if unit.radius <= 0.0 || (!mesh_changed && unit.pos == unit.prev_pos) {
                 continue;
             }
-            // Fast path: distance to a wall changes at most 1:1 with distance
-            // moved, so with no wall within `radius` + chord length of the
-            // endpoint, the pass loop below finds nothing to push and no wall
-            // can lie within `radius` of any point of the tick's chord — no
-            // possible pinch either. Skip the unit.
+            // Fast path: wall distance changes at most 1:1 with distance moved, so
+            // with no wall within `radius` + chord length of the endpoint, the
+            // pass loop below finds nothing to push and no wall can lie within
+            // `radius` of the chord either — no possible pinch. Skip the unit.
             let reach = unit.radius + (unit.pos - unit.prev_pos).length();
             s.clamp_walls.clear();
             Self::gather_nearby_walls(
@@ -1401,18 +1387,18 @@ impl Sim {
                 continue;
             }
             // A push moves the circle and changes which faces it overlaps,
-            // invalidating the walk in progress; re-walk until a pass applies
-            // no push (bounded against corner ping-pong). `out` accumulates the
-            // outward wall normals so we can tell a wall the unit faces from one
-            // merely beside it. `pushed_any` tracks whether any pass pushed, so
-            // the stall detector fires even when opposite normals cancel in `out`.
+            // invalidating the walk in progress, so re-walk until a pass pushes
+            // nothing (bounded against corner ping-pong). `out` accumulates
+            // outward wall normals to tell a faced wall from one merely beside
+            // the unit; `pushed_any` tracks whether any pass pushed, so the
+            // stall detector still fires when opposing normals cancel in `out`.
             let mut out = Vector2::ZERO;
             let mut pushed_any = false;
-            // Check every push against every wall any pass touched so far: a
-            // push snaps the circle to exactly `radius` from one wall — at a
-            // segment endpoint, radially from that corner — and near a
-            // sub-diameter gap that snap can leap past the *other* wall's
-            // exclusion disk in one discrete step ("corner-teleport").
+            // Check every push against every wall touched so far: a push snaps
+            // the circle to exactly `radius` from one wall — at a segment
+            // endpoint, radially from that corner — and near a sub-diameter gap
+            // that snap can leap past the *other* wall's exclusion disk in one
+            // discrete step ("corner-teleport").
             s.clamp_walls.clear();
             let mut violated = false;
             let min_clear = unit.radius - WALL_CLAMP_REVERT_EPS_FRAC * unit.radius;
@@ -1474,27 +1460,25 @@ impl Sim {
                     break;
                 }
             }
-            // Revert when a push re-violated a touched wall or the chord swept
-            // a gap the body doesn't fit: `prev_pos` is clear by induction, so
-            // crowd pressure can never ratchet a unit into or through a pinch.
-            // Skipped on `mesh_changed` — a new obstacle can invalidate
-            // `prev_pos` itself, so best-effort projection is correct there.
+            // Revert when a push re-violated a touched wall or the chord swept a
+            // gap the body doesn't fit: `prev_pos` is clear by induction, so crowd
+            // pressure can never ratchet a unit into or through a pinch. Skipped
+            // on `mesh_changed` since a new obstacle can invalidate `prev_pos`
+            // itself, where best-effort projection is the correct fallback.
             if !mesh_changed
                 && (violated
                     || Self::swept_through_pinch(cdt, s, unit.prev_pos, unit.pos, unit.radius))
             {
                 unit.pos = unit.prev_pos;
             }
-            // Stuck-on-corner detection: a moving unit shoved off its cleared
-            // route so its line to the next waypoint cuts a wall — i.e. it's
-            // pressed against a wall (`pushed_any`), heading *into* that wall
-            // (waypoint on its far side), and not shrinking its remaining path.
-            // The wall-facing test is what separates this from a unit merely
-            // jammed sideways against a wall by neighbours (where a repath
-            // wouldn't help). Skipped in the arrival zone (crowding, not walls,
-            // holds it). After a few such ticks, repath from where it now is.
-            // Free ticks (no wall contact) reset the counter so only consecutive
-            // clamped ticks accumulate toward the threshold.
+            // Stuck-on-corner detection: a unit shoved off its cleared route so
+            // its line to the next waypoint cuts a wall is pressed against that
+            // wall (`pushed_any`), heading *into* it, and not shrinking its
+            // remaining path. The wall-facing test separates this from a unit
+            // merely jammed sideways by neighbours (repath wouldn't help there).
+            // Skipped in the arrival zone (crowding, not walls, holds it there).
+            // Free ticks reset the counter so only consecutive clamped ticks
+            // accumulate toward the repath threshold.
             if pushed_any && unit.is_moving() {
                 let goal = *unit.path.last().expect("moving ⇒ non-empty path");
                 let (gx, gy) = (goal.x - unit.pos.x, goal.y - unit.pos.y);
@@ -1611,16 +1595,16 @@ fn external_bisector(prev: Vector2, cur: Vector2, next: Vector2) -> Vector2 {
 }
 
 /// A unit's path through the flock's shared corner apexes, each displaced
-/// `outward[j] * offset` into the bend's free side so the flock fans out and
-/// rounds bends side-by-side instead of single-filing the apex. Tries the full
-/// offset, then halves toward the apex; returns the first polyline whose every
-/// leg clears walls, or `None` so the caller paths the unit alone.
+/// `outward[j] * offset` into the bend's free side so the flock fans out
+/// instead of single-filing the apex. Tries the full offset, then halves
+/// toward the apex; returns the first polyline whose every leg clears walls,
+/// or `None` so the caller paths the unit alone.
 ///
-/// Fanned legs (offset > 0) are validated at an inflated radius so a unit only
-/// takes a lane where the corridor has room for parallel lanes — in a tight
-/// squeeze every offset fails the inflated check and it falls back to the apex
-/// (single-file, the only thing that fits). The apex itself (scale 0) is
-/// validated at the true radius, so the real shortest route is always allowed.
+/// Fanned legs (offset > 0) validate at an inflated radius so a unit only
+/// takes a lane with room for parallel lanes — in a tight squeeze every
+/// offset fails this and it falls back to the apex (single-file, the only
+/// fit). The apex itself (scale 0) validates at the true radius, so the
+/// shortest route is always allowed.
 fn build_offset_path(
     cdt: &CDT,
     start: Vector2,
@@ -1651,12 +1635,11 @@ fn build_offset_path(
     None
 }
 
-/// Fallback when a unit can't follow the flock's shared corners (its leg to the
-/// first one is blocked): route it onto the flock's route *via* that first
-/// corner, rather than down a private shortest path — otherwise an outer unit
-/// whose own shortest rounds an obstacle the *other* way splits off from the
-/// group. With no corners (straight shot), or if even the leg to the first
-/// corner is blocked, fall back to a plain shortest path to the goal.
+/// Fallback when a unit can't reach the flock's shared corners directly: route
+/// it onto the channel *via* the first corner instead of a private shortest
+/// path — otherwise an outer unit whose own shortest rounds an obstacle the
+/// *other* way splits off from the group. Falls back to a plain shortest path
+/// with no corners, or if even the first leg is blocked.
 fn route_onto_channel(
     cdt: &CDT,
     abstraction: &Abstraction,
@@ -2191,11 +2174,9 @@ mod tests {
 
     #[test]
     fn test_group_packed_against_edge_stays_inside() {
-        // A large, fast group ordered to a goal hard against the map's right
-        // edge (x=200 wall), with the same move re-issued repeatedly (the
-        // player spam-clicking the same spot). The crowd packs against the wall
-        // and the per-tick separation push — large for fast units — must never
-        // shove a unit clean across the boundary to the outside of the map.
+        // A large, fast group spam-clicked to a goal hard against the map's
+        // right edge (x=200): the per-tick separation push — large for fast
+        // units — must never shove a unit clean across the boundary.
         let (points, constraints) = rooms_map(2, 2); // 200×200 open-ish map
         let walls = wall_segments(&points, &constraints);
         let mut sim = Sim::new(points, &constraints, 5);
@@ -2299,10 +2280,9 @@ mod tests {
         let walls = wall_segments(&points, &constraints);
         let mut sim = Sim::new(points, &constraints, 7);
         let goal = v(175.0, 100.0);
-        // Spawn all 40 units in one step (spawning one-at-a-time via the
-        // `spawn()` helper each runs its own `sim.step`, which would let
-        // early-spawned units collide/settle over dozens of unchecked ticks
-        // before the crowd-pressure loop below even starts).
+        // Spawn all 40 in one step — the `spawn()` helper runs its own
+        // `sim.step` each, which would let early spawns settle over dozens of
+        // unchecked ticks before the crowd-pressure loop below even starts.
         let spawn_cmds: Vec<Command> = (0..40)
             .map(|i| Command::Spawn {
                 // 8 columns * 3px stay well clear of the wall at x=150.
@@ -2337,11 +2317,9 @@ mod tests {
 
     #[test]
     fn test_crowd_never_squeezes_through_near_exact_gap() {
-        // Harsher than the 6px-vs-10px repro above: the gap is only *just*
-        // too small (deficit well under a diameter), and the crowd spam-clicks
-        // right at the gap entrance every tick instead of every 5th — maximum
-        // sustained pressure against the weakest case (near-exact-fit, where
-        // the clamp's float-noise slack is largest relative to the deficit).
+        // Harsher than the 6px-vs-10px repro above: the gap is only *just* too
+        // small, and the crowd spam-clicks the entrance every tick — max
+        // pressure against the case where clamp float-noise slack matters most.
         let (points, constraints) = thin_wall_map(9.9); // diameter 10: 0.1px too tight.
         let walls = wall_segments(&points, &constraints);
         let mut sim = Sim::new(points, &constraints, 11);
@@ -2525,11 +2503,10 @@ mod tests {
 
     #[test]
     fn test_group_rounding_corner_none_stuck() {
-        // A group rounding the end of a wall: the pack shoves some units onto
-        // the wall's face, where their straight line to the next waypoint cuts
-        // through it and the wall clamp pins them — stuck. The stall-repath
-        // (heading-into-wall, no progress) must route them around and every
-        // unit must reach the goal. Without it ~2 units stay pinned on the wall.
+        // A group rounding a wall's end: the pack shoves some units onto its
+        // face, where their line to the next waypoint cuts through it and the
+        // wall clamp pins them. The stall-repath must route them around —
+        // without it ~2 units stay pinned on the wall.
         let mut sim = rooms_sim(1, 1, 1);
         sim.step(&[Command::AddObstacle {
             points: vec![v(72.0, 10.0), v(78.0, 10.0), v(78.0, 75.0), v(72.0, 75.0)],
@@ -2558,10 +2535,9 @@ mod tests {
 
     #[test]
     fn test_cohesion_tightens_group_spread() {
-        // Same scenario twice: one Move groups all units (cohesion on); one
-        // Move per unit gives each its own group (no shared group → cohesion
-        // off). Paths and separation are identical, so the spread difference
-        // is cohesion alone. Both variants are a single tick, so timing aligns.
+        // Same scenario twice: one Move groups all units (cohesion on) vs one
+        // Move per unit (own group each, cohesion off). Paths and separation
+        // are identical, so the spread difference is cohesion alone.
         let run = |grouped: bool| -> f32 {
             let mut sim = rooms_sim(3, 1, 7);
             let mut ids = Vec::new();
@@ -2651,11 +2627,10 @@ mod tests {
 
     #[test]
     fn test_cross_group_independence() {
-        // A trailing unit in line behind a leader, both marching to a shared goal
-        // (placed along the travel axis so the straight-line fan stays neutral and
-        // cohesion is the only differing effect). Same group: cohesion pulls the
-        // straggler forward and it closes the gap. Different groups: no cross-group
-        // pull, so the gap holds at what the parallel paths leave it.
+        // A trailing unit behind a leader, goal on the travel axis (so the
+        // straight-line fan stays neutral and cohesion is the only differing
+        // effect). Same group: cohesion pulls the straggler forward, closing
+        // the gap. Different groups: no cross-group pull, gap holds.
         let gap_after = |same_group: bool| -> f32 {
             let mut sim = rooms_sim(3, 1, 4);
             let a = spawn(&mut sim, v(50.0, 50.0), 5.0, 30.0);
@@ -2847,9 +2822,8 @@ mod tests {
     #[test]
     fn test_move_into_sealed_region_never_crosses_wall() {
         // A goal inside a fully sealed-off region (no door) is unreachable.
-        // Whatever the units do (idle, or shuffle on their own side), none may
-        // end up across the sealing wall — a move toward an unreachable spot
-        // must never tunnel units into the closed-off area.
+        // Whatever the units do, none may end up across the sealing wall — a
+        // move toward an unreachable spot must never tunnel units through it.
         let (points, constraints) = partitioned_map();
         let walls = wall_segments(&points, &constraints);
         let mut sim = Sim::new(points, &constraints, 3);
@@ -2882,13 +2856,12 @@ mod tests {
 
     #[test]
     fn test_group_move_to_sealed_goal_near_edge_does_not_cross() {
-        // Goal just inside a sealed-off area, close to the constraint edge. A
-        // single unit correctly idles (it is its own seed and gets the empty
-        // path), but a *group*'s fan synthesises a converge waypoint backed off
-        // toward the seed — which for a near-edge goal lands on the reachable
-        // side — and route_onto_channel then appends the unreachable goal leg,
-        // producing a path that pokes across the wall. Fast units follow it
-        // through. No unit may ever cross the sealing wall.
+        // Goal just inside a sealed-off area, near the constraint edge. A single
+        // unit correctly idles, but a *group*'s fan synthesises a converge
+        // waypoint backed off toward the seed — which for a near-edge goal lands
+        // on the reachable side — so route_onto_channel appends the unreachable
+        // goal leg, producing a path that pokes across the wall. No unit may
+        // ever cross the sealing wall.
         let (points, constraints) = partitioned_map(); // solid wall x=100, no door
         let walls = wall_segments(&points, &constraints);
         let mut sim = Sim::new(points, &constraints, 1);
@@ -2990,9 +2963,9 @@ mod tests {
     fn test_outer_unit_does_not_split_around_obstacle() {
         // A wide flock vs a central obstacle with two ways around. The flock
         // commits to one side (the seed's); an outer unit whose own shortest
-        // path rounds the *other* way must still follow the group, not split off
-        // onto a private path. (Regression: build_offset_path failed for that
-        // unit and the fallback gave it an individual, other-side route.)
+        // path rounds the *other* way must still follow the group. (Regression:
+        // build_offset_path failed for that unit and the fallback gave it an
+        // individual, other-side route.)
         let mut sim = rooms_sim(1, 1, 1);
         sim.step(&[Command::AddObstacle {
             points: vec![v(47.0, 30.0), v(53.0, 30.0), v(53.0, 70.0), v(47.0, 70.0)],

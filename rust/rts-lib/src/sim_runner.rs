@@ -21,14 +21,14 @@ pub struct Snapshot {
     pub ids: Vec<UnitId>,
     pub positions: Vec<Vector2>,
     pub velocities: Vec<Vector2>,
-    /// Next waypoint per unit (own position when idle) — enables path-aware
-    /// view-side extrapolation without extra round-trips.
+    /// Next waypoint per unit (own position when idle); lets the view
+    /// extrapolate along the path without extra round-trips.
     pub waypoints: Vec<Vector2>,
     pub radii: Vec<f32>,
     /// Full remaining path per unit; filled only while the debug overlay is on.
     pub debug_paths: Option<Vec<Vec<Vector2>>>,
-    /// Queued (not-yet-started) order goals per unit; filled only while the
-    /// debug overlay is on, so the view can draw a unit's pending waypoints.
+    /// Queued (not-yet-started) order goals per unit, so the view can draw
+    /// pending waypoints; filled only while the debug overlay is on.
     pub debug_order_goals: Option<Vec<Vec<Vector2>>>,
     /// Wall-clock cost of the `step()` that produced this snapshot, in ms.
     /// Instrumentation only — never feeds back into sim state.
@@ -84,13 +84,13 @@ impl Snapshot {
     }
 }
 
-/// View-side snapshot buffer with a continuous render clock that targets
-/// estimated *current* sim time, not the newest snapshot. Inside a snapshot
-/// interval the clock runs past the newest tick and the view extrapolates
-/// (alpha > 1 on the last pair, capped at one tick), so display latency is
-/// near zero at any sim speed; mispredictions are bounded by one tick of
-/// unit movement. Drift is corrected by nudging playback rate, never by
-/// stepping backwards, so rendered time is monotonic.
+/// View-side snapshot buffer with a continuous render clock that tracks
+/// estimated *current* sim time, not the newest snapshot. Between snapshots
+/// the clock runs ahead of the newest tick and the view extrapolates (alpha
+/// > 1, capped at one tick), keeping display latency near zero at any sim
+/// speed with mispredictions bounded to one tick of movement. Drift is
+/// corrected by nudging the playback rate, never by stepping backwards, so
+/// rendered time stays monotonic.
 pub struct Interpolator {
     /// Snapshots in tick order; `[0]` is the current bracket start.
     buf: VecDeque<Arc<Snapshot>>,
@@ -123,11 +123,10 @@ impl Interpolator {
     /// Buffer a snapshot; ignored unless newer than the newest held.
     pub fn push(&mut self, snap: Arc<Snapshot>) {
         if snap.tick > self.buf.back().unwrap().tick {
-            // Authoritative resync: the sim just published this tick. Must
-            // overwrite, not max(): max() would let frame-clock drift
+            // Overwrite, not max(): max() would let frame-clock drift
             // accumulate until sim_now saturates at the extrapolation cap
-            // and rendered time pins there. The transient negative err an
-            // overwrite can cause is absorbed by the deadband.
+            // and rendered time pins there. Any transient negative err from
+            // the overwrite is absorbed by the deadband.
             self.sim_now = snap.tick as f64;
             self.buf.push_back(snap);
         }
@@ -138,7 +137,8 @@ impl Interpolator {
         &self.buf[0]
     }
 
-    /// Newer snapshot of the current bracket; the view renders its rows.
+    /// Newer snapshot of the current bracket; source for every field except
+    /// position, which lerps with `prev`.
     pub fn cur(&self) -> &Arc<Snapshot> {
         self.buf.get(1).unwrap_or(&self.buf[0])
     }
@@ -208,7 +208,7 @@ struct Shared {
     snapshot: Mutex<Arc<Snapshot>>,
     quit: AtomicBool,
     paused: AtomicBool,
-    /// Sim speed multiplier as f32 bits (1.0 = real time).
+    /// Sim speed multiplier, stored as f32 bits for atomic access (1.0 = real time).
     speed_bits: AtomicU32,
     debug_overlay: AtomicBool,
     mesh_dump_requested: AtomicBool,
@@ -262,10 +262,9 @@ impl SimHandle {
 
     /// Queue an `AddObstacle` and return the id the sim will assign to it.
     ///
-    /// `DynamicNavmesh` hands out sequential ids and the sim is its only
-    /// writer, so a counter seeded from the sim at start and bumped per
-    /// enqueued `AddObstacle` (under the queue lock, preserving order)
-    /// predicts the id exactly.
+    /// Ids are sequential and the sim is the only writer, so a counter
+    /// seeded at start and bumped under the queue lock (preserving enqueue
+    /// order) predicts the assigned id exactly.
     pub fn add_obstacle(&self, points: Vec<Vector2>) -> crate::navmesh::ObstacleId {
         let mut queue = self.shared.commands.lock().unwrap();
         let id = self.shared.next_obstacle_id.fetch_add(1, Ordering::Relaxed);

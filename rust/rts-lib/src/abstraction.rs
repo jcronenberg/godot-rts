@@ -4,13 +4,12 @@ use crate::delaunay::{CDT, NONE};
 
 // ── Reusable search scratch ───────────────────────────────────────────────────
 
-/// Generation-marked buffers for the abstraction's per-query local searches
-/// (`find_local_l3`, `find_channel_between`).  Reusing them turns the previous
-/// `vec![..; num_faces]` allocate-and-init on every query into an O(1) epoch
-/// bump, so TRA* queries stay sublinear in the mesh size.
+/// Epoch-stamped scratch for per-query searches (`find_local_l3`,
+/// `find_channel_between`); reuse turns per-query `vec![..; num_faces]`
+/// allocation into an O(1) epoch bump, keeping TRA* sublinear in mesh size.
 #[derive(Default)]
 pub struct AbsScratch {
-    /// `mark[f] == gen` iff face `f` was visited in the current search.
+    /// `mark[f] == epoch` iff face `f` was visited in the current search.
     mark: Vec<u32>,
     /// Predecessor face for path reconstruction (valid only when `mark[f] == epoch`).
     pred: Vec<u32>,
@@ -122,7 +121,7 @@ impl Abstraction {
                 }
                 free[nb] -= 1;
                 if free[nb] == 0 {
-                    levels[nb] = NodeLevel::Island; // (degenerate; shouldn't happen in practice)
+                    levels[nb] = NodeLevel::Island; // degenerate; shouldn't happen in practice
                 } else if free[nb] == 1 {
                     levels[nb] = NodeLevel::DeadEnd;
                     queue.push_back(nb as u32);
@@ -152,7 +151,7 @@ impl Abstraction {
             cdt.for_each_neighbor(f, |nb, he| {
                 let slot = (he % 3) as usize;
                 match levels[nb as usize] {
-                    NodeLevel::Island | NodeLevel::DeadEnd => {} // skip
+                    NodeLevel::Island | NodeLevel::DeadEnd => {}
                     NodeLevel::DecisionPoint => {
                         l3_adj[f as usize * 3 + slot] = nb;
                         l3_choke[f as usize * 3 + slot] = cdt.portal_radius(he);
@@ -178,20 +177,17 @@ impl Abstraction {
         }
     }
 
-    /// Connected component of face `f`.
     #[inline]
     pub fn component_of(&self, f: u32) -> u32 {
         self.components[f as usize]
     }
 
-    /// Classification level of face `f`.
     #[inline]
     pub fn level_of(&self, f: u32) -> NodeLevel {
         self.levels[f as usize]
     }
 
-    /// Level-3 neighbour reachable through edge slot `s` of face `f`.
-    /// Returns `NONE` when the corridor is blocked or leads into dead-end space.
+    /// `NONE` if slot `s` is blocked or leads only into dead-end space.
     #[inline]
     pub fn l3_neighbor(&self, f: u32, s: u32) -> u32 {
         self.l3_adj[f as usize * 3 + s as usize]
@@ -203,16 +199,14 @@ impl Abstraction {
         self.l3_choke[f as usize * 3 + s as usize]
     }
 
-    /// Find all level-3 (decision-point) faces adjacent to the local
-    /// corridor/dead-end sub-region containing `face`.
+    /// Level-3 faces bounding the local corridor/dead-end region containing `face`.
     ///
-    /// BFS expands through level-1 and level-2 faces but **stops** at
-    /// level-3 faces (collecting them as the boundary).  This way a
-    /// corridor face between two decision points returns both of them,
-    /// while a dead-end tree returns only its single root decision point.
+    /// DFS expands through level-1/2 faces but stops at level-3 (collected as
+    /// the boundary): a corridor between two decision points returns both; a
+    /// dead-end tree returns only its root.
     ///
-    /// Writes the result into `out` (cleared first); empty for islands or rings
-    /// with no decision point. Uses the pooled buffers in `sc` — no allocation.
+    /// Writes into `out` (cleared first); empty for islands or rings with no
+    /// decision point. Uses `sc`'s pooled buffers — no allocation.
     pub fn find_local_l3(&self, cdt: &CDT, face: u32, out: &mut Vec<u32>, sc: &mut AbsScratch) {
         out.clear();
         match self.levels[face as usize] {
@@ -441,7 +435,7 @@ pub fn reconstruct_channel(
             // Direct l3→l3 edge, no corridor.
             push_unique(channel, l3_b);
         } else if !follow_corridor_channel(cdt, &abs.levels, l3_a, first_nb, channel) {
-            // Follow corridor from first_nb to l3_b.
+            // Corridor from first_nb didn't reach l3_b (dead end or ring).
             return false;
         }
     }
@@ -491,10 +485,9 @@ fn flood_fill_components(cdt: &CDT, levels: &[NodeLevel], n: usize) -> Vec<u32> 
     components
 }
 
-// Deduplicates only consecutive equal values.  Duplicates can arise at the
-// seam between a corridor segment and the decision-point face it ends on,
-// since both `follow_corridor_channel` (which appends the terminal face) and
-// the outer loop (which is about to append the same face again) contribute it.
+// Dedups only consecutive equals. Duplicates arise where a corridor segment's
+// terminal face (appended by `follow_corridor_channel`) meets the same face
+// the outer loop is about to append again.
 #[inline]
 fn push_unique(v: &mut Vec<u32>, x: u32) {
     if v.last() != Some(&x) {

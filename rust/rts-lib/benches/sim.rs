@@ -56,9 +56,9 @@ fn unit_ids(sim: &Sim) -> Vec<UnitId> {
     sim.units().iter().map(|(id, _)| id).collect()
 }
 
-/// Time `iters` steps in chunks, rebuilding a fresh sim between chunks
-/// (setup and command construction excluded) so long benches never drift out
-/// of steady state — `chunk` is sized below each scenario's drift horizon.
+/// Time `iters` steps (command construction excluded) in chunks, rebuilding
+/// a fresh sim between chunks so long benches don't drift out of steady
+/// state; `chunk` stays below each scenario's drift horizon.
 fn chunked<F>(iters: u64, chunk: u64, mut make: impl FnMut() -> Sim, mut commands: F) -> Duration
 where
     F: FnMut(u64, &Sim) -> Vec<Command>,
@@ -130,9 +130,9 @@ fn bench_step_burst(c: &mut Criterion) {
     group.finish();
 }
 
-/// Grouped move every tick: one `Move` over the whole selection, exercising
-/// the clustering + one-funnel-per-flock + per-unit corner-offset path (the
-/// group-pathing command cost), vs `step_burst`'s per-unit moves.
+/// One `Move` over the whole selection every tick — clustering,
+/// one-funnel-per-flock, per-unit corner offsets — vs `step_burst`'s
+/// per-unit moves.
 fn bench_group_move(c: &mut Criterion) {
     let mut group = c.benchmark_group("sim/group_move");
     group.sample_size(10);

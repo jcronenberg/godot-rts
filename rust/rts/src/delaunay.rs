@@ -10,8 +10,8 @@ pub struct DelaunayTriangulator {
     points: PackedVector2Array,
     constraints: PackedInt32Array,
     navmesh: Option<DynamicNavmesh>,
-    /// Abstraction plus the navmesh version it was built for; rebuilt lazily
-    /// when the navmesh version moves (e.g. after an obstacle change).
+    /// Abstraction plus the navmesh version it was built for; `find_path_tra`
+    /// rebuilds it lazily once the version moves.
     abstraction: Option<(u64, Abstraction)>,
     scratch: AStarScratch,
 }
@@ -113,8 +113,8 @@ impl DelaunayTriangulator {
 
     /// Build the graph abstraction for TRA* pathfinding.
     ///
-    /// Call this once after `triangulate()`. It is re-built automatically when
-    /// the navmesh changes (obstacle add/remove or re-triangulation).
+    /// Call once after `triangulate()`; `find_path_tra` rebuilds it lazily
+    /// when the navmesh has since changed.
     #[func]
     pub fn build_abstraction(&mut self) {
         let Some(cdt) = self.cdt_mut() else {
@@ -179,8 +179,7 @@ impl DelaunayTriangulator {
 
     /// Find a path for a circular agent of the given `radius`.
     ///
-    /// Pass `radius = 0.0` to find the shortest path without any width
-    /// constraint (equivalent to the old single-argument `find_path`).
+    /// Pass `radius = 0.0` for the shortest path with no width constraint.
     #[func]
     pub fn find_path(&mut self, start: Vector2, goal: Vector2, radius: f32) -> PackedVector2Array {
         let Some(nav) = &mut self.navmesh else {

@@ -8,11 +8,11 @@ use rts_lib::sim_runner::{Interpolator, SimHandle, Snapshot, display_pos};
 
 /// Godot view of the Rust sim thread: commands in, snapshots out.
 ///
-/// Per frame, call `poll(delta)` once to fetch fresh snapshots and advance the
-/// render clock, then read `get_positions(alpha)` / ids / radii with the alpha
-/// it returned. All gameplay state lives in the sim; this node only holds an
-/// [`Interpolator`] over recent snapshots (alpha may exceed 1.0 — bounded
-/// extrapolation). Getters read the bracket's newer snapshot.
+/// Call `poll(delta)` once per frame, then read `get_positions(alpha)` / ids /
+/// radii with the returned alpha. All gameplay state lives in the sim; this
+/// node only holds an [`Interpolator`] over recent snapshots (alpha may
+/// exceed 1.0 for bounded extrapolation). Getters read the bracket's newer
+/// snapshot.
 #[derive(GodotClass)]
 #[class(base=Node)]
 pub struct Simulation {
@@ -34,15 +34,15 @@ impl INode for Simulation {
     }
 
     fn exit_tree(&mut self) {
-        // Dropping the handle flags the sim thread and joins it.
+        // Drop flags the sim thread to quit and joins it.
         self.handle = None;
     }
 }
 
 #[godot_api]
 impl Simulation {
-    /// Build the sim over static map geometry (constraint index pairs into
-    /// `points`) and start the sim thread.
+    /// Build the sim from static map geometry (`constraints` are index pairs
+    /// into `points`) and start the sim thread.
     #[func]
     pub fn load_map(
         &mut self,
@@ -146,16 +146,15 @@ impl Simulation {
     }
 
     /// Live-tweaks a sim tunable by name (see `rts_lib::sim::set_tuning` for
-    /// valid names); returns false if `name` doesn't match one. Applies
-    /// immediately — the tunables are read straight off the sim thread, no
-    /// map/handle needed.
+    /// valid names); returns false for an unknown name. Applies immediately —
+    /// tunables are global atomics, no map/handle needed.
     #[func]
     pub fn set_tuning(&self, name: GString, value: f32) -> bool {
         rts_lib::sim::set_tuning(&name.to_string(), value)
     }
 
     /// Reads a sim tunable's current value by name (see
-    /// `rts_lib::sim::get_tuning`); returns 0.0 if `name` doesn't match one.
+    /// `rts_lib::sim::get_tuning`); returns 0.0 for an unknown name.
     #[func]
     pub fn get_tuning(&self, name: GString) -> f32 {
         rts_lib::sim::get_tuning(&name.to_string()).unwrap_or(0.0)
@@ -168,7 +167,7 @@ impl Simulation {
         let Some(handle) = &self.handle else {
             return 0.0;
         };
-        // Surface sim-thread errors here, where engine printing is allowed.
+        // godot_error! only works on the main thread; drain sim-thread errors here.
         for error in handle.take_errors() {
             godot_error!("sim: {error}");
         }
@@ -200,9 +199,8 @@ impl Simulation {
     }
 
     /// Positions interpolated between the snapshots bracketing render time;
-    /// alpha > 1 extrapolates waypoint-ward along the last pair (see
-    /// [`display_pos`]). Units with no sample in the older snapshot render
-    /// at their current position.
+    /// alpha > 1 extrapolates waypoint-ward (see [`display_pos`]). Units
+    /// absent from the older snapshot render at their current position.
     #[func]
     pub fn get_positions(&self, alpha: f32) -> PackedVector2Array {
         let (prev, cur) = (self.interp.prev(), self.interp.cur());
@@ -212,7 +210,7 @@ impl Simulation {
         let mut p = 0;
         for (i, &id) in cur.ids.iter().enumerate() {
             let cur_pos = cur.positions[i];
-            // Both id lists are in slot order: advance a single cursor.
+            // Id lists are in slot order: advance a single cursor over both.
             while p < prev.ids.len() && (prev.ids[p].raw() as u32) < (id.raw() as u32) {
                 p += 1;
             }

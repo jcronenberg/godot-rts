@@ -7,10 +7,9 @@ pub mod report;
 pub mod sim;
 pub mod sim_runner;
 
-/// Per-thread allocation counter used by tests to verify that pooled-scratch
-/// code paths are allocation-free in steady state. Counts only the current
-/// thread's allocations (via a `const`-initialised thread-local, so it never
-/// itself allocates), making it immune to parallel-test interference.
+/// Per-thread allocation counter for tests asserting pooled-scratch code is
+/// allocation-free in steady state. Thread-local (const-initialised, so it
+/// never allocates itself) keeps counts immune to parallel-test interference.
 #[cfg(test)]
 pub(crate) mod alloc_counter {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -139,9 +138,8 @@ pub(crate) mod test_utils {
         cdt.assert_dcel_valid();
     }
 
-    /// Every unconstrained interior edge passes the in-circumcircle test
-    /// (f64 predicate with a relative tolerance, so f32 round-off and
-    /// cocircular degeneracies don't trip it).
+    /// Every unconstrained interior edge passes the in-circle test (f64,
+    /// relative tolerance, so f32 round-off and cocircular cases don't trip it).
     pub(crate) fn assert_local_delaunay(cdt: &CDT) {
         let pt = |v: u32| cdt.points()[v as usize];
         for f in 0..cdt.num_faces() {
@@ -179,7 +177,7 @@ pub(crate) mod test_utils {
     /// Structural equivalence for triangulations of the same input: identical
     /// vertex and constrained-edge sets (by coordinates), same face count,
     /// valid DCEL, and the local Delaunay property. Triangle sets may differ
-    /// in cocircular cases, so they are deliberately not compared.
+    /// in cocircular cases, so they aren't compared.
     pub(crate) fn assert_navmesh_equiv(a: &CDT, b: &CDT) {
         assert_valid(a);
         assert_valid(b);

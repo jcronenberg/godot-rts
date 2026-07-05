@@ -5,7 +5,7 @@ use rts_lib::delaunay::CDT;
 pub use rts_lib::mapgen::rooms_map;
 
 /// Standard bench constraint pattern: an edge between every 10th point index
-/// and its successor. Shared so the isolated benches decompose `pipeline/load`.
+/// and its successor. Shared with `pipeline/load` for apples-to-apples comparison.
 pub fn chain_constraints(n: usize) -> Vec<(u32, u32)> {
     (0..n.saturating_sub(1))
         .step_by(10)

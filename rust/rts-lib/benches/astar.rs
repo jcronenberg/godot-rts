@@ -49,8 +49,8 @@ fn make_pairs(cdt: &CDT, n: usize) -> Vec<(Vector2, Vector2)> {
 
 // ── find_path (A* + funnel) ───────────────────────────────────────────────────
 
-/// Plain A* on a constrained mesh with a nonzero agent radius — the branch
-/// set `find_path` takes in the game (`find_path_tra` fallback included).
+/// Plain A* with a nonzero radius — the path `find_path_tra` falls back to
+/// when no abstraction is built.
 fn bench_astar_radius(c: &mut Criterion) {
     let mut group = c.benchmark_group("astar/radius");
 
@@ -77,10 +77,9 @@ fn bench_astar_radius(c: &mut Criterion) {
 
 // ── find_path_abstract (TRA* query) ──────────────────────────────────────────
 
-/// Steady-state TRA* query cost: build the abstraction once, then run a batch
-/// of queries reusing a single scratch (mirrors the Godot wrapper, which keeps
-/// one persistent scratch on the object).  Exercises the per-query allocations
-/// in `find_local_l3` / `tra_star` / `reconstruct_channel`.
+/// Steady-state TRA* query cost: one abstraction build, then a batch of
+/// queries reusing a single scratch (mirrors the Godot wrapper's persistent
+/// scratch).
 fn bench_tra_star_query(c: &mut Criterion) {
     const QUERIES: usize = 16;
     let mut group = c.benchmark_group("astar/tra_star_query_16");
@@ -156,9 +155,8 @@ fn bench_abstraction_build(c: &mut Criterion) {
 
 // ── full level-load pipeline ──────────────────────────────────────────────────
 
-/// End-to-end load cost for a level, through the same entry points the Godot
-/// wrapper uses: `DynamicNavmesh::new` (base build, widths, first active
-/// rebuild) plus the TRA* abstraction over the active mesh.
+/// End-to-end level load cost via the same entry points the Godot wrapper
+/// uses: `DynamicNavmesh::new` plus `Abstraction::build`.
 fn bench_load_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline/load");
 

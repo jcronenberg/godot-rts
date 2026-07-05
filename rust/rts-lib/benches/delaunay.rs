@@ -133,8 +133,7 @@ fn bench_clustered_points(c: &mut Criterion) {
     group.finish();
 }
 
-/// Query locate_face for random points on a pre-built CDT.
-/// Construction cost is excluded — measures only point location.
+/// locate_face on a pre-built CDT — construction cost excluded.
 fn bench_locate_face(c: &mut Criterion) {
     let mut group = c.benchmark_group("locate_face");
 
@@ -142,9 +141,7 @@ fn bench_locate_face(c: &mut Criterion) {
         let points = generate_random_points(size, 42);
         let cdt = CDT::triangulate(points);
 
-        // Fixed query set (seed 99) reused across all CDT sizes so comparisons are apples-to-apples.
-        // generate_random_points always produces points in [0,1000)x[0,1000) regardless of count,
-        // so queries fall within the same domain as the CDT at every size.
+        // Fixed query set (seed 99), reused across sizes — same [0,1000) domain as the CDT.
         let query_points = generate_random_points(1000, 99);
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
@@ -163,8 +160,7 @@ fn bench_locate_face(c: &mut Criterion) {
     group.finish();
 }
 
-/// Traverse every face's neighbors on a pre-built CDT.
-/// Construction cost is excluded — measures only graph traversal.
+/// Traverse every face's neighbors on a pre-built CDT — construction cost excluded.
 fn bench_graph_traversal(c: &mut Criterion) {
     let mut group = c.benchmark_group("graph_traversal");
 
@@ -190,7 +186,7 @@ fn bench_constrained(c: &mut Criterion) {
     let mut group = c.benchmark_group("constrained");
 
     group.bench_function("grid_9_with_diagonal", |b| {
-        let points = generate_grid_points(3); // 9 points
+        let points = generate_grid_points(3);
         b.iter(|| {
             let mut cdt = CDT::from_points(black_box(points.clone()));
             cdt.insert_constraint(0, 8);
@@ -209,8 +205,8 @@ fn bench_constrained(c: &mut Criterion) {
     group.finish();
 }
 
-/// Random points with a constraint every 10th index, prepared for width queries
-/// (super-triangle removed, grid built) but *without* `compute_widths`.
+/// Prepped for width queries (constraints, super-triangle removed, grid built)
+/// but *without* `compute_widths`.
 fn prepared_constrained(n: usize, seed: u64) -> CDT {
     let mut cdt = CDT::from_points(generate_random_points(n, seed));
     common::insert_chain_constraints(&mut cdt, n);
@@ -219,9 +215,8 @@ fn prepared_constrained(n: usize, seed: u64) -> CDT {
     cdt
 }
 
-/// Per-portal passability precomputation — a one-time load cost (a 32-step
-/// binary search per half-edge) that the pathfinders depend on but no other
-/// bench measures.
+/// Per-portal width precompute (32-step binary search per half-edge) — a
+/// one-time load cost the pathfinders depend on but no other bench measures.
 fn bench_compute_widths(c: &mut Criterion) {
     let mut group = c.benchmark_group("compute_widths");
 
@@ -236,8 +231,8 @@ fn bench_compute_widths(c: &mut Criterion) {
     group.finish();
 }
 
-/// Cost of inserting a batch of constraints (the edge-flip work), isolated from
-/// the initial triangulation via `iter_batched` so only the insertions are timed.
+/// Cost of the constraint-insertion edge-flips, isolated from the initial
+/// triangulation via `iter_batched`.
 fn bench_insert_constraints(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert_constraints");
 
@@ -296,7 +291,8 @@ fn slot_rect(cols: usize, slot: usize, rng: &mut Lcg) -> Obstacle {
     ])
 }
 
-/// (map label, room grid size, obstacle counts) — k is capped at 4 per room.
+/// (map label, room grid size, obstacle counts) — at most 4 obstacles per
+/// room, one per quadrant.
 const OBSTACLE_SCENARIOS: &[(&str, usize, &[usize])] = &[
     ("10x10", 10, &[10, 100]),
     ("20x20", 20, &[10, 100, 500, 1000]),
@@ -312,11 +308,9 @@ fn obstacle_set(cols: usize, k: usize) -> Vec<Obstacle> {
     obstacle_set_salted(cols, k, 0)
 }
 
-/// Full declarative rebuild with k live obstacles: clone base → insert points
-/// and constraints → super removal → grid index → widths. One iteration is
-/// also the cost of a single obstacle change while k obstacles are live (the
-/// `delta` signal from the plan): removal is "not re-inserting", so any change
-/// triggers exactly this rebuild.
+/// Full rebuild (clone → insert points/constraints → super removal → grid →
+/// widths) with k live obstacles — also the per-tick cost of any single
+/// obstacle change, since there's no incremental removal path.
 fn bench_obstacle_rebuild(c: &mut Criterion) {
     let mut group = c.benchmark_group("obstacles");
     group.sample_size(10);
@@ -337,7 +331,7 @@ fn bench_obstacle_rebuild(c: &mut Criterion) {
                 &k,
                 |b, _| {
                     b.iter(|| {
-                        // Swap one obstacle out and back in: marks dirty, keeps k live.
+                        // Swap one obstacle out and back in, keeping k live.
                         nav.remove_obstacle(ids[0]);
                         ids[0] = nav.add_obstacle(obstacles[0].clone());
                         black_box(nav.rebuild().num_faces())
@@ -350,9 +344,8 @@ fn bench_obstacle_rebuild(c: &mut Criterion) {
     group.finish();
 }
 
-/// Worst case for the width cache: alternate between two disjoint obstacle
-/// sets so every rebuild replaces all k obstacles and no obstacle-local portal
-/// width can be reused (the cache holds only the previous generation).
+/// Worst case for the width cache: alternates two disjoint obstacle sets so
+/// every rebuild replaces all k obstacles and nothing is reusable.
 fn bench_obstacle_rebuild_all_change(c: &mut Criterion) {
     let mut group = c.benchmark_group("obstacles");
     group.sample_size(10);
@@ -426,10 +419,8 @@ fn bench_obstacle_rebuild_with_abstraction(c: &mut Criterion) {
     group.finish();
 }
 
-/// Stage breakdown of the rebuild pipeline (representative 20x20 map) to
-/// direct the optimization pass. Each stage's setup replays the prior stages
-/// untimed; obstacle geometry is replicated via the same public CDT calls
-/// `DynamicNavmesh::rebuild` uses.
+/// Per-stage timing of the rebuild pipeline (20x20 map), using the same CDT
+/// calls `DynamicNavmesh::rebuild` does, to find where to optimize.
 fn bench_obstacle_stages(c: &mut Criterion) {
     let mut group = c.benchmark_group("obstacles");
     group.sample_size(10);

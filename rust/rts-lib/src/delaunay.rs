@@ -399,7 +399,6 @@ impl CDT {
                 );
             }
 
-            // Origin valid
             assert!(
                 (he.origin as usize) < self.points.len(),
                 "origin {} of he {} out of bounds",
@@ -407,7 +406,7 @@ impl CDT {
                 i
             );
 
-            // Continuity: origin(next(he)) == destination(he)
+            // Continuity: dest(he) must equal origin(twin(he))
             let n = next(i);
             let dest = self.half_edges[n as usize].origin;
             if he.twin != NONE {
@@ -470,7 +469,6 @@ impl CDT {
     fn init_super_triangle(points: &mut Vec<Vector2>) -> CDT {
         let n = points.len();
 
-        // Compute bounding box
         let (mut min_x, mut max_x, mut min_y, mut max_y) = (
             f32::INFINITY,
             f32::NEG_INFINITY,
@@ -517,7 +515,6 @@ impl CDT {
         // Face 0: the super-triangle (CCW)
         cdt.alloc_face(sv0, sv1, sv2);
 
-        // Set vertex_half_edge for super-triangle vertices
         cdt.vertex_half_edge[sv0 as usize] = 0;
         cdt.vertex_half_edge[sv1 as usize] = 1;
         cdt.vertex_half_edge[sv2 as usize] = 2;
@@ -540,7 +537,7 @@ impl CDT {
             let p1 = self.point(v1);
             let p2 = self.point(v2);
 
-            // Check each edge: if pt is on the wrong side, walk through that edge
+            // Cross into whichever neighbor lies on pt's failing side.
             let d0 = orient2d(p0, p1, pt);
             if d0 < 0.0 {
                 let twin = self.half_edges[base as usize].twin;
@@ -611,7 +608,6 @@ impl CDT {
         let con2 = self.he_constrained[he2 as usize];
 
         // Reuse face f for triangle (v0, v1, v)
-        // Overwrite in-place
         self.half_edges[he0 as usize] = HalfEdge {
             origin: v0,
             twin: twin0,
@@ -657,7 +653,6 @@ impl CDT {
         // b_base+1 (v0->v) <-> he2 (v->v0)
         self.link_twins(b_base + 1, he2);
 
-        // Update vertex_half_edge
         self.vertex_half_edge[v as usize] = he2; // v->v0
         self.vertex_half_edge[v0 as usize] = he0;
         self.vertex_half_edge[v1 as usize] = a_base; // v1->v2
@@ -762,8 +757,8 @@ impl CDT {
         if twin_bc != NONE {
             self.half_edges[twin_bc as usize].twin = t2_base + 2;
         }
-        self.link_twins(t2_base, f1_base + 2); // C->V <-> V->C
-        self.link_twins(t2_base + 1, f2_base + 1); // V->B <-> B->V
+        self.link_twins(t2_base, f1_base + 2);
+        self.link_twins(t2_base + 1, f2_base + 1);
         self.he_constrained[(t2_base + 1) as usize] = con_edge;
 
         // New face T4: (D, V, A)
@@ -776,11 +771,10 @@ impl CDT {
         if twin_ad != NONE {
             self.half_edges[twin_ad as usize].twin = t4_base + 2;
         }
-        self.link_twins(t4_base, f2_base + 2); // D->V <-> V->D
-        self.link_twins(t4_base + 1, f1_base + 1); // V->A <-> A->V
+        self.link_twins(t4_base, f2_base + 2);
+        self.link_twins(t4_base + 1, f1_base + 1);
         self.he_constrained[(t4_base + 1) as usize] = con_edge;
 
-        // Update vertex_half_edge
         self.vertex_half_edge[v as usize] = f1_base + 2; // V->C
         self.vertex_half_edge[vertex_a as usize] = f1_base + 1; // A->V
         self.vertex_half_edge[vertex_b as usize] = f2_base + 1; // B->V
@@ -796,7 +790,6 @@ impl CDT {
         let twin_id = self.half_edges[he_id as usize].twin;
         debug_assert!(twin_id != NONE);
 
-        // Gather all 6 half-edges of the two faces
         let he_ab = he_id;
         let he_bc = next(he_ab);
         let he_ca = prev(he_ab);
@@ -862,7 +855,6 @@ impl CDT {
         // Internal twin: D->C (f1_base+2) <-> C->D (f2_base+2)
         self.link_twins(f1_base + 2, f2_base + 2);
 
-        // Fix external twin back-pointers
         if twin_ca != NONE {
             self.half_edges[twin_ca as usize].twin = f1_base;
         }
@@ -876,7 +868,6 @@ impl CDT {
             self.half_edges[twin_bc as usize].twin = f2_base + 1;
         }
 
-        // Update vertex_half_edge
         self.vertex_half_edge[vertex_a as usize] = f1_base + 1; // A->D
         self.vertex_half_edge[vertex_b as usize] = f2_base + 1; // B->C
         self.vertex_half_edge[vertex_c as usize] = f1_base; // C->A
@@ -961,10 +952,8 @@ impl CDT {
     fn insert_vertex(&mut self, i: u32, hint_face: u32) -> u32 {
         let pt = self.points[i as usize];
 
-        // Locate containing face
         let f = self.locate_containing_face(pt, hint_face);
 
-        // Check if point is on an edge of the face
         let base = f * 3;
         let mut on_edge: Option<u32> = None;
         for j in 0..3u32 {
@@ -974,7 +963,6 @@ impl CDT {
             let o = orient2d(a, b, pt).abs();
             let edge_len = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
             if o < edge_len * 1e-5 && edge_len > 1e-10 {
-                // Check pt is actually between a and b
                 let t = if (b.x - a.x).abs() > (b.y - a.y).abs() {
                     (pt.x - a.x) / (b.x - a.x)
                 } else {
@@ -1008,7 +996,6 @@ impl CDT {
             self.legalize(t2_base + 2, i);
             self.legalize(t4_base + 2, i);
         } else {
-            // Point inside face: split into 3
             self.split_face_3(f, i);
 
             // Legalize the 3 outer edges (the original edges of face f)
@@ -1036,8 +1023,8 @@ impl CDT {
     pub fn insert_point(&mut self, p: Vector2, hint_face: u32) -> u32 {
         let f = self.locate_containing_face(p, hint_face);
 
-        // Duplicate check against the containing face's corners and the
-        // neighbor apexes (the ε-ball around p can cross an edge of f)
+        // Check the face's corners and neighbor apexes: the ε-ball around
+        // p can cross an edge of f into a neighbor.
         let base = f * 3;
         for j in 0..3u32 {
             let he = base + j;
@@ -1097,7 +1084,6 @@ impl CDT {
         self.version = next_cdt_version(); // geometry/topology changes
         self.grid_cells.clear(); // topology changes; rebuild with build_grid_index if needed
 
-        // If edge already exists, just mark it constrained
         if let Some(he) = self.find_half_edge(v0, v1) {
             self.he_constrained[he as usize] = true;
             let twin = self.half_edges[he as usize].twin;
@@ -1125,7 +1111,6 @@ impl CDT {
             t > 1e-6 && t < 1.0 - 1e-6
         };
 
-        // Collect crossing edges
         let mut crossing: Vec<u32> = Vec::new();
 
         // Find the outgoing half-edge from v0 whose face the segment (v0,v1)
@@ -1184,7 +1169,7 @@ impl CDT {
             let fv1 = self.origin(f_base + 1);
             let fv2 = self.origin(f_base + 2);
             if fv0 == v1 || fv1 == v1 || fv2 == v1 {
-                break; // Reached destination
+                break;
             }
 
             // Segment passes exactly through the apex of the entered face
@@ -1201,7 +1186,6 @@ impl CDT {
                 return;
             }
 
-            // Find which of the other two edges of this face the segment crosses
             let mut advanced = false;
             for j in 0..3u32 {
                 let he = f_base + j;
@@ -1232,19 +1216,18 @@ impl CDT {
         while let Some(he) = queue.pop_front() {
             safety += 1;
             if safety > max_flips {
-                break; // Safety bail-out
+                break;
             }
 
-            // Check if this edge is still crossing (it might have been flipped already)
             let a = self.origin(he);
             let b = self.dest(he);
 
-            // If this IS the constraint edge, we're done with it
+            // Constraint edge itself: nothing to flip.
             if (a == v0 && b == v1) || (a == v1 && b == v0) {
                 continue;
             }
 
-            // Check it still crosses
+            // May have already been flipped away by an earlier queue entry.
             if !segments_intersect_proper(p0, p1, self.point(a), self.point(b)) {
                 continue;
             }
@@ -1266,7 +1249,7 @@ impl CDT {
                 return;
             }
 
-            // Check if quad is convex: diagonals AB and CD must properly cross
+            // Flip needs a convex quad: find its other two corners.
             let vertex_c = self.origin(prev(he));
             let vertex_d = self.origin(prev(twin));
 
@@ -1393,7 +1376,6 @@ impl CDT {
 
         let num_faces = self.half_edges.len() as u32 / 3;
 
-        // Identify live faces (those not touching super-triangle vertices)
         let mut face_alive = vec![false; num_faces as usize];
         for f in 0..num_faces {
             face_alive[f as usize] = !self.face_touches_super(f);
@@ -1425,7 +1407,6 @@ impl CDT {
             }
         }
 
-        // Build new half_edges array (and parallel constrained/width vecs).
         // Widths survive compaction: super edges are unconstrained, so removal
         // changes no wall set and every surviving width stays valid.
         let keep_widths = self.edge_max_radius.len() == self.half_edges.len();
@@ -2248,7 +2229,7 @@ mod tests {
         let a = Vector2::new(0.0, 0.0);
         let b = Vector2::new(2.0, 0.0);
         let c = Vector2::new(1.0, 2.0);
-        let p = Vector2::new(1.0, 0.5); // inside circumcircle
+        let p = Vector2::new(1.0, 0.5);
         assert!(in_circumcircle(a, b, c, p));
     }
 
@@ -2257,7 +2238,7 @@ mod tests {
         let a = Vector2::new(0.0, 0.0);
         let b = Vector2::new(1.0, 0.0);
         let c = Vector2::new(0.5, 0.5);
-        let p = Vector2::new(10.0, 10.0); // far outside
+        let p = Vector2::new(10.0, 10.0);
         assert!(!in_circumcircle(a, b, c, p));
     }
 
@@ -2365,8 +2346,8 @@ mod tests {
         );
         assert_eq!(d.num_vertices(), 5);
 
-        // Center point should appear in all 4 triangles.
-        // Spatial sort may reorder indices, so find it by frequency instead.
+        // Spatial sort may reorder indices, so find the center point by
+        // frequency (it should appear in all 4 triangles) instead of by id.
         let mut vertex_freq = vec![0u32; d.num_vertices() as usize];
         for f in 0..d.num_faces() {
             for v in d.face_vertices(f) {
@@ -2386,8 +2367,7 @@ mod tests {
         ];
 
         let d = CDT::triangulate(points);
-        assert_eq!(d.num_vertices(), 3);
-        // Collinear points should not crash
+        assert_eq!(d.num_vertices(), 3); // should not crash
     }
 
     #[test]
@@ -2463,7 +2443,6 @@ mod tests {
         ];
 
         let d = CDT::triangulate(points);
-        // 1 triangle * 3 vertices = 3 mesh vertices
         assert_eq!(d.num_faces() * 3, 3);
     }
 
@@ -2479,7 +2458,6 @@ mod tests {
 
         let d = CDT::triangulate(points);
 
-        // Every interior face should have at least 1 neighbor
         for f in 0..d.num_faces() {
             let mut count = 0;
             d.for_each_neighbor(f, |_, _| count += 1);
@@ -2513,11 +2491,9 @@ mod tests {
 
         let d = CDT::triangulate(points);
 
-        // The center point should be locatable
         let f = d.locate_face(Vector2::new(1.0, 1.0));
         assert!(f.is_some(), "Should find face containing (1,1)");
 
-        // A point clearly inside the domain
         let f = d.locate_face(Vector2::new(0.5, 0.5));
         assert!(f.is_some(), "Should find face containing (0.5, 0.5)");
     }
@@ -2539,7 +2515,6 @@ mod tests {
         );
         assert!(d.grid_cols > 0);
         assert!(d.grid_rows > 0);
-        // No cell should be NONE after the fill pass
         for &cell in &d.grid_cells {
             assert_ne!(cell, NONE, "all cells should be filled after scanline pass");
         }
@@ -2556,7 +2531,6 @@ mod tests {
         ];
         let d = CDT::triangulate(points);
         let num_faces = d.num_faces();
-        // Query several points and verify returned faces are within range
         let queries = [
             Vector2::new(1.0, 1.0),
             Vector2::new(3.0, 3.0),
@@ -2584,7 +2558,6 @@ mod tests {
         ];
         let d = CDT::triangulate(points);
         let num_faces = d.num_faces();
-        // Points well outside the bounding box should still return a valid face (clamped).
         for q in [
             Vector2::new(-100.0, -100.0),
             Vector2::new(100.0, 100.0),
@@ -2616,7 +2589,6 @@ mod tests {
                 "centroid of face {} should be locatable",
                 f
             );
-            // The found face should actually contain the centroid.
             let found_face = found.unwrap();
             let verts = d.face_vertices(found_face);
             let p0 = d.points()[verts[0] as usize];
@@ -2634,7 +2606,6 @@ mod tests {
 
     #[test]
     fn test_empty_grid_index_fallback() {
-        // A CDT with no grid built should fall back to face 0 from grid_lookup.
         let points = vec![
             Vector2::new(0.0, 0.0),
             Vector2::new(1.0, 0.0),
@@ -2652,15 +2623,9 @@ mod tests {
 
     #[test]
     fn test_grid_scanline_fill_does_not_cross_row_boundary() {
-        // Build a mesh whose centroids only populate the right half of each row,
-        // leaving the left half of every row empty. Before the fix, the forward
-        // scanline would propagate the last cell of row N into the first cell of
-        // row N+1, so a query into the top-left corner of any row would receive a
-        // seed face from the bottom-right of the previous row.
-        //
-        // We verify this by checking that every cell in the grid points to a face
-        // whose centroid is in the same row as the cell (or an adjacent row), not
-        // from a completely different part of the mesh.
+        // Regression: the forward scanline pass used to leak a cell from
+        // the end of row N into the start of row N+1. Verify every cell's
+        // seed face has a centroid in the same (or adjacent) row.
         let points: Vec<Vector2> = (0..10)
             .flat_map(|y| (0..10).map(move |x| Vector2::new(x as f32, y as f32)))
             .collect();
@@ -2674,7 +2639,6 @@ mod tests {
                 let face = d.grid_cells[r * cols + c];
                 assert_ne!(face, NONE, "cell ({},{}) should be filled", c, r);
 
-                // The face's centroid y should map to a row within 1 of the cell's row.
                 let centroid = d.face_centroid(face);
                 let centroid_row = ((centroid.y - d.grid_origin.y) / d.grid_cell_size.y) as i32;
                 let cell_row = r as i32;
@@ -2692,7 +2656,6 @@ mod tests {
 
     #[test]
     fn test_grid_aspect_ratio_wide_domain() {
-        // A 4:1 wide domain should produce more columns than rows.
         let points: Vec<Vector2> = (0..5)
             .flat_map(|y| (0..20).map(move |x| Vector2::new(x as f32 * 4.0, y as f32)))
             .collect();
@@ -2707,7 +2670,6 @@ mod tests {
 
     #[test]
     fn test_grid_aspect_ratio_tall_domain() {
-        // A 1:4 tall domain should produce more rows than columns.
         let points: Vec<Vector2> = (0..20)
             .flat_map(|y| (0..5).map(move |x| Vector2::new(x as f32, y as f32 * 4.0)))
             .collect();
@@ -2730,18 +2692,16 @@ mod tests {
         }
         cdt.remove_super_triangle();
 
-        // Should still have valid triangulation
         assert!(cdt.num_faces() >= 4);
     }
 
     #[test]
     fn test_constraint_crossing_edges() {
-        // Create a grid of points and insert a diagonal constraint
         let (points, constraints) = load_raw("constraint_crossing_edges");
         let mut cdt = CDT::from_points(points);
         for (a, b) in constraints {
             cdt.insert_constraint(a, b);
-        } // diagonal from (0,0) to (4,4)
+        }
         cdt.remove_super_triangle();
 
         // The diagonal passes through vertex 4 at (2,2), so the constraint is split
@@ -2757,7 +2717,6 @@ mod tests {
             "Constraint sub-edge 4-8 should exist in triangulation"
         );
 
-        // Verify the constraint edges are marked as constrained
         if let Some(he) = cdt.find_half_edge(0, 4).or(cdt.find_half_edge(4, 0)) {
             assert!(
                 cdt.he_constrained[he as usize],
@@ -2774,12 +2733,7 @@ mod tests {
 
     #[test]
     fn test_euler_formula() {
-        // V - E + F = 1 (for a triangulation with boundary, Euler for planar graph with 1 unbounded face)
-        // For a triangulation: E = 3F/2 + boundary_edges/2... actually simpler:
-        // For a triangulation of a convex point set with no holes:
-        // F = 2V - h - 2  where h = convex hull size
-        // Just verify basic consistency
-
+        // Euler's formula for a planar graph with an outer face: V - E + F = 1.
         let points = vec![
             Vector2::new(0.0, 0.0),
             Vector2::new(2.0, 0.0),
@@ -2805,8 +2759,6 @@ mod tests {
             }
         }
 
-        // Euler: V - E + F = 1 (with outer face counted)
-        // Or: V - E + F_inner = 1 for planar graph with boundary
         let euler = v as i32 - edge_count as i32 + f as i32;
         assert!(
             euler == 1 || euler == 2,
@@ -2852,7 +2804,6 @@ mod tests {
 
         let d = CDT::triangulate(points);
 
-        // Verify Delaunay property
         for f in 0..d.num_faces() {
             let verts = d.face_vertices(f);
             let a = d.points()[verts[0] as usize];
@@ -2961,7 +2912,6 @@ mod tests {
         let cdt = square_cdt();
         let start = Vector2::new(0.1, 0.1);
         let goal = Vector2::new(0.2, 0.1);
-        // Both points should land in the same face
         let sf = cdt.locate_face(start).unwrap();
         let gf = cdt.locate_face(goal).unwrap();
         assert_eq!(sf, gf, "test requires both points in the same face");
@@ -2980,8 +2930,7 @@ mod tests {
     #[test]
     fn test_path_simple() {
         let cdt = square_cdt();
-        // Put start/goal in different faces (2-triangle square)
-        // Face 0 and face 1 should be the two triangles
+        // 2-triangle square: face 0 and face 1 should differ.
         let c0 = cdt.face_centroid(0);
         let c1 = cdt.face_centroid(1);
         assert_ne!(
@@ -3013,9 +2962,7 @@ mod tests {
         let start = Vector2::new(0.5, 0.25); // below wall
         let goal = Vector2::new(0.5, 1.5); // above wall — outside mesh actually
 
-        // If goal is outside, locate_face returns None → empty path
-        // If goal happens to be inside (mesh extends beyond 1.0 vertically it won't),
-        // then the wall constraints ensure disconnection.
+        // Empty either way: outside the mesh → None; inside → wall blocks it.
         let path = crate::astar::find_path(
             &cdt,
             start,
