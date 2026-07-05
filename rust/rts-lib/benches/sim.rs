@@ -147,7 +147,10 @@ fn bench_group_move(c: &mut Criterion) {
                         let goal = if k % 2 == 0 {
                             Vector2::new(50.0, 50.0)
                         } else {
-                            Vector2::new(SIDE as f32 * ROOM_SIZE - 50.0, SIDE as f32 * ROOM_SIZE - 50.0)
+                            Vector2::new(
+                                SIDE as f32 * ROOM_SIZE - 50.0,
+                                SIDE as f32 * ROOM_SIZE - 50.0,
+                            )
                         };
                         vec![Command::Move {
                             units: unit_ids(sim),

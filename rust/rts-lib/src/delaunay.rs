@@ -1848,11 +1848,7 @@ impl CDT {
         mut f: impl FnMut(f32, f32, f32),
     ) {
         let pv = self.points[v as usize];
-        self.for_outgoing_he(v, |out_he| {
-            if !self.he_constrained[out_he as usize] {
-                return;
-            }
-            let pc = self.points[self.dest(out_he) as usize];
+        let mut emit = |pc: Vector2| {
             let cx = pc.x - pv.x;
             let cy = pc.y - pv.y;
             f(
@@ -1860,7 +1856,31 @@ impl CDT {
                 (cx * cx + cy * cy).sqrt(),
                 (cx * dir_y - cy * dir_x).abs(),
             );
+        };
+        self.for_outgoing_he(v, |out_he| {
+            if self.he_constrained[out_he as usize] {
+                emit(self.points[self.dest(out_he) as usize]);
+            }
+            // A one-sided (hull-boundary) wall incoming to v is never itself
+            // outgoing from v, so for_outgoing_he never yields it directly —
+            // catch it via the preceding half-edge in the same face, whose
+            // dest is v.
+            let p = prev(out_he);
+            if self.he_constrained[p as usize] && self.is_one_sided_wall(p) {
+                emit(self.points[self.origin(p) as usize]);
+            }
         });
+    }
+
+    /// A one-sided wall (map-boundary / hull constraint) has a single
+    /// interior-facing half-edge: its twin is absent, or belongs to a face
+    /// that `remove_super_triangle` will delete. Interior obstacle walls are
+    /// twinned on both sides and are never one-sided. Detection must be
+    /// super-removal-invariant since incremental widths run before removal
+    /// and the full path after.
+    fn is_one_sided_wall(&self, he: u32) -> bool {
+        let twin = self.half_edges[he as usize].twin;
+        twin == NONE || self.face_touches_super(face_of(twin))
     }
 
     /// Compute the valid parameter range [t_lo, t_hi] on portal half-edge `he`
@@ -1961,10 +1981,16 @@ impl CDT {
         // hull constraints live in super-touching faces), so widths computed
         // before removal equal those computed after. No-op on finished meshes.
         let dies_with_super = |he: u32| self.face_touches_super(face_of(he));
+        // One-sided (hull-boundary) walls are attributed to both endpoints —
+        // see `is_one_sided_wall` — since only their origin has an outgoing
+        // half-edge to find them by.
         let mut offsets = vec![0u32; self.points.len() + 1];
         for he in 0..self.half_edges.len() as u32 {
             if self.he_constrained[he as usize] && !dies_with_super(he) {
                 offsets[self.origin(he) as usize + 1] += 1;
+                if self.is_one_sided_wall(he) {
+                    offsets[self.dest(he) as usize + 1] += 1;
+                }
             }
         }
         for i in 1..offsets.len() {
@@ -1975,11 +2001,17 @@ impl CDT {
         for he in 0..self.half_edges.len() as u32 {
             if self.he_constrained[he as usize] && !dies_with_super(he) {
                 let v = self.origin(he);
+                let d = self.dest(he);
                 let pv = self.points[v as usize];
-                let pc = self.points[self.dest(he) as usize];
-                let (cx, cy) = (pc.x - pv.x, pc.y - pv.y);
-                walls[cursor[v as usize] as usize] = (cx, cy, (cx * cx + cy * cy).sqrt());
+                let pd = self.points[d as usize];
+                let (cx, cy) = (pd.x - pv.x, pd.y - pv.y);
+                let len = (cx * cx + cy * cy).sqrt();
+                walls[cursor[v as usize] as usize] = (cx, cy, len);
                 cursor[v as usize] += 1;
+                if self.is_one_sided_wall(he) {
+                    walls[cursor[d as usize] as usize] = (-cx, -cy, len);
+                    cursor[d as usize] += 1;
+                }
             }
         }
         (offsets, walls)
@@ -3074,6 +3106,79 @@ mod tests {
         cdt.build_grid_index();
         // compute_widths NOT called — portal_radius should return infinity.
         assert_eq!(cdt.portal_radius(0), f32::INFINITY);
+    }
+
+    #[test]
+    fn test_boundary_wall_seen_from_both_endpoints() {
+        // Bottom-boundary edge (0,0)-(200,0) is outgoing from vertex 0 only;
+        // vertex 1 = (200,0) must still see it as an incident wall, not just
+        // the right-boundary edge (1,2) that *is* outgoing from it.
+        let points = vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(200.0, 0.0),
+            Vector2::new(200.0, 200.0),
+            Vector2::new(0.0, 200.0),
+        ];
+        let mut cdt = CDT::from_points(points);
+        cdt.insert_constraint(0, 1);
+        cdt.insert_constraint(1, 2);
+        cdt.insert_constraint(2, 3);
+        cdt.insert_constraint(3, 0);
+        cdt.remove_super_triangle();
+
+        let mut walls = 0;
+        cdt.for_each_constrained_wall(1, 1.0, 0.0, |_, _, _| walls += 1);
+        assert_eq!(
+            walls, 2,
+            "vertex (200,0) must see both the bottom and right boundary walls"
+        );
+    }
+
+    #[test]
+    fn test_narrow_gap_under_obstacle_reports_true_clearance() {
+        // Repro from narrow_gap_clearance_findings.md: a 3px-thick wall leaves
+        // a 6px slot to the map boundary. The diagonal portal spanning that
+        // slot must report a radius close to the true ~3 (half the 6px gap),
+        // not the ~23.6 the boundary-wall attribution bug produced by missing
+        // the bottom-boundary wall at vertex 1 = (200,0).
+        let points = vec![
+            Vector2::new(0.0, 0.0),     // 0
+            Vector2::new(200.0, 0.0),   // 1
+            Vector2::new(200.0, 200.0), // 2
+            Vector2::new(0.0, 200.0),   // 3
+            Vector2::new(150.0, 6.0),   // 4
+            Vector2::new(153.0, 6.0),   // 5
+            Vector2::new(153.0, 200.0), // 6
+            Vector2::new(150.0, 200.0), // 7
+        ];
+        let mut cdt = CDT::from_points(points);
+        for (a, b) in [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 0),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 4),
+        ] {
+            cdt.insert_constraint(a, b);
+        }
+        cdt.remove_super_triangle();
+        cdt.build_grid_index();
+        cdt.compute_widths();
+
+        let he = (0..cdt.half_edges.len() as u32)
+            .find(|&he| {
+                let (a, b) = (cdt.origin(he), cdt.dest(he));
+                (a, b) == (4, 1) || (a, b) == (1, 4)
+            })
+            .expect("triangulation must connect (150,6) and (200,0) directly");
+        let r = cdt.portal_radius(he);
+        assert!(
+            r < 10.0,
+            "portal under the obstacle should report true clearance (~3-5), got {r}"
+        );
     }
 
     #[test]

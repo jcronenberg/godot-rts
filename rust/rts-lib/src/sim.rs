@@ -11,7 +11,8 @@ use godot::prelude::Vector2;
 
 use crate::abstraction::Abstraction;
 use crate::astar::{
-    AStarScratch, clear_los, clip_ray_to_walls, closest_on_segment, find_path_abstract,
+    AStarScratch, clear_los, clip_ray_to_walls, closest_on_segment, dist_segment_segment,
+    find_path_abstract,
 };
 use crate::delaunay::{CDT, FNV_OFFSET, FNV_PRIME};
 use crate::navmesh::{DynamicNavmesh, Obstacle, ObstacleId};
@@ -77,6 +78,15 @@ pub static STALL_REPATH_TICKS: TunableU8 = TunableU8::new(3);
 /// the stall counter); below it the unit is treated as not advancing.
 pub static STALL_PROGRESS_EPS: TunableF32 = TunableF32::new(0.1);
 
+/// Max `wall_clamp` passes per unit per tick before giving up as unresolved.
+/// Internal convergence detail, not a gameplay knob — plain const rather than
+/// a `Tunable`.
+const WALL_CLAMP_PASSES: u32 = 8;
+/// Clearance slack (fraction of radius) below which a clamped position still
+/// counts as overlapping a wall. Just enough for f32 noise in an exact-fit
+/// (`gap == 2r`) corridor; more would let genuinely-too-tight gaps pass.
+const WALL_CLAMP_REVERT_EPS_FRAC: f32 = 0.0005;
+
 /// Runtime-settable f32, stored as bits in an atomic. Backs the tunables above.
 pub struct TunableF32(std::sync::atomic::AtomicU32);
 impl TunableF32 {
@@ -88,7 +98,8 @@ impl TunableF32 {
         f32::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed))
     }
     pub fn set(&self, v: f32) {
-        self.0.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed)
+        self.0
+            .store(v.to_bits(), std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -555,6 +566,9 @@ struct StepScratch {
     /// Wall-clamp face frontier and visited list (tiny per unit).
     faces: Vec<u32>,
     visited: Vec<u32>,
+    /// Wall-clamp: constrained half-edges near the unit this tick (gate
+    /// prefilter, then per-pass discoveries; tiny per unit).
+    clamp_walls: Vec<u32>,
     /// Units the wall clamp found stuck this tick, to repath (usually empty).
     repath: Vec<UnitId>,
 }
@@ -780,8 +794,14 @@ impl Sim {
                     da.partial_cmp(&db).unwrap()
                 })
                 .expect("non-empty component");
-            let seed_path =
-                find_path_abstract(cdt, &self.abstraction, pos[seed], goal, &mut self.scratch, flock_r);
+            let seed_path = find_path_abstract(
+                cdt,
+                &self.abstraction,
+                pos[seed],
+                goal,
+                &mut self.scratch,
+                flock_r,
+            );
 
             // Empty seed path ⇒ the goal is unreachable for the seed (the member
             // nearest it). Cluster members are mutually clear-LoS, so they share
@@ -841,7 +861,11 @@ impl Sim {
             // (offset 0) and the rest fan into the free side; on a straight leg,
             // keep the sign so they fan symmetrically and hold their spread.
             let has_corners = !corners.is_empty();
-            let axis = if has_corners { outward[0] } else { Vector2::ZERO };
+            let axis = if has_corners {
+                outward[0]
+            } else {
+                Vector2::ZERO
+            };
             lanes.clear();
             let mut lane_min = f32::INFINITY;
             for &i in members {
@@ -869,7 +893,12 @@ impl Sim {
                     build_offset_path(cdt, pos[i], &corners, &outward, goal, offset, radius)
                         .unwrap_or_else(|| {
                             route_onto_channel(
-                                cdt, &self.abstraction, &mut self.scratch, pos[i], &corners, goal,
+                                cdt,
+                                &self.abstraction,
+                                &mut self.scratch,
+                                pos[i],
+                                &corners,
+                                goal,
                                 radius,
                             )
                         })
@@ -973,9 +1002,7 @@ impl Sim {
                 let i = unit.path_i as usize;
                 let (w, nxt) = (unit.path[i], unit.path[i + 1]);
                 let (d, seg) = (unit.pos - w, nxt - w);
-                if d.x * seg.x + d.y * seg.y >= 0.0
-                    && clear_los(cdt, unit.pos, nxt, unit.radius)
-                {
+                if d.x * seg.x + d.y * seg.y >= 0.0 && clear_los(cdt, unit.pos, nxt, unit.radius) {
                     unit.path_i += 1;
                 } else {
                     break;
@@ -1060,7 +1087,8 @@ impl Sim {
             s.arrive.push(false);
             s.coh_sum.push(Vector2::ZERO);
             s.coh_n.push(0);
-            s.goals.push(u.path.last().copied().unwrap_or(Vector2::ZERO));
+            s.goals
+                .push(u.path.last().copied().unwrap_or(Vector2::ZERO));
             max_radius = max_radius.max(u.radius);
         }
         if s.ids.len() < 2 || max_radius <= 0.0 {
@@ -1258,6 +1286,90 @@ impl Sim {
         self.step_scratch.merge_pairs.clear();
     }
 
+    /// Collect (dedup) every constrained half-edge within `radius` of `p` into
+    /// `walls`, without moving anything — a read-only version of the radius
+    /// BFS `wall_clamp`'s pass loop uses while pushing. Reuses `faces`/
+    /// `visited` as scratch (cleared internally).
+    fn gather_nearby_walls(
+        cdt: &CDT,
+        p: Vector2,
+        radius: f32,
+        faces: &mut Vec<u32>,
+        visited: &mut Vec<u32>,
+        walls: &mut Vec<u32>,
+    ) {
+        let Some(start) = cdt.locate_face(p) else {
+            return;
+        };
+        faces.clear();
+        visited.clear();
+        faces.push(start);
+        visited.push(start);
+        while let Some(face) = faces.pop() {
+            for he in face * 3..face * 3 + 3 {
+                let a = cdt.points()[cdt.he_origin(he) as usize];
+                let b = cdt.points()[cdt.he_dest(he) as usize];
+                let closest = closest_on_segment(p, a, b);
+                let delta = p - closest;
+                if delta.x * delta.x + delta.y * delta.y >= radius * radius {
+                    continue;
+                }
+                if cdt.he_is_constrained(he) {
+                    if !walls.contains(&he) {
+                        walls.push(he);
+                    }
+                } else if let Some(twin) = cdt.he_twin(he) {
+                    let nb = cdt.face_of_he(twin);
+                    if !visited.contains(&nb) {
+                        visited.push(nb);
+                        faces.push(nb);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the tick's end-to-end motion (chord `prev → pos`) passed
+    /// within `radius` of two walls that don't share an endpoint — squeezed
+    /// through a gap the body doesn't fit. Adjacent walls are exempt: they
+    /// form one obstacle corner, which paths may legitimately cut close (see
+    /// `astar.rs`'s clearance contract) trusting the clamp to push back out.
+    fn swept_through_pinch(
+        cdt: &CDT,
+        s: &mut StepScratch,
+        prev: Vector2,
+        pos: Vector2,
+        radius: f32,
+    ) -> bool {
+        // Midpoint gather with radius expanded by half the chord length covers
+        // every wall within `radius` of any point of the chord in one BFS.
+        let half = (pos - prev) * 0.5;
+        Self::gather_nearby_walls(
+            cdt,
+            prev + half,
+            radius + half.length(),
+            &mut s.faces,
+            &mut s.visited,
+            &mut s.clamp_walls,
+        );
+        let min_clear = radius - WALL_CLAMP_REVERT_EPS_FRAC * radius;
+        s.clamp_walls.retain(|&he| {
+            let a = cdt.points()[cdt.he_origin(he) as usize];
+            let b = cdt.points()[cdt.he_dest(he) as usize];
+            dist_segment_segment(prev, pos, a, b) < min_clear
+        });
+        let shares_vertex = |he1: u32, he2: u32| {
+            let (a1, b1) = (cdt.he_origin(he1), cdt.he_dest(he1));
+            let (a2, b2) = (cdt.he_origin(he2), cdt.he_dest(he2));
+            a1 == a2 || a1 == b2 || b1 == a2 || b1 == b2
+        };
+        s.clamp_walls.iter().enumerate().any(|(i, &he1)| {
+            s.clamp_walls[i + 1..]
+                .iter()
+                .any(|&he2| !shares_vertex(he1, he2))
+        })
+    }
+
     /// Project unit circles out of nearby constrained edges. Paths already
     /// respect radius; this only cleans up separation pushes, so units that
     /// didn't move this tick are skipped — unless the mesh changed, which can
@@ -1269,6 +1381,25 @@ impl Sim {
             if unit.radius <= 0.0 || (!mesh_changed && unit.pos == unit.prev_pos) {
                 continue;
             }
+            // Fast path: distance to a wall changes at most 1:1 with distance
+            // moved, so with no wall within `radius` + chord length of the
+            // endpoint, the pass loop below finds nothing to push and no wall
+            // can lie within `radius` of any point of the tick's chord — no
+            // possible pinch either. Skip the unit.
+            let reach = unit.radius + (unit.pos - unit.prev_pos).length();
+            s.clamp_walls.clear();
+            Self::gather_nearby_walls(
+                cdt,
+                unit.pos,
+                reach,
+                &mut s.faces,
+                &mut s.visited,
+                &mut s.clamp_walls,
+            );
+            if s.clamp_walls.is_empty() {
+                unit.stall = 0;
+                continue;
+            }
             // A push moves the circle and changes which faces it overlaps,
             // invalidating the walk in progress; re-walk until a pass applies
             // no push (bounded against corner ping-pong). `out` accumulates the
@@ -1277,7 +1408,15 @@ impl Sim {
             // the stall detector fires even when opposite normals cancel in `out`.
             let mut out = Vector2::ZERO;
             let mut pushed_any = false;
-            for _ in 0..4 {
+            // Check every push against every wall any pass touched so far: a
+            // push snaps the circle to exactly `radius` from one wall — at a
+            // segment endpoint, radially from that corner — and near a
+            // sub-diameter gap that snap can leap past the *other* wall's
+            // exclusion disk in one discrete step ("corner-teleport").
+            s.clamp_walls.clear();
+            let mut violated = false;
+            let min_clear = unit.radius - WALL_CLAMP_REVERT_EPS_FRAC * unit.radius;
+            'passes: for _ in 0..WALL_CLAMP_PASSES {
                 let Some(start) = cdt.locate_face(unit.pos) else {
                     break;
                 };
@@ -1297,12 +1436,28 @@ impl Sim {
                             continue;
                         }
                         if cdt.he_is_constrained(he) {
+                            if !s.clamp_walls.contains(&he) {
+                                s.clamp_walls.push(he);
+                            }
                             let d = d2.sqrt();
                             if d > 1e-6 {
                                 unit.pos = closest + delta * (unit.radius / d);
                                 pushed = true;
                                 pushed_any = true;
                                 out += delta * (1.0 / d);
+                                if s.clamp_walls.iter().any(|&wh| {
+                                    if wh == he {
+                                        return false;
+                                    }
+                                    let wa = cdt.points()[cdt.he_origin(wh) as usize];
+                                    let wb = cdt.points()[cdt.he_dest(wh) as usize];
+                                    let c = closest_on_segment(unit.pos, wa, wb);
+                                    let dd = unit.pos - c;
+                                    dd.x * dd.x + dd.y * dd.y < min_clear * min_clear
+                                }) {
+                                    violated = true;
+                                    break 'passes;
+                                }
                             }
                         } else if let Some(twin) = cdt.he_twin(he) {
                             // Circle reaches past a free edge: also check the
@@ -1318,6 +1473,17 @@ impl Sim {
                 if !pushed {
                     break;
                 }
+            }
+            // Revert when a push re-violated a touched wall or the chord swept
+            // a gap the body doesn't fit: `prev_pos` is clear by induction, so
+            // crowd pressure can never ratchet a unit into or through a pinch.
+            // Skipped on `mesh_changed` — a new obstacle can invalidate
+            // `prev_pos` itself, so best-effort projection is correct there.
+            if !mesh_changed
+                && (violated
+                    || Self::swept_through_pinch(cdt, s, unit.prev_pos, unit.pos, unit.radius))
+            {
+                unit.pos = unit.prev_pos;
             }
             // Stuck-on-corner detection: a moving unit shoved off its cleared
             // route so its line to the next waypoint cuts a wall — i.e. it's
@@ -1583,7 +1749,6 @@ mod tests {
         ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
     }
 
-
     #[test]
     fn test_spawn_and_idle() {
         let mut sim = rooms_sim(2, 2, 1);
@@ -1718,9 +1883,19 @@ mod tests {
         let mut sim = rooms_sim(3, 1, 1);
         let id = spawn(&mut sim, v(50.0, 50.0), 5.0, 30.0);
         let (g1, g2) = (v(250.0, 50.0), v(150.0, 50.0));
-        sim.step(&[Command::Move { units: vec![id], goal: g1 }]);
-        sim.step(&[Command::Queue { units: vec![id], order: Order::Move { goal: g2 } }]);
-        assert_eq!(unit(&sim, id).orders.len(), 1, "second move is queued, not run");
+        sim.step(&[Command::Move {
+            units: vec![id],
+            goal: g1,
+        }]);
+        sim.step(&[Command::Queue {
+            units: vec![id],
+            order: Order::Move { goal: g2 },
+        }]);
+        assert_eq!(
+            unit(&sim, id).orders.len(),
+            1,
+            "second move is queued, not run"
+        );
 
         // The queue drains the tick g1 is reached; g2 must not begin before then.
         let mut reached_g1 = false;
@@ -1729,7 +1904,10 @@ mod tests {
             let u = unit(&sim, id);
             if u.orders.is_empty() && !reached_g1 {
                 reached_g1 = true;
-                assert_eq!(u.pos, g1, "first goal must be reached before the second begins");
+                assert_eq!(
+                    u.pos, g1,
+                    "first goal must be reached before the second begins"
+                );
             }
             if reached_g1 && !u.is_moving() {
                 break;
@@ -1746,7 +1924,10 @@ mod tests {
         let goal = v(150.0, 50.0);
         // advance_orders runs in the same step the command lands, so an idle
         // unit begins a queued order immediately (no idle tick).
-        sim.step(&[Command::Queue { units: vec![id], order: Order::Move { goal } }]);
+        sim.step(&[Command::Queue {
+            units: vec![id],
+            order: Order::Move { goal },
+        }]);
         let u = unit(&sim, id);
         assert!(u.is_moving());
         assert!(u.orders.is_empty());
@@ -1757,13 +1938,27 @@ mod tests {
     fn test_plain_move_clears_queue() {
         let mut sim = rooms_sim(3, 1, 1);
         let id = spawn(&mut sim, v(50.0, 50.0), 5.0, 30.0);
-        sim.step(&[Command::Move { units: vec![id], goal: v(250.0, 50.0) }]);
-        sim.step(&[Command::Queue { units: vec![id], order: Order::Move { goal: v(150.0, 50.0) } }]);
+        sim.step(&[Command::Move {
+            units: vec![id],
+            goal: v(250.0, 50.0),
+        }]);
+        sim.step(&[Command::Queue {
+            units: vec![id],
+            order: Order::Move {
+                goal: v(150.0, 50.0),
+            },
+        }]);
         assert_eq!(unit(&sim, id).orders.len(), 1);
         let new_goal = v(200.0, 50.0);
-        sim.step(&[Command::Move { units: vec![id], goal: new_goal }]);
+        sim.step(&[Command::Move {
+            units: vec![id],
+            goal: new_goal,
+        }]);
         let u = unit(&sim, id);
-        assert!(u.orders.is_empty(), "a plain move must cancel queued orders");
+        assert!(
+            u.orders.is_empty(),
+            "a plain move must cancel queued orders"
+        );
         assert_eq!(*u.path.last().unwrap(), new_goal);
     }
 
@@ -1869,7 +2064,9 @@ mod tests {
                     // Queue a follow-on order so the order queue is hashed too.
                     cmds.push(Command::Queue {
                         units: ids.clone(),
-                        order: Order::Move { goal: v(60.0, 60.0) },
+                        order: Order::Move {
+                            goal: v(60.0, 60.0),
+                        },
                     });
                 }
                 if t == 40 {
@@ -2014,8 +2211,11 @@ mod tests {
         }
         for _ in 0..400 {
             // Re-issue the same move every few ticks (spam-click).
-            let cmd = if sim.tick() % 5 == 0 {
-                vec![Command::Move { units: ids.clone(), goal }]
+            let cmd = if sim.tick().is_multiple_of(5) {
+                vec![Command::Move {
+                    units: ids.clone(),
+                    goal,
+                }]
             } else {
                 vec![]
             };
@@ -2063,6 +2263,116 @@ mod tests {
         }
     }
 
+    /// 200x200 map with a 3px-thick wall from (150,`gap`) up to the top edge,
+    /// leaving a `gap`-tall slot to the bottom boundary.
+    fn thin_wall_map(gap: f32) -> (Vec<Vector2>, Vec<(u32, u32)>) {
+        let pts = vec![
+            v(0.0, 0.0),
+            v(200.0, 0.0),
+            v(200.0, 200.0),
+            v(0.0, 200.0),
+            v(150.0, gap),
+            v(153.0, gap),
+            v(153.0, 200.0),
+            v(150.0, 200.0),
+        ];
+        let cons = vec![
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 0),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 4),
+        ];
+        (pts, cons)
+    }
+
+    #[test]
+    fn test_crowd_never_squeezes_through_subdiameter_gap() {
+        // narrow_gap_clearance_findings.md repro: a 6px slot, too tight for
+        // radius-5 (diameter-10) units. A single unit stalls at the entrance;
+        // sustained crowd pressure must not squeeze the front units through
+        // it either.
+        let (points, constraints) = thin_wall_map(6.0);
+        let walls = wall_segments(&points, &constraints);
+        let mut sim = Sim::new(points, &constraints, 7);
+        let goal = v(175.0, 100.0);
+        // Spawn all 40 units in one step (spawning one-at-a-time via the
+        // `spawn()` helper each runs its own `sim.step`, which would let
+        // early-spawned units collide/settle over dozens of unchecked ticks
+        // before the crowd-pressure loop below even starts).
+        let spawn_cmds: Vec<Command> = (0..40)
+            .map(|i| Command::Spawn {
+                // 8 columns * 3px stay well clear of the wall at x=150.
+                pos: v(115.0 + 3.0 * (i % 8) as f32, 20.0 + 4.0 * (i / 8) as f32),
+                radius: 5.0,
+                speed: 60.0,
+            })
+            .collect();
+        sim.step(&spawn_cmds);
+        let ids: Vec<UnitId> = sim.units().iter().map(|(id, _)| id).collect();
+        assert_no_wall_crossing(&sim, &walls);
+        for _ in 0..1000 {
+            let cmd = if sim.tick().is_multiple_of(5) {
+                vec![Command::Move {
+                    units: ids.clone(),
+                    goal,
+                }]
+            } else {
+                vec![]
+            };
+            sim.step(&cmd);
+            assert_no_wall_crossing(&sim, &walls);
+            for (_, u) in sim.units().iter() {
+                assert!(
+                    u.pos.x <= 150.0 + 1e-3,
+                    "unit squeezed through the sub-diameter gap to {:?}",
+                    u.pos
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_crowd_never_squeezes_through_near_exact_gap() {
+        // Harsher than the 6px-vs-10px repro above: the gap is only *just*
+        // too small (deficit well under a diameter), and the crowd spam-clicks
+        // right at the gap entrance every tick instead of every 5th — maximum
+        // sustained pressure against the weakest case (near-exact-fit, where
+        // the clamp's float-noise slack is largest relative to the deficit).
+        let (points, constraints) = thin_wall_map(9.9); // diameter 10: 0.1px too tight.
+        let walls = wall_segments(&points, &constraints);
+        let mut sim = Sim::new(points, &constraints, 11);
+        let goal = v(151.5, 3.0); // dead centre of the gap: max pressure at the pinch.
+        let spawn_cmds: Vec<Command> = (0..60)
+            .map(|i| Command::Spawn {
+                // Columns stay well clear (max x=133.5) of the wall at x=150.
+                pos: v(120.0 + 1.5 * (i % 10) as f32, 20.0 + 3.0 * (i / 10) as f32),
+                radius: 5.0,
+                speed: 80.0,
+            })
+            .collect();
+        sim.step(&spawn_cmds);
+        let ids: Vec<UnitId> = sim.units().iter().map(|(id, _)| id).collect();
+        assert_no_wall_crossing(&sim, &walls);
+        for _ in 0..3000 {
+            sim.step(&[Command::Move {
+                units: ids.clone(),
+                goal,
+            }]);
+            assert_no_wall_crossing(&sim, &walls);
+            for (_, u) in sim.units().iter() {
+                assert!(
+                    u.pos.x <= 150.0 + 1e-3,
+                    "unit squeezed through the near-exact gap to {:?}",
+                    u.pos
+                );
+            }
+        }
+    }
+
     /// Mean distance of the alive units from their centroid (group spread).
     fn spread(sim: &Sim) -> f32 {
         let ps: Vec<Vector2> = sim.units().iter().map(|(_, u)| u.pos).collect();
@@ -2086,7 +2396,6 @@ mod tests {
         panic!("unit did not arrive within {max} ticks");
     }
 
-
     #[test]
     fn test_crowd_arrival_stops_short_of_goal() {
         // A reaches the goal and parks; B, behind it and same group, stops on
@@ -2104,7 +2413,11 @@ mod tests {
         assert!(ua.parked && ub.parked, "both must settle (parked)");
         assert!(!ua.is_moving() && !ub.is_moving());
         let (da, db) = (dist(ua.pos, goal), dist(ub.pos, goal));
-        assert!(da.min(db) < 6.0, "one unit settles at the goal: {}", da.min(db));
+        assert!(
+            da.min(db) < 6.0,
+            "one unit settles at the goal: {}",
+            da.min(db)
+        );
         assert!(
             da.max(db) > 7.0,
             "the other stops short, not crammed onto the goal: {}",
@@ -2147,7 +2460,10 @@ mod tests {
         }
         // Only a couple reach the goal centre; the rest stop around it.
         let at_goal = us.iter().filter(|u| dist(u.pos, goal) < 5.0).count();
-        assert!(at_goal <= 2, "units crammed onto the goal centre: {at_goal}");
+        assert!(
+            at_goal <= 2,
+            "units crammed onto the goal centre: {at_goal}"
+        );
         // Blob straddles the goal (not piled up short of it), centroid within
         // the group's own arrival radius.
         let axis = (goal - v(12.0, 12.0)).normalized();
@@ -2162,8 +2478,8 @@ mod tests {
             "blob must straddle the goal, not stop short: behind={behind} past={past}"
         );
         let r = us[0].radius;
-        let arrival_r =
-            r * (ARRIVAL_RADIUS_FACTOR.get() * (us.len() as f32).sqrt()).max(ARRIVAL_MIN_RADII.get());
+        let arrival_r = r
+            * (ARRIVAL_RADIUS_FACTOR.get() * (us.len() as f32).sqrt()).max(ARRIVAL_MIN_RADII.get());
         let mut c = Vector2::ZERO;
         for u in &us {
             c += u.pos;
@@ -2517,11 +2833,13 @@ mod tests {
             v(100.0, 200.0), // 5
         ];
         let cons = vec![
-            (0, 4), (4, 1), // bottom, split at the wall foot
-            (1, 2),         // right
-            (2, 5), (5, 3), // top, split at the wall head
-            (3, 0),         // left
-            (4, 5),         // interior wall
+            (0, 4),
+            (4, 1), // bottom, split at the wall foot
+            (1, 2), // right
+            (2, 5),
+            (5, 3), // top, split at the wall head
+            (3, 0), // left
+            (4, 5), // interior wall
         ];
         (pts, cons)
     }
@@ -2545,7 +2863,10 @@ mod tests {
                 30.0,
             ));
         }
-        sim.step(&[Command::Move { units: ids.clone(), goal }]);
+        sim.step(&[Command::Move {
+            units: ids.clone(),
+            goal,
+        }]);
         for _ in 0..400 {
             sim.step(&[]);
             assert_no_wall_crossing(&sim, &walls);
@@ -2574,7 +2895,10 @@ mod tests {
         let goal = v(103.0, 100.0); // just inside the sealed right half
         let a = spawn(&mut sim, v(88.0, 100.0), 5.0, 300.0); // fast
         let b = spawn(&mut sim, v(94.0, 100.0), 5.0, 300.0);
-        sim.step(&[Command::Move { units: vec![a, b], goal }]);
+        sim.step(&[Command::Move {
+            units: vec![a, b],
+            goal,
+        }]);
         for _ in 0..120 {
             sim.step(&[]);
             assert_no_wall_crossing(&sim, &walls);
@@ -2599,7 +2923,10 @@ mod tests {
         let ids: Vec<_> = (0..4)
             .map(|i| spawn(&mut sim, v(15.0, 10.0 + 10.0 * i as f32), 5.0, 25.0))
             .collect();
-        sim.step(&[Command::Move { units: ids.clone(), goal }]);
+        sim.step(&[Command::Move {
+            units: ids.clone(),
+            goal,
+        }]);
 
         // Bend waypoint (the apex unit-0 would single-file through) fans out, one
         // distinct crossing per lane, monotone in spawn (lateral) order.
@@ -2674,12 +3001,18 @@ mod tests {
         let ids: Vec<_> = (0..10)
             .map(|i| spawn(&mut sim, v(15.0, 18.0 + 7.0 * i as f32), 5.0, 25.0))
             .collect();
-        sim.step(&[Command::Move { units: ids.clone(), goal }]);
+        sim.step(&[Command::Move {
+            units: ids.clone(),
+            goal,
+        }]);
         // The flock rounds the bottom (below y=30); no unit detours over the top
         // (above y=70) on a private route.
         for (k, &id) in ids.iter().enumerate() {
             let maxy = unit(&sim, id).path.iter().fold(0.0f32, |m, p| m.max(p.y));
-            assert!(maxy < 70.0, "unit {k} split to the far side of the obstacle: maxy {maxy}");
+            assert!(
+                maxy < 70.0,
+                "unit {k} split to the far side of the obstacle: maxy {maxy}"
+            );
         }
     }
 
@@ -2688,10 +3021,16 @@ mod tests {
     /// the gap (short straight route); big units must detour around an end.
     fn narrow_gap_map() -> (Vec<Vector2>, Vec<(u32, u32)>) {
         let pts = vec![
-            v(0.0, 0.0), v(200.0, 0.0), v(200.0, 100.0), v(0.0, 100.0),
-            v(100.0, 25.0), v(100.0, 45.0), v(100.0, 55.0), v(100.0, 75.0),
+            v(0.0, 0.0),
+            v(200.0, 0.0),
+            v(200.0, 100.0),
+            v(0.0, 100.0),
+            v(100.0, 25.0),
+            v(100.0, 45.0),
+            v(100.0, 55.0),
+            v(100.0, 75.0),
         ];
-        let cons = vec![(0,1),(1,2),(2,3),(3,0),(4,5),(6,7)];
+        let cons = vec![(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (6, 7)];
         (pts, cons)
     }
 
@@ -2725,7 +3064,10 @@ mod tests {
         // Big units can't fit the gap, so they detour past an end (below y=30).
         for &id in &big {
             let miny = unit(&sim, id).path.iter().fold(999.0f32, |m, p| m.min(p.y));
-            assert!(miny < 30.0, "big unit didn't detour around the end: miny {miny}");
+            assert!(
+                miny < 30.0,
+                "big unit didn't detour around the end: miny {miny}"
+            );
         }
         // Different sizes are separate flocks.
         assert_ne!(group_of(&sim, big[0]), group_of(&sim, small[0]));
@@ -2746,8 +3088,14 @@ mod tests {
         let all: Vec<_> = a.iter().chain(&b).copied().collect();
         sim.step(&[Command::Move { units: all, goal }]);
         let (ga, gb) = (group_of(&sim, a[0]), group_of(&sim, b[0]));
-        assert!(a.iter().all(|&id| group_of(&sim, id) == ga), "cluster A split");
-        assert!(b.iter().all(|&id| group_of(&sim, id) == gb), "cluster B split");
+        assert!(
+            a.iter().all(|&id| group_of(&sim, id) == ga),
+            "cluster A split"
+        );
+        assert!(
+            b.iter().all(|&id| group_of(&sim, id) == gb),
+            "cluster B split"
+        );
         assert_ne!(ga, gb, "far clusters must get distinct groups");
     }
 
@@ -2781,8 +3129,14 @@ mod tests {
         let b: Vec<_> = (0..4)
             .map(|i| spawn(&mut sim, v(15.0 + 6.0 * i as f32, 80.0), 5.0, 25.0))
             .collect();
-        sim.step(&[Command::Move { units: a.clone(), goal }]);
-        sim.step(&[Command::Move { units: b.clone(), goal }]);
+        sim.step(&[Command::Move {
+            units: a.clone(),
+            goal,
+        }]);
+        sim.step(&[Command::Move {
+            units: b.clone(),
+            goal,
+        }]);
         assert_ne!(group_of(&sim, a[0]), group_of(&sim, b[0]), "start distinct");
         step_n(&mut sim, 120);
         let g = group_of(&sim, a[0]);
@@ -2802,8 +3156,14 @@ mod tests {
         let b: Vec<_> = (0..3)
             .map(|i| spawn(&mut sim, v(40.0 + 6.0 * i as f32, 15.0), 5.0, 25.0))
             .collect();
-        sim.step(&[Command::Move { units: a.clone(), goal: v(85.0, 50.0) }]);
-        sim.step(&[Command::Move { units: b.clone(), goal: v(50.0, 85.0) }]);
+        sim.step(&[Command::Move {
+            units: a.clone(),
+            goal: v(85.0, 50.0),
+        }]);
+        sim.step(&[Command::Move {
+            units: b.clone(),
+            goal: v(50.0, 85.0),
+        }]);
         let (ga, gb) = (group_of(&sim, a[0]), group_of(&sim, b[0]));
         assert_ne!(ga, gb);
         for _ in 0..60 {
@@ -2821,8 +3181,14 @@ mod tests {
         let mut sim = Sim::new(points, &constraints, 1);
         let goal = v(175.0, 190.0);
         let id = spawn(&mut sim, v(15.0, 25.0), 5.0, 25.0);
-        sim.step(&[Command::Move { units: vec![id], goal }]);
-        assert!(unit(&sim, id).path.len() >= 2, "need an intermediate waypoint");
+        sim.step(&[Command::Move {
+            units: vec![id],
+            goal,
+        }]);
+        assert!(
+            unit(&sim, id).path.len() >= 2,
+            "need an intermediate waypoint"
+        );
         let corner = unit(&sim, id).path[0];
         let next = unit(&sim, id).path[1];
         // Teleport just past the corner toward the next waypoint (a crowd shove).
@@ -2860,7 +3226,11 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(script(), script(), "multi-cluster + merge must be deterministic");
+        assert_eq!(
+            script(),
+            script(),
+            "multi-cluster + merge must be deterministic"
+        );
     }
 }
 

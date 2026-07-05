@@ -359,7 +359,11 @@ pub fn clip_ray_to_walls(cdt: &CDT, a: Vector2, b: Vector2) -> Vector2 {
             let p0 = pts[cdt.he_origin(face * 3) as usize];
             let p1 = pts[cdt.he_origin(face * 3 + 1) as usize];
             let p2 = pts[cdt.he_origin(face * 3 + 2) as usize];
-            return if crate::delaunay::is_point_in_triangle(b, p0, p1, p2) { b } else { a };
+            return if crate::delaunay::is_point_in_triangle(b, p0, p1, p2) {
+                b
+            } else {
+                a
+            };
         }
         match cdt.he_twin(exit) {
             // Interior portal (a door): cross into the neighbour face.
@@ -1058,6 +1062,59 @@ pub(crate) fn closest_on_segment(p: Vector2, a: Vector2, b: Vector2) -> Vector2 
 #[inline(always)]
 fn dist_point_seg(p: Vector2, a: Vector2, b: Vector2) -> f32 {
     dist(p, closest_on_segment(p, a, b))
+}
+
+/// Minimum distance between segments `p1q1` and `p2q2` — for checking that a
+/// moving body's *swept path* (not just its endpoint) clears a wall, since a
+/// series of individually-valid endpoint positions can still sweep through a
+/// gap too tight for the body along the way. Endpoint-clamped closest points
+/// on each segment (Ericson, *Real-Time Collision Detection* §5.1.9); exact
+/// for non-degenerate segments, falls back to point/segment distance when
+/// either segment is a point.
+pub(crate) fn dist_segment_segment(p1: Vector2, q1: Vector2, p2: Vector2, q2: Vector2) -> f32 {
+    let d1 = q1 - p1;
+    let d2 = q2 - p2;
+    let r = p1 - p2;
+    let a = d1.x * d1.x + d1.y * d1.y;
+    let e = d2.x * d2.x + d2.y * d2.y;
+    let f = d2.x * r.x + d2.y * r.y;
+
+    let (s, t);
+    if a <= f32::EPSILON && e <= f32::EPSILON {
+        s = 0.0;
+        t = 0.0;
+    } else if a <= f32::EPSILON {
+        s = 0.0;
+        t = (f / e).clamp(0.0, 1.0);
+    } else {
+        let c = d1.x * r.x + d1.y * r.y;
+        if e <= f32::EPSILON {
+            t = 0.0;
+            s = (-c / a).clamp(0.0, 1.0);
+        } else {
+            let b = d1.x * d2.x + d1.y * d2.y;
+            let denom = a * e - b * b;
+            let s0 = if denom.abs() > f32::EPSILON {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let t0 = (b * s0 + f) / e;
+            if t0 < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t0 > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            } else {
+                t = t0;
+                s = s0;
+            }
+        }
+    }
+    let c1 = p1 + d1 * s;
+    let c2 = p2 + d2 * t;
+    dist(c1, c2)
 }
 
 #[inline(always)]
