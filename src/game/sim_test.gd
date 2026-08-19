@@ -7,8 +7,21 @@ const BUILDING_SIZE := Vector2(20, 20)
 const ACK_DURATION: float = 0.4
 const DRAG_THRESHOLD: float = 5.0
 
+## Per-team unit color, indexed by team id (wraps via modulo).
+const TEAM_COLORS: Array[Color] = [
+	Color(0.3, 0.6, 1.0),
+	Color(1.0, 0.35, 0.3),
+	Color(0.4, 0.9, 0.4),
+	Color(0.9, 0.8, 0.3),
+]
+
 @export var unit_radius: float = 5.0
 @export var unit_speed: float = 60.0
+@export var unit_team: int = 0
+@export var unit_max_health: float = 100.0
+@export var unit_damage: float = 10.0
+@export var unit_attack_range: float = 20.0
+@export var unit_attack_cooldown_ticks: int = 10
 
 ## Level source of truth, editable in-editor; doubles as the runtime debug
 ## view of the sim's live navmesh (hidden until the overlay is toggled on).
@@ -19,11 +32,16 @@ var _alpha: float = 0.0
 var _ids: PackedInt64Array
 var _positions: PackedVector2Array
 var _radii: PackedFloat32Array
+var _teams: PackedInt32Array
+var _healths: PackedFloat32Array
+var _max_healths: PackedFloat32Array
 var _selected: Dictionary = {}  # unit id -> true
 
 var _dragging: bool = false
 var _drag_start: Vector2
 var _drag_end: Vector2
+
+var _attack_move_armed: bool = false
 
 var _ack_pos: Vector2
 var _ack_time: float = -1.0
@@ -133,6 +151,9 @@ func _process(delta: float) -> void:
 	_ids = _sim.get_unit_ids()
 	_positions = _sim.get_positions(_alpha)
 	_radii = _sim.get_radii()
+	_teams = _sim.get_teams()
+	_healths = _sim.get_healths()
+	_max_healths = _sim.get_max_healths()
 	_prune_selection()
 	if _overlay:
 		_refresh_overlay()
@@ -195,7 +216,10 @@ func _unhandled_input(event: InputEvent) -> void:
 		match event.button_index:
 			MOUSE_BUTTON_LEFT:
 				if event.is_pressed():
-					if _build_mode:
+					if _attack_move_armed:
+						_attack_move_selected(world, event.shift_pressed)
+						_set_attack_move_armed(false)
+					elif _build_mode:
 						_place_building(world)
 					else:
 						_dragging = true
@@ -206,6 +230,11 @@ func _unhandled_input(event: InputEvent) -> void:
 					_select(world)
 			MOUSE_BUTTON_RIGHT:
 				if not event.is_pressed():
+					return
+				if _attack_move_armed:
+					_set_attack_move_armed(false)
+					if not _selected.is_empty():
+						_move_selected(world, event.shift_pressed)
 					return
 				if _build_mode:
 					_remove_building_at(world)
@@ -222,7 +251,14 @@ func _unhandled_input(event: InputEvent) -> void:
 		for i in count:
 			var r := sqrt(float(i + 0.5) / count) * pack_r
 			var a := i * golden_angle
-			_sim.spawn_unit(center + Vector2(cos(a), sin(a)) * r, unit_radius, unit_speed)
+			_sim.spawn_unit(center + Vector2(cos(a), sin(a)) * r, unit_radius, unit_speed,
+				unit_team, unit_max_health, unit_damage, unit_attack_range,
+				unit_attack_cooldown_ticks)
+	elif event.is_action_pressed("attack_move"):
+		if not _selected.is_empty():
+			_set_attack_move_armed(true)
+	elif event is InputEventKey and event.is_pressed() and event.keycode == KEY_ESCAPE:
+		_set_attack_move_armed(false)
 
 
 func _select(world: Vector2) -> void:
@@ -251,6 +287,30 @@ func _move_selected(goal: Vector2, queued: bool) -> void:
 	# Instant view-side ack, independent of sim latency.
 	_ack_pos = goal
 	_ack_time = ACK_DURATION
+
+
+func _attack_move_selected(goal: Vector2, queued: bool) -> void:
+	var ids := PackedInt64Array()
+	for id in _selected.keys():
+		ids.append(id)
+	if ids.is_empty():
+		return
+	if queued:
+		_sim.queue_attack_move(ids, goal)
+	else:
+		_sim.attack_move_units(ids, goal)
+	_ack_pos = goal
+	_ack_time = ACK_DURATION
+
+
+## Arms/disarms attack-move mode: while armed, the next LMB click issues an
+## attack-move order instead of a drag-select, and the system cursor changes
+## to signal it. RMB always disarms (see `_unhandled_input`).
+func _set_attack_move_armed(armed: bool) -> void:
+	if _attack_move_armed == armed:
+		return
+	_attack_move_armed = armed
+	Input.set_default_cursor_shape(Input.CURSOR_CROSS if armed else Input.CURSOR_ARROW)
 
 
 func _place_building(center: Vector2) -> void:
@@ -290,7 +350,8 @@ func _draw() -> void:
 		var pos := _positions[i]
 		if _selected.has(_ids[i]):
 			draw_arc(pos, _radii[i] + 2.0, 0, TAU, 24, Color.GREEN, 1.5)
-		draw_circle(pos, _radii[i], Color(0.3, 0.6, 1.0))
+		var team := _teams[i] if i < _teams.size() else 0
+		draw_circle(pos, _radii[i], _team_color(team))
 
 	if _dragging:
 		var rect := Rect2(_drag_start, Vector2.ZERO).expand(_drag_end)
@@ -301,6 +362,25 @@ func _draw() -> void:
 		_ack_time -= get_process_delta_time()
 		var t := _ack_time / ACK_DURATION
 		draw_arc(_ack_pos, 4.0 + 8.0 * t, 0, TAU, 16, Color(0.2, 1.0, 0.2, t), 2.0)
+
+	# Drawn last so a bar is never occluded by a neighboring unit's circle.
+	for i in _ids.size():
+		if i < _healths.size() and i < _max_healths.size() and _max_healths[i] > 0.0:
+			_draw_health_bar(_positions[i], _radii[i], _healths[i] / _max_healths[i])
+
+
+func _team_color(team: int) -> Color:
+	return TEAM_COLORS[team % TEAM_COLORS.size()]
+
+
+## Thin bar above a damaged unit; hidden at full health.
+func _draw_health_bar(pos: Vector2, radius: float, frac: float) -> void:
+	if frac >= 1.0:
+		return
+	var w := maxf(radius * 2.0, 10.0)
+	var top := pos + Vector2(-w / 2.0, -radius - 6.0)
+	draw_rect(Rect2(top, Vector2(w, 2.0)), Color(0.2, 0.2, 0.2, 0.8))
+	draw_rect(Rect2(top, Vector2(w * clampf(frac, 0.0, 1.0), 2.0)), Color.RED.lerp(Color.GREEN, frac))
 
 
 ## Faint cyan polyline + dots from each unit's current goal through its queued
@@ -411,6 +491,11 @@ func _build_keymap_ui(layer: CanvasLayer) -> void:
 		"Click (LMB) — select unit",
 		"RMB — move selected",
 		"Shift+RMB — queue move",
+		"A — arm attack-move (cursor changes)",
+		"LMB (armed) — attack-move to cursor",
+		"Shift+LMB (armed) — queue attack-move",
+		"RMB (armed) — cancel, issue normal move instead",
+		"Esc — cancel attack-move arm",
 		"LMB (build mode) — place building",
 		"RMB (build mode) — remove building",
 	]
@@ -483,6 +568,16 @@ func _build_controls_ui(layer: CanvasLayer) -> void:
 		func(v: float) -> void: unit_radius = v)
 	_add_prop_slider(content, "Speed", unit_speed, 10.0, 300.0, 5.0,
 		func(v: float) -> void: unit_speed = v)
+	_add_prop_slider(content, "Team", float(unit_team), 0.0, TEAM_COLORS.size() - 1.0, 1.0,
+		func(v: float) -> void: unit_team = int(v))
+	_add_prop_slider(content, "Max HP", unit_max_health, 1.0, 500.0, 5.0,
+		func(v: float) -> void: unit_max_health = v)
+	_add_prop_slider(content, "Damage", unit_damage, 0.0, 100.0, 1.0,
+		func(v: float) -> void: unit_damage = v)
+	_add_prop_slider(content, "Atk Range", unit_attack_range, 0.0, 200.0, 1.0,
+		func(v: float) -> void: unit_attack_range = v)
+	_add_prop_slider(content, "Atk CD", float(unit_attack_cooldown_ticks), 1.0, 120.0, 1.0,
+		func(v: float) -> void: unit_attack_cooldown_ticks = int(v))
 
 
 ## Sliders for the sim's runtime-tunable flocking/pathing constants

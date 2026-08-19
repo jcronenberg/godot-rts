@@ -75,6 +75,19 @@ pub static STALL_REPATH_TICKS: TunableU8 = TunableU8::new(3);
 /// Remaining-path-length improvement that counts as real progress (and resets
 /// the stall counter); below it the unit is treated as not advancing.
 pub static STALL_PROGRESS_EPS: TunableF32 = TunableF32::new(0.1);
+/// Multiple of a unit's own `attack_range` used as its attack-move
+/// acquisition radius — how far it "notices" an enemy before being in
+/// weapon range, so it starts closing the distance rather than only
+/// reacting once already adjacent.
+pub static ACQUISITION_RANGE_MULT: TunableF32 = TunableF32::new(3.0);
+/// Distance a chased target may drift from the anchor its current chase path
+/// was built toward before that path is rebuilt — chase-repath hysteresis,
+/// distance half (see [`CHASE_REPATH_TICKS`] for the time half).
+pub static CHASE_REPATH_DIST: TunableF32 = TunableF32::new(15.0);
+/// Ticks between forced chase-path rebuilds regardless of drift, so a target
+/// weaving right at [`CHASE_REPATH_DIST`] still gets a fresh path
+/// periodically.
+pub static CHASE_REPATH_TICKS: TunableU8 = TunableU8::new(15);
 
 /// Max `wall_clamp` passes per unit per tick before giving up as unresolved.
 /// Internal convergence detail, not a gameplay knob — plain const rather than
@@ -133,6 +146,9 @@ pub fn set_tuning(name: &str, value: f32) -> bool {
         "straight_fan_frac" => STRAIGHT_FAN_FRAC.set(value),
         "stall_repath_ticks" => STALL_REPATH_TICKS.set(value.round().clamp(0.0, 255.0) as u8),
         "stall_progress_eps" => STALL_PROGRESS_EPS.set(value),
+        "acquisition_range_mult" => ACQUISITION_RANGE_MULT.set(value),
+        "chase_repath_dist" => CHASE_REPATH_DIST.set(value),
+        "chase_repath_ticks" => CHASE_REPATH_TICKS.set(value.round().clamp(0.0, 255.0) as u8),
         _ => return false,
     }
     true
@@ -155,6 +171,9 @@ pub fn get_tuning(name: &str) -> Option<f32> {
         "straight_fan_frac" => STRAIGHT_FAN_FRAC.get(),
         "stall_repath_ticks" => STALL_REPATH_TICKS.get() as f32,
         "stall_progress_eps" => STALL_PROGRESS_EPS.get(),
+        "acquisition_range_mult" => ACQUISITION_RANGE_MULT.get(),
+        "chase_repath_dist" => CHASE_REPATH_DIST.get(),
+        "chase_repath_ticks" => CHASE_REPATH_TICKS.get() as f32,
         _ => return None,
     })
 }
@@ -256,6 +275,34 @@ pub struct Unit {
     /// Best (smallest) remaining path length seen since the path was set — the
     /// jitter-proof progress yardstick for the stall detector (`MAX` = unset).
     pub min_remaining: f32,
+    /// Team affiliation, stamped at spawn and immutable for now. Relations
+    /// between teams live on [`Sim`], not here (see [`Sim::relation`]).
+    pub team: u32,
+    pub max_health: f32,
+    pub health: f32,
+    pub damage: f32,
+    /// Surface-to-surface (centre distance minus both radii) engagement range.
+    pub attack_range: f32,
+    /// Ticks between attacks; authored and clamped to at least 1 at spawn (see
+    /// `combat_plan.md`'s "Combat stats" for why this stays in ticks).
+    pub attack_cooldown_ticks: u32,
+    /// Ticks remaining before this unit may fire again.
+    pub cooldown_left: u32,
+    /// Active combat target while executing `Attack` or an acquired
+    /// `AttackMove` engagement; `None` when idle or marching without a
+    /// target yet. Chase/fire state (in range or not) is derived from this
+    /// plus current positions, not stored separately.
+    pub target: Option<UnitId>,
+    /// March goal of the active `AttackMove` order, kept alongside `target`
+    /// so the march resumes once an acquired target dies. `None` while
+    /// executing a plain `Move` or `Attack`, or when idle.
+    pub attack_move_goal: Option<Vector2>,
+    /// Target position the current chase path was built toward, and a
+    /// countdown to the next scheduled rebuild — hysteresis so a moving
+    /// target doesn't trigger a repath every tick. Meaningless while `target`
+    /// is `None`.
+    pub chase_anchor: Vector2,
+    pub chase_repath_in: u8,
 }
 
 impl Unit {
@@ -385,11 +432,25 @@ impl Units {
 
 /// A task a unit works through. Units hold a FIFO queue of these; the front one
 /// drives behaviour until it completes, then the next begins (see
-/// [`Sim::advance_orders`]). Extend with `Attack`, `HoldPosition`, … — each new
+/// [`Sim::advance_orders`]). Extend with `HoldPosition`, … — each new
 /// variant adds an arm to [`Sim::begin_order`] and to the order hash/snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Order {
     Move { goal: Vector2 },
+    /// Engage one specific unit (right-click on an enemy). Completes (leaves
+    /// the attacker idle) when the target dies.
+    Attack { target: UnitId },
+    /// Walk toward `goal`, engaging the first enemy acquired along the way,
+    /// then resume marching once it dies.
+    AttackMove { goal: Vector2 },
+}
+
+/// Diplomatic stance between two teams; see [`Sim::relation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Relation {
+    Ally,
+    Enemy,
+    Neutral,
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -401,7 +462,12 @@ pub enum Command {
     Spawn {
         pos: Vector2,
         radius: f32,
-        speed: f32,
+        max_speed: f32,
+        team: u32,
+        max_health: f32,
+        damage: f32,
+        attack_range: f32,
+        attack_cooldown_ticks: u32,
     },
     /// Move now: clears each unit's order queue and paths immediately (a plain
     /// right-click that interrupts whatever the unit was doing).
@@ -409,8 +475,20 @@ pub enum Command {
         units: Vec<UnitId>,
         goal: Vector2,
     },
+    /// Attack now: as `Move`, but engages `target` directly instead of
+    /// pathing to a point.
+    Attack {
+        units: Vec<UnitId>,
+        target: UnitId,
+    },
+    /// Attack-move now: as `Move`, but engages the first enemy acquired en
+    /// route instead of marching straight through.
+    AttackMove {
+        units: Vec<UnitId>,
+        goal: Vector2,
+    },
     /// Append an order to each unit's queue (a shift-click). The general
-    /// queue-append seam — every future order type queues through here.
+    /// queue-append seam — every order type queues through here.
     Queue {
         units: Vec<UnitId>,
         order: Order,
@@ -421,6 +499,18 @@ pub enum Command {
     RemoveObstacle {
         id: ObstacleId,
     },
+    /// Override the default relation ("same team allied, different team
+    /// enemy") between two teams; symmetric, and a no-op for `a == b`.
+    SetRelation {
+        team_a: u32,
+        team_b: u32,
+        relation: Relation,
+    },
+    /// Debug/test seam: damage a unit directly, bypassing targeting and
+    /// range entirely. Goes through the same buffered-damage/despawn path
+    /// combat uses, so death and despawn can be exercised without any
+    /// combat logic running.
+    Damage { unit: UnitId, amount: f32 },
 }
 
 // ── Spatial grid (separation broad-phase) ─────────────────────────────────────
@@ -567,8 +657,34 @@ struct StepScratch {
     /// Wall-clamp: constrained half-edges near the unit this tick (gate
     /// prefilter, then per-pass discoveries; tiny per unit).
     clamp_walls: Vec<u32>,
-    /// Units the wall clamp found stuck this tick, to repath (usually empty).
+    /// Units the wall clamp — or a chase-path rebuild — found needing a
+    /// repath this tick (usually empty); both feed the same repath pass.
     repath: Vec<UnitId>,
+    /// Combat: acquisition results this tick, parallel (attacker, target).
+    /// Almost always empty — most ticks acquire nothing.
+    acquired_by: Vec<UnitId>,
+    acquired_target: Vec<UnitId>,
+    /// Combat: fire/chase decisions read against pre-tick state, applied in a
+    /// second pass (looking up a unit's target needs a second live borrow of
+    /// `units`, so decide-then-apply avoids aliasing).
+    combat_decisions: Vec<CombatDecision>,
+    /// Combat: buffered (target, damage) pairs from this tick's fire
+    /// resolution, applied after every unit has acted so two units that kill
+    /// each other the same tick both die (no attacker gets a slot-order edge).
+    damage: Vec<(UnitId, f32)>,
+    /// Combat: units whose health reached zero this tick, in slot order.
+    dead: Vec<UnitId>,
+}
+
+/// One unit's combat decision for the tick, computed read-only against
+/// pre-tick state in [`Sim::engage`] and applied afterward.
+struct CombatDecision {
+    id: UnitId,
+    fire: bool,
+    /// Target position at decision time; only meaningful when `!fire`.
+    target_pos: Vector2,
+    /// Only meaningful when `!fire`: whether the chase path needs rebuilding.
+    need_repath: bool,
 }
 
 pub struct Sim {
@@ -584,6 +700,11 @@ pub struct Sim {
     step_scratch: StepScratch,
     /// Monotonic group id; bumped per `Move`, stamped onto its units.
     group_seq: u32,
+    /// Team-relation overrides, keyed `(min(a,b), max(a,b))`. Point-queried
+    /// only (never iterated for a result), so insertion order doesn't affect
+    /// lookups — only `state_hash`, where it's read back in that same order.
+    /// Small (one entry per diplomacy change), so a linear scan beats a map.
+    relations: Vec<((u32, u32), Relation)>,
 }
 
 impl Sim {
@@ -603,6 +724,7 @@ impl Sim {
             grid: SpatialGrid::default(),
             step_scratch: StepScratch::default(),
             group_seq: 0,
+            relations: Vec::new(),
         }
     }
 
@@ -612,6 +734,24 @@ impl Sim {
 
     pub fn units(&self) -> &Units {
         &self.units
+    }
+
+    /// Diplomatic stance between two teams: an explicit override if one was
+    /// set via [`Command::SetRelation`], else the default rule (same team
+    /// allied, different team enemy).
+    pub fn relation(&self, a: u32, b: u32) -> Relation {
+        relation_of(&self.relations, a, b)
+    }
+
+    fn set_relation(&mut self, a: u32, b: u32, relation: Relation) {
+        if a == b {
+            return; // same-team relation is fixed Ally; ignore
+        }
+        let key = if a < b { (a, b) } else { (b, a) };
+        match self.relations.iter_mut().find(|(k, _)| *k == key) {
+            Some(entry) => entry.1 = relation,
+            None => self.relations.push((key, relation)),
+        }
     }
 
     pub fn navmesh(&self) -> &CDT {
@@ -627,9 +767,10 @@ impl Sim {
     ///
     /// Order: store prev positions → apply commands → rebuild navmesh if the
     /// obstacle set changed (refresh abstraction, repath all moving units) →
-    /// integrate along paths → flock (separation + cohesion) → start the next
+    /// integrate along paths → flock (separation + cohesion) → combat
+    /// (acquire, chase or fire, apply damage, despawn dead) → start the next
     /// queued order for any unit that just finished → wall clamp → repath units
-    /// stuck against a corner → advance tick.
+    /// stuck against a corner or mid-chase → advance tick.
     pub fn step(&mut self, commands: &[Command]) {
         for (_, u) in self.units.iter_mut() {
             u.prev_pos = u.pos;
@@ -640,6 +781,7 @@ impl Sim {
         let mesh_changed = self.rebuild_and_repath();
         self.integrate();
         self.flock();
+        self.combat();
         self.advance_orders();
         self.wall_clamp(mesh_changed);
         self.repath_stalled();
@@ -648,12 +790,21 @@ impl Sim {
 
     fn apply(&mut self, cmd: &Command) {
         match cmd {
-            Command::Spawn { pos, radius, speed } => {
+            Command::Spawn {
+                pos,
+                radius,
+                max_speed,
+                team,
+                max_health,
+                damage,
+                attack_range,
+                attack_cooldown_ticks,
+            } => {
                 self.units.spawn(Unit {
                     pos: *pos,
                     prev_pos: *pos,
                     radius: *radius,
-                    max_speed: *speed,
+                    max_speed: *max_speed,
                     path: Vec::new(),
                     path_i: 0,
                     orders: VecDeque::new(),
@@ -662,16 +813,34 @@ impl Sim {
                     arrival_r: 0.0,
                     stall: 0,
                     min_remaining: f32::MAX,
+                    team: *team,
+                    max_health: *max_health,
+                    health: *max_health,
+                    damage: *damage,
+                    // Negative range would make `engage`'s range check unsatisfiable forever.
+                    attack_range: attack_range.max(0.0),
+                    // A mis-authored zero cooldown would fire every tick
+                    // forever; clamp instead of trusting the caller.
+                    attack_cooldown_ticks: (*attack_cooldown_ticks).max(1),
+                    cooldown_left: 0,
+                    target: None,
+                    attack_move_goal: None,
+                    chase_anchor: Vector2::ZERO,
+                    chase_repath_in: 0,
                 });
             }
             Command::Move { units, goal } => {
                 // Plain move interrupts: drop any queued orders, path now.
-                for &id in units {
-                    if let Some(u) = self.units.get_mut(id) {
-                        u.orders.clear();
-                    }
-                }
+                self.interrupt_orders(units);
                 self.start_move(units, *goal);
+            }
+            Command::Attack { units, target } => {
+                self.interrupt_orders(units);
+                self.start_attack(units, *target);
+            }
+            Command::AttackMove { units, goal } => {
+                self.interrupt_orders(units);
+                self.start_attack_move(units, *goal);
             }
             Command::Queue { units, order } => {
                 for &id in units {
@@ -686,6 +855,27 @@ impl Sim {
             Command::RemoveObstacle { id } => {
                 self.nav.remove_obstacle(*id);
             }
+            Command::SetRelation {
+                team_a,
+                team_b,
+                relation,
+            } => {
+                self.set_relation(*team_a, *team_b, *relation);
+            }
+            Command::Damage { unit, amount } => {
+                self.step_scratch.damage.push((*unit, *amount));
+            }
+        }
+    }
+
+    /// Drop each unit's queued orders — the shared first step of every
+    /// "now" command (`Move`/`Attack`/`AttackMove`), which interrupts
+    /// whatever was queued behind the previous order.
+    fn interrupt_orders(&mut self, units: &[UnitId]) {
+        for &id in units {
+            if let Some(u) = self.units.get_mut(id) {
+                u.orders.clear();
+            }
         }
     }
 
@@ -696,10 +886,13 @@ impl Sim {
     /// fails line-of-sight (straggler / no useful channel) paths individually.
     /// See `group_pathing_plan.md`.
     fn start_move(&mut self, units: &[UnitId], goal: Vector2) {
-        // Live selected units, slot order (stable, deterministic).
+        // Live selected units, slot order (stable, deterministic). A fresh
+        // move interrupts any combat engagement, same as it clears a path.
         let mut sel: Vec<UnitId> = Vec::new();
         for &id in units {
-            if self.units.get(id).is_some() {
+            if let Some(u) = self.units.get_mut(id) {
+                u.target = None;
+                u.attack_move_goal = None;
                 sel.push(id);
             }
         }
@@ -910,6 +1103,49 @@ impl Sim {
     fn begin_order(&mut self, units: &[UnitId], order: &Order) {
         match order {
             Order::Move { goal } => self.start_move(units, *goal),
+            Order::Attack { target } => self.start_attack(units, *target),
+            Order::AttackMove { goal } => self.start_attack_move(units, *goal),
+        }
+    }
+
+    /// Begin engaging `target` directly: no acquisition, no march goal — the
+    /// order completes (leaving the attacker idle) once `target` dies. Chase
+    /// pathing is deferred to [`Sim::engage`]/[`Sim::repath_stalled`] like any
+    /// other combat path, so this just records the target and idles the path.
+    fn start_attack(&mut self, units: &[UnitId], target: UnitId) {
+        // Bail on a dead target (resolve_deaths only clears stale targets on
+        // ticks where something dies, so latching on here would soft-lock).
+        let Some(target_team) = self.units.get(target).map(|t| t.team) else {
+            return;
+        };
+        for &id in units {
+            let Some(unit) = self.units.get_mut(id) else {
+                continue;
+            };
+            // Same-team relation is fixed `Ally` (see `relation_of`), so this
+            // also rejects `id == target`: a unit can't be its own enemy.
+            if relation_of(&self.relations, unit.team, target_team) != Relation::Enemy {
+                continue;
+            }
+            unit.target = Some(target);
+            unit.attack_move_goal = None;
+            unit.group = 0;
+            unit.path.clear();
+            unit.path_i = 0;
+            unit.parked = false;
+        }
+    }
+
+    /// Begin marching toward `goal`, engaging the first enemy acquired along
+    /// the way. Reuses `start_move` for the march itself (clustering, group
+    /// id, channel pathing) — group ids stay per `Move`; acquisition later
+    /// breaks a unit out of its march individually rather than re-grouping.
+    fn start_attack_move(&mut self, units: &[UnitId], goal: Vector2) {
+        self.start_move(units, goal);
+        for &id in units {
+            if let Some(unit) = self.units.get_mut(id) {
+                unit.attack_move_goal = Some(goal);
+            }
         }
     }
 
@@ -919,10 +1155,15 @@ impl Sim {
     /// re-channels around the next waypoint instead of single-filing it;
     /// stragglers finishing a tick later re-merge via the flock merge pass.
     /// Deterministic: slot-order scan, exact-order batching, no map iteration.
+    ///
+    /// A unit with a live combat target isn't idle even with an empty path —
+    /// firing holds it stationary — so `target.is_some()` also excludes it,
+    /// or a queued order behind an `Attack`/`AttackMove` would cut the fight
+    /// short the moment it started firing instead of waiting for a kill.
     fn advance_orders(&mut self) {
         let mut batches: Vec<(Order, Vec<UnitId>)> = Vec::new();
         for (id, u) in self.units.iter() {
-            if u.is_moving() {
+            if u.is_moving() || u.target.is_some() {
                 continue;
             }
             let Some(order) = u.orders.front() else {
@@ -1018,9 +1259,10 @@ impl Sim {
                 }
             }
             if unit.path_i as usize >= unit.path.len() {
-                unit.path.clear();
-                unit.path_i = 0;
-                unit.parked = true; // reached the goal: seed for crowd-arrival
+                // A real march arrival (a chase path never runs out —
+                // `engage` clears it once in range, well before the unit
+                // would reach the target's exact position).
+                arrive_at_goal(unit);
             }
         }
     }
@@ -1175,10 +1417,9 @@ impl Sim {
         for i in 0..s.ids.len() {
             let unit = self.units.get_mut(s.ids[i]).expect("dense id alive");
             if s.arrive[i] {
-                // Stop where it is, against the cluster — don't drive to centre.
-                unit.path.clear();
-                unit.path_i = 0;
-                unit.parked = true;
+                // Stop where it is, against the cluster — don't drive to
+                // centre. Crowd-arrival also completes the march order.
+                arrive_at_goal(unit);
             }
             let mut d = s.disp[i];
             if !s.arrive[i] && s.coh_n[i] > 0 {
@@ -1271,6 +1512,236 @@ impl Sim {
             }
         }
         self.step_scratch.merge_pairs.clear();
+    }
+
+    /// Acquire targets, chase-or-fire, apply buffered damage and despawn the
+    /// dead. Slots in after `flock` and before `advance_orders` so an order
+    /// completing because its target died is retired the same tick.
+    fn combat(&mut self) {
+        self.acquire_targets();
+        self.engage();
+        self.resolve_deaths();
+    }
+
+    /// For every attack-moving unit without a target, scan the flock grid
+    /// (already rebuilt this tick by [`Sim::flock`], so this is a reuse, not
+    /// a second broad-phase build) for the nearest eligible enemy within
+    /// acquisition range and lock onto it.
+    ///
+    /// Candidate filter: alive, enemy by relation, within acquisition range,
+    /// clear line of sight at the attacker's radius. Tie-break is nearest
+    /// first, then lowest slot index (`UnitId`'s derived `Ord` sorts by index
+    /// before generation) — deterministic regardless of grid scan order.
+    fn acquire_targets(&mut self) {
+        let s = &mut self.step_scratch;
+        s.acquired_by.clear();
+        s.acquired_target.clear();
+        if s.ids.len() < 2 {
+            return;
+        }
+        let cdt = self.nav.navmesh();
+        for i in 0..s.ids.len() {
+            let id = s.ids[i];
+            let Some(unit) = self.units.get(id) else {
+                continue;
+            };
+            if unit.target.is_some() || unit.attack_move_goal.is_none() || unit.attack_range <= 0.0
+            {
+                continue;
+            }
+            let acq_range = unit.attack_range * ACQUISITION_RANGE_MULT.get();
+            let (team, radius, pos) = (unit.team, unit.radius, unit.pos);
+            let (cx, cy) = self.grid.cell_coords(s.positions[i]);
+            // Clamp to the grid's extent: scanning further is a no-op, and it
+            // keeps `cy + rings` / `cx + rings` safe from overflow.
+            let rings = ((acq_range * self.grid.inv_cell).ceil() as u32)
+                .max(1)
+                .min(self.grid.rows.max(self.grid.cols));
+            let mut best: Option<(f32, UnitId)> = None;
+            for ny in cy.saturating_sub(rings)..=(cy + rings).min(self.grid.rows - 1) {
+                for nx in cx.saturating_sub(rings)..=(cx + rings).min(self.grid.cols - 1) {
+                    for &j in self.grid.cell_entries(nx, ny) {
+                        let cand_id = s.ids[j as usize];
+                        if cand_id == id {
+                            continue;
+                        }
+                        let Some(cand) = self.units.get(cand_id) else {
+                            continue;
+                        };
+                        if relation_of(&self.relations, team, cand.team) != Relation::Enemy {
+                            continue;
+                        }
+                        let delta = cand.pos - pos;
+                        let surf = (delta.length() - radius - cand.radius).max(0.0);
+                        if surf > acq_range {
+                            continue;
+                        }
+                        if !clear_los(cdt, pos, cand.pos, radius) {
+                            continue;
+                        }
+                        let better = match best {
+                            None => true,
+                            Some((bd, bid)) => surf < bd || (surf == bd && cand_id < bid),
+                        };
+                        if better {
+                            best = Some((surf, cand_id));
+                        }
+                    }
+                }
+            }
+            if let Some((_, target_id)) = best {
+                s.acquired_by.push(id);
+                s.acquired_target.push(target_id);
+            }
+        }
+        for k in 0..self.step_scratch.acquired_by.len() {
+            let (id, target_id) = (
+                self.step_scratch.acquired_by[k],
+                self.step_scratch.acquired_target[k],
+            );
+            let Some(target_pos) = self.units.get(target_id).map(|t| t.pos) else {
+                continue;
+            };
+            if let Some(unit) = self.units.get_mut(id) {
+                unit.target = Some(target_id);
+                unit.path = vec![target_pos];
+                unit.path_i = 0;
+                unit.chase_anchor = target_pos;
+                unit.chase_repath_in = CHASE_REPATH_TICKS.get();
+            }
+            self.step_scratch.repath.push(id);
+        }
+    }
+
+    /// For every unit with a live target: fire if in range (stop, tick the
+    /// cooldown, buffer damage on zero), else chase (path toward the
+    /// target's current position, rebuilding only past the hysteresis
+    /// threshold). Decisions are computed read-only first — resolving a
+    /// unit's target needs a second live borrow of `units` — then applied.
+    fn engage(&mut self) {
+        let s = &mut self.step_scratch;
+        s.combat_decisions.clear();
+        for i in 0..s.ids.len() {
+            let id = s.ids[i];
+            let Some(unit) = self.units.get(id) else {
+                continue;
+            };
+            let Some(target_id) = unit.target else {
+                continue;
+            };
+            let Some(target) = self.units.get(target_id) else {
+                continue; // stale; cleaned up in resolve_deaths
+            };
+            let delta = target.pos - unit.pos;
+            let surf = (delta.length() - unit.radius - target.radius).max(0.0);
+            if surf <= unit.attack_range {
+                s.combat_decisions.push(CombatDecision {
+                    id,
+                    fire: true,
+                    target_pos: target.pos,
+                    need_repath: false,
+                });
+            } else {
+                let drift = target.pos - unit.chase_anchor;
+                let need_repath = unit.path.is_empty()
+                    || drift.length_squared()
+                        > CHASE_REPATH_DIST.get() * CHASE_REPATH_DIST.get()
+                    || unit.chase_repath_in == 0;
+                s.combat_decisions.push(CombatDecision {
+                    id,
+                    fire: false,
+                    target_pos: target.pos,
+                    need_repath,
+                });
+            }
+        }
+        for i in 0..self.step_scratch.combat_decisions.len() {
+            let (id, fire, target_pos, need_repath) = {
+                let d = &self.step_scratch.combat_decisions[i];
+                (d.id, d.fire, d.target_pos, d.need_repath)
+            };
+            let Some(unit) = self.units.get_mut(id) else {
+                continue;
+            };
+            if fire {
+                unit.path.clear();
+                unit.path_i = 0;
+                if unit.cooldown_left == 0 {
+                    let dmg = unit.damage;
+                    let target_id = unit.target.expect("fire decision implies a target");
+                    self.step_scratch.damage.push((target_id, dmg));
+                    unit.cooldown_left = unit.attack_cooldown_ticks.saturating_sub(1);
+                } else {
+                    unit.cooldown_left -= 1;
+                }
+            } else if need_repath {
+                unit.path = vec![target_pos];
+                unit.path_i = 0;
+                unit.chase_anchor = target_pos;
+                unit.chase_repath_in = CHASE_REPATH_TICKS.get();
+                self.step_scratch.repath.push(id);
+            } else {
+                unit.chase_repath_in = unit.chase_repath_in.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Apply this tick's buffered damage, despawn anything at or below zero
+    /// health (slot order, so two units that kill each other the same tick
+    /// both die — buffered above for the same reason), then clear any
+    /// now-stale target references and resume the march for attack-movers
+    /// whose target just died. The cleanup scan only runs when something
+    /// actually died: a target reference can only go stale via a despawn,
+    /// and every despawn is handled the same tick it happens, so a quiet
+    /// tick has nothing to clean up.
+    fn resolve_deaths(&mut self) {
+        let s = &mut self.step_scratch;
+        s.dead.clear();
+        // Health only changes via the damage buffer, so no damage means no new deaths.
+        if s.damage.is_empty() {
+            return;
+        }
+        for &(target, dmg) in s.damage.iter() {
+            if let Some(u) = self.units.get_mut(target) {
+                u.health -= dmg;
+            }
+        }
+        s.damage.clear();
+        for (id, u) in self.units.iter() {
+            if u.health <= 0.0 {
+                s.dead.push(id);
+            }
+        }
+        if s.dead.is_empty() {
+            return;
+        }
+        for i in 0..self.step_scratch.dead.len() {
+            let id = self.step_scratch.dead[i];
+            self.units.despawn(id);
+        }
+        // A stale target either just goes idle, or — for an attack-mover —
+        // resumes its march; `start_attack_move` clears `target` itself, so
+        // only the idle case needs the write done here.
+        let mut idle: Vec<UnitId> = Vec::new();
+        let mut resume_march: Vec<(UnitId, Vector2)> = Vec::new();
+        for (id, u) in self.units.iter() {
+            if let Some(t) = u.target
+                && self.units.get(t).is_none()
+            {
+                match u.attack_move_goal {
+                    Some(goal) => resume_march.push((id, goal)),
+                    None => idle.push(id),
+                }
+            }
+        }
+        for id in idle {
+            if let Some(u) = self.units.get_mut(id) {
+                u.target = None;
+            }
+        }
+        for (id, goal) in resume_march {
+            self.start_attack_move(&[id], goal);
+        }
     }
 
     /// Collect (dedup) every constrained half-edge within `radius` of `p` into
@@ -1541,6 +2012,12 @@ impl Sim {
         h.write_u64(self.tick);
         h.write_u64(self.group_seq as u64);
         h.write_u64(self.nav.num_obstacles() as u64);
+        h.write_u64(self.relations.len() as u64);
+        for &((a, b), rel) in &self.relations {
+            h.write_u64(a as u64);
+            h.write_u64(b as u64);
+            h.write_u64(rel as u64);
+        }
         h.write_u64(self.units.slots.len() as u64);
         for (i, slot) in self.units.slots.iter().enumerate() {
             h.write_u64(self.units.generations[i] as u64);
@@ -1562,11 +2039,36 @@ impl Sim {
             for &p in &u.path {
                 h.write_v2(p);
             }
+            h.write_u64(u.team as u64);
+            h.write_f32(u.max_health);
+            h.write_f32(u.health);
+            h.write_f32(u.damage);
+            h.write_f32(u.attack_range);
+            h.write_u64(u.attack_cooldown_ticks as u64);
+            h.write_u64(u.cooldown_left as u64);
+            h.write_u64(u.target.map_or(u64::MAX, |t| t.raw()));
+            match u.attack_move_goal {
+                Some(g) => {
+                    h.write_u64(1);
+                    h.write_v2(g);
+                }
+                None => h.write_u64(0),
+            }
+            h.write_v2(u.chase_anchor);
+            h.write_u64(u.chase_repath_in as u64);
             h.write_u64(u.orders.len() as u64);
             for order in &u.orders {
                 match order {
                     Order::Move { goal } => {
                         h.write_u64(0);
+                        h.write_v2(*goal);
+                    }
+                    Order::Attack { target } => {
+                        h.write_u64(1);
+                        h.write_u64(target.raw());
+                    }
+                    Order::AttackMove { goal } => {
+                        h.write_u64(2);
                         h.write_v2(*goal);
                     }
                 }
@@ -1575,6 +2077,20 @@ impl Sim {
         self.rng.hash_into(&mut h);
         h.0
     }
+}
+
+/// Core of [`Sim::relation`], as a free function over just the override
+/// table — lets combat's inner loops (which hold a mutable borrow of
+/// `step_scratch`) query relations without needing a whole-`&self` borrow.
+fn relation_of(relations: &[((u32, u32), Relation)], a: u32, b: u32) -> Relation {
+    if a == b {
+        return Relation::Ally;
+    }
+    let key = if a < b { (a, b) } else { (b, a) };
+    relations
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map_or(Relation::Enemy, |&(_, r)| r)
 }
 
 fn norm(v: Vector2) -> Vector2 {
@@ -1698,6 +2214,21 @@ fn set_path(unit: &mut Unit, mut path: Vec<Vector2>) {
     }
 }
 
+/// Settle a unit at its current position: clear the path and mark it parked
+/// (the seed for crowd-arrival), and — unless it's mid-combat — clear a
+/// stale attack-move goal, since reaching it is also how an `AttackMove`
+/// completes. Shared by [`Sim::integrate`] (ran out of waypoints) and
+/// [`Sim::flock`] (crowd-arrival touched a parked group-mate): both are
+/// "reached the goal", just detected differently.
+fn arrive_at_goal(unit: &mut Unit) {
+    unit.path.clear();
+    unit.path_i = 0;
+    unit.parked = true;
+    if unit.target.is_none() {
+        unit.attack_move_goal = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1712,10 +2243,43 @@ mod tests {
         Sim::new(points, &constraints, seed)
     }
 
-    /// Spawn now and return the id (commands carry no return channel).
+    /// Spawn now and return the id (commands carry no return channel). No
+    /// combat stats: team 0, huge health, harmless — the ~40 movement tests
+    /// go through this and shouldn't have to know about combat.
     fn spawn(sim: &mut Sim, pos: Vector2, radius: f32, speed: f32) -> UnitId {
-        sim.step(&[Command::Spawn { pos, radius, speed }]);
+        spawn_stats(sim, pos, radius, speed, 0, f32::MAX, 0.0, 0.0, 1)
+    }
+
+    /// Spawn now with full combat stats and return the id.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_stats(
+        sim: &mut Sim,
+        pos: Vector2,
+        radius: f32,
+        speed: f32,
+        team: u32,
+        max_health: f32,
+        damage: f32,
+        attack_range: f32,
+        attack_cooldown_ticks: u32,
+    ) -> UnitId {
+        sim.step(&[Command::Spawn {
+            pos,
+            radius,
+            max_speed: speed,
+            team,
+            max_health,
+            damage,
+            attack_range,
+            attack_cooldown_ticks,
+        }]);
         sim.units().iter().last().unwrap().0
+    }
+
+    /// Spawn on team 1 (enemy of team 0 by the default rule) with combat
+    /// stats reasonable for direct-attack/attack-move tests.
+    fn spawn_enemy(sim: &mut Sim, pos: Vector2, radius: f32, speed: f32) -> UnitId {
+        spawn_stats(sim, pos, radius, speed, 1, 20.0, 5.0, 8.0, 5)
     }
 
     fn unit(sim: &Sim, id: UnitId) -> &Unit {
@@ -2026,7 +2590,7 @@ mod tests {
 
     #[test]
     fn test_determinism_same_stream_same_hashes() {
-        let script = |sim: &mut Sim| {
+        let script = |sim: &mut Sim| -> (Vec<u64>, usize) {
             let mut hashes = Vec::new();
             let mut ids = Vec::new();
             for t in 0..120u32 {
@@ -2035,15 +2599,33 @@ mod tests {
                     cmds.push(Command::Spawn {
                         pos: v(20.0 + 7.0 * t as f32, 30.0 + 5.0 * (t % 3) as f32),
                         radius: 5.0,
-                        speed: 20.0 + t as f32,
+                        max_speed: 20.0 + t as f32,
+                        team: t % 2,
+                        max_health: 30.0,
+                        damage: 4.0,
+                        attack_range: 6.0,
+                        attack_cooldown_ticks: 6,
                     });
                 }
                 if t == 25 {
                     ids = sim.units().iter().map(|(id, _)| id).collect();
-                    cmds.push(Command::Move {
-                        units: ids.clone(),
-                        goal: v(250.0, 150.0),
-                    });
+                    // Pair each team-0 unit directly against a team-1 unit so
+                    // they clash mid-stream regardless of where a march would
+                    // have taken them — kills exercise death, cooldown and
+                    // target-handle hashing, not just movement.
+                    let (team0, team1): (Vec<UnitId>, Vec<UnitId>) = ids
+                        .iter()
+                        .partition(|&&id| sim.units().get(id).unwrap().team == 0);
+                    for (&x, &y) in team0.iter().zip(team1.iter()) {
+                        cmds.push(Command::Attack {
+                            units: vec![x],
+                            target: y,
+                        });
+                        cmds.push(Command::Attack {
+                            units: vec![y],
+                            target: x,
+                        });
+                    }
                     // Queue a follow-on order so the order queue is hashed too.
                     cmds.push(Command::Queue {
                         units: ids.clone(),
@@ -2076,14 +2658,19 @@ mod tests {
                 sim.step(&cmds);
                 hashes.push(sim.state_hash());
             }
-            hashes
+            (hashes, sim.units().len())
         };
         let a = script(&mut rooms_sim(3, 3, 42));
         let b = script(&mut rooms_sim(3, 3, 42));
         assert_eq!(a, b, "same command stream must reproduce every tick hash");
+        assert!(
+            a.1 < 20,
+            "the mid-stream clash must actually kill someone (population {}), or deaths/cooldowns/target handles never exercise state_hash",
+            a.1
+        );
 
         let c = script(&mut rooms_sim(3, 3, 43));
-        assert_eq!(a.len(), c.len());
+        assert_eq!(a.0.len(), c.0.len());
     }
 
     #[test]
@@ -2288,7 +2875,12 @@ mod tests {
                 // 8 columns * 3px stay well clear of the wall at x=150.
                 pos: v(115.0 + 3.0 * (i % 8) as f32, 20.0 + 4.0 * (i / 8) as f32),
                 radius: 5.0,
-                speed: 60.0,
+                max_speed: 60.0,
+                team: 0,
+                max_health: f32::MAX,
+                damage: 0.0,
+                attack_range: 0.0,
+                attack_cooldown_ticks: 1,
             })
             .collect();
         sim.step(&spawn_cmds);
@@ -2329,7 +2921,12 @@ mod tests {
                 // Columns stay well clear (max x=133.5) of the wall at x=150.
                 pos: v(120.0 + 1.5 * (i % 10) as f32, 20.0 + 3.0 * (i / 10) as f32),
                 radius: 5.0,
-                speed: 80.0,
+                max_speed: 80.0,
+                team: 0,
+                max_health: f32::MAX,
+                damage: 0.0,
+                attack_range: 0.0,
+                attack_cooldown_ticks: 1,
             })
             .collect();
         sim.step(&spawn_cmds);
@@ -2736,39 +3333,43 @@ mod tests {
         assert_eq!(UnitId::from_raw(id.raw()), id);
     }
 
+    /// A minimal, harmless `Unit` at `pos` for tests that exercise `Units`
+    /// storage directly rather than going through `Sim`.
+    fn bare_unit(pos: Vector2) -> Unit {
+        Unit {
+            pos,
+            prev_pos: pos,
+            radius: 1.0,
+            max_speed: 1.0,
+            path: Vec::new(),
+            path_i: 0,
+            orders: VecDeque::new(),
+            group: 0,
+            parked: false,
+            arrival_r: 0.0,
+            stall: 0,
+            min_remaining: f32::MAX,
+            team: 0,
+            max_health: 1.0,
+            health: 1.0,
+            damage: 0.0,
+            attack_range: 0.0,
+            attack_cooldown_ticks: 1,
+            cooldown_left: 0,
+            target: None,
+            attack_move_goal: None,
+            chase_anchor: Vector2::ZERO,
+            chase_repath_in: 0,
+        }
+    }
+
     #[test]
     fn test_slot_reuse_bumps_generation() {
         let mut units = Units::default();
-        let a = units.spawn(Unit {
-            pos: Vector2::ZERO,
-            prev_pos: Vector2::ZERO,
-            radius: 1.0,
-            max_speed: 1.0,
-            path: Vec::new(),
-            path_i: 0,
-            orders: VecDeque::new(),
-            group: 0,
-            parked: false,
-            arrival_r: 0.0,
-            stall: 0,
-            min_remaining: f32::MAX,
-        });
+        let a = units.spawn(bare_unit(Vector2::ZERO));
         assert!(units.despawn(a));
         assert!(!units.despawn(a), "double despawn must fail");
-        let b = units.spawn(Unit {
-            pos: Vector2::ONE,
-            prev_pos: Vector2::ONE,
-            radius: 1.0,
-            max_speed: 1.0,
-            path: Vec::new(),
-            path_i: 0,
-            orders: VecDeque::new(),
-            group: 0,
-            parked: false,
-            arrival_r: 0.0,
-            stall: 0,
-            min_remaining: f32::MAX,
-        });
+        let b = units.spawn(bare_unit(Vector2::ONE));
         assert_eq!(a.index, b.index);
         assert_ne!(a.generation, b.generation);
         assert!(units.get(a).is_none());
@@ -3205,6 +3806,387 @@ mod tests {
             "multi-cluster + merge must be deterministic"
         );
     }
+
+    // ── Combat (teams, stats, targeting, engagement) ─────────────────────────
+
+    #[test]
+    fn test_relation_default_and_override_round_trips() {
+        let mut sim = rooms_sim(1, 1, 1);
+        assert_eq!(sim.relation(0, 0), Relation::Ally);
+        assert_eq!(sim.relation(0, 1), Relation::Enemy);
+        assert_eq!(sim.relation(1, 0), Relation::Enemy, "must be symmetric");
+        sim.step(&[Command::SetRelation {
+            team_a: 0,
+            team_b: 1,
+            relation: Relation::Ally,
+        }]);
+        assert_eq!(sim.relation(0, 1), Relation::Ally);
+        assert_eq!(
+            sim.relation(1, 0),
+            Relation::Ally,
+            "override must be symmetric too"
+        );
+        // An unrelated pair keeps the default rule.
+        assert_eq!(sim.relation(0, 2), Relation::Enemy);
+    }
+
+    #[test]
+    fn test_mixed_teams_do_not_perturb_movement() {
+        // Same movement scenario, once with every unit on team 0 and once
+        // split across four teams: final positions must match exactly. Not a
+        // `state_hash` comparison — team is itself hashed, so that would
+        // trivially differ; this compares the movement outcome instead.
+        let run = |teams: [u32; 4]| -> Vec<Vector2> {
+            let mut sim = rooms_sim(3, 3, 9);
+            let mut ids = Vec::new();
+            for (i, &team) in teams.iter().enumerate() {
+                ids.push(spawn_stats(
+                    &mut sim,
+                    v(30.0 + 20.0 * i as f32, 40.0),
+                    5.0,
+                    25.0,
+                    team,
+                    f32::MAX,
+                    0.0,
+                    0.0,
+                    1,
+                ));
+            }
+            sim.step(&[Command::Move {
+                units: ids.clone(),
+                goal: v(200.0, 200.0),
+            }]);
+            step_n(&mut sim, 150);
+            ids.iter().map(|&id| unit(&sim, id).pos).collect()
+        };
+        assert_eq!(run([0, 0, 0, 0]), run([0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn test_zero_cooldown_clamped_to_one() {
+        let mut sim = rooms_sim(1, 1, 1);
+        let id = spawn_stats(&mut sim, v(50.0, 50.0), 5.0, 20.0, 0, 10.0, 1.0, 5.0, 0);
+        assert_eq!(unit(&sim, id).attack_cooldown_ticks, 1);
+    }
+
+    #[test]
+    fn test_damage_drives_health_down_despawns_and_bumps_generation() {
+        let mut sim = rooms_sim(1, 1, 1);
+        let a = spawn_stats(&mut sim, v(50.0, 50.0), 5.0, 20.0, 0, 10.0, 0.0, 0.0, 1);
+        sim.step(&[Command::Damage {
+            unit: a,
+            amount: 4.0,
+        }]);
+        assert_eq!(unit(&sim, a).health, 6.0, "damage must drive health down");
+        sim.step(&[Command::Damage {
+            unit: a,
+            amount: 6.0,
+        }]);
+        assert!(
+            sim.units().get(a).is_none(),
+            "id must go stale once health reaches zero"
+        );
+        let b = spawn_stats(&mut sim, v(60.0, 60.0), 5.0, 20.0, 0, 10.0, 0.0, 0.0, 1);
+        assert_eq!(a.index, b.index, "slot must be reused");
+        assert_ne!(
+            a.generation, b.generation,
+            "a combat death must bump the generation like an explicit despawn"
+        );
+    }
+
+    #[test]
+    fn test_attack_closes_to_range_and_stops() {
+        let mut sim = rooms_sim(3, 1, 1);
+        let attacker = spawn_stats(&mut sim, v(30.0, 50.0), 5.0, 30.0, 0, 100.0, 5.0, 8.0, 5);
+        // Huge health: this test is about closing distance, not the kill.
+        let target = spawn_stats(&mut sim, v(220.0, 50.0), 5.0, 0.0, 1, 1.0e6, 0.0, 0.0, 1);
+        sim.step(&[Command::Attack {
+            units: vec![attacker],
+            target,
+        }]);
+        step_n(&mut sim, 400);
+        let (a, t) = (unit(&sim, attacker), unit(&sim, target));
+        let surf = dist(a.pos, t.pos) - a.radius - t.radius;
+        assert!(
+            surf <= a.attack_range + 0.5,
+            "must close to within attack range: {surf}"
+        );
+        assert!(!a.is_moving(), "must stop once in range");
+    }
+
+    #[test]
+    fn test_queued_order_waits_for_attack_to_finish_even_while_firing() {
+        // A firing unit has an empty path (stationary), same as an idle one —
+        // `advance_orders` must not mistake that for "done" and start a
+        // queued order out from under an active fight.
+        let mut sim = rooms_sim(1, 1, 1);
+        let attacker = spawn_stats(&mut sim, v(50.0, 50.0), 5.0, 20.0, 0, 100.0, 4.0, 20.0, 6);
+        let target = spawn_stats(&mut sim, v(60.0, 50.0), 5.0, 0.0, 1, 1.0e6, 0.0, 0.0, 1);
+        sim.step(&[Command::Attack {
+            units: vec![attacker],
+            target,
+        }]); // already in range: fires and goes stationary this very tick
+        sim.step(&[Command::Queue {
+            units: vec![attacker],
+            order: Order::Move { goal: v(20.0, 20.0) },
+        }]);
+        step_n(&mut sim, 20);
+        let a = unit(&sim, attacker);
+        assert_eq!(
+            a.target,
+            Some(target),
+            "a firing unit must not look idle to advance_orders"
+        );
+        assert_eq!(a.orders.len(), 1, "queued move must wait for the kill");
+        assert_eq!(a.pos, v(50.0, 50.0), "must not wander toward the queued goal");
+    }
+
+    #[test]
+    fn test_damage_lands_only_on_cooldown_boundaries() {
+        let mut sim = rooms_sim(1, 1, 1);
+        let cooldown = 6u32;
+        let dmg = 4.0f32;
+        let attacker =
+            spawn_stats(&mut sim, v(50.0, 50.0), 5.0, 20.0, 0, 100.0, dmg, 20.0, cooldown);
+        let target = spawn_stats(&mut sim, v(70.0, 50.0), 5.0, 0.0, 1, 1.0e6, 0.0, 0.0, 1);
+        let health_before = unit(&sim, target).health;
+        // Already in range: fires the same tick, no chase to fold in.
+        sim.step(&[Command::Attack {
+            units: vec![attacker],
+            target,
+        }]);
+        assert!(!unit(&sim, attacker).is_moving(), "already in range");
+        let periods = 10;
+        step_n(&mut sim, cooldown as usize * periods);
+        let fires = periods as f32 + 1.0; // the immediate fire, plus one per full period
+        assert_eq!(
+            unit(&sim, target).health,
+            health_before - fires * dmg,
+            "damage must land exactly on cooldown boundaries"
+        );
+    }
+
+    #[test]
+    fn test_simultaneous_mutual_kill_both_die() {
+        let mut sim = rooms_sim(1, 1, 1);
+        // Lethal in one hit each, already in range: no attacker may get a
+        // slot-order edge — both must die the same tick.
+        let a = spawn_stats(&mut sim, v(50.0, 50.0), 5.0, 20.0, 0, 5.0, 10.0, 20.0, 1);
+        let b = spawn_stats(&mut sim, v(60.0, 50.0), 5.0, 20.0, 1, 5.0, 10.0, 20.0, 1);
+        sim.step(&[
+            Command::Attack {
+                units: vec![a],
+                target: b,
+            },
+            Command::Attack {
+                units: vec![b],
+                target: a,
+            },
+        ]);
+        assert!(sim.units().get(a).is_none(), "a must die");
+        assert!(sim.units().get(b).is_none(), "b must die");
+    }
+
+    #[test]
+    fn test_acquisition_ignores_allies() {
+        let mut sim = rooms_sim(1, 1, 1);
+        // Same team, close enough to be well within acquisition range at the
+        // closest approach, but off the direct path (not blocking): never
+        // acquired or damaged even as the mover passes near it.
+        let ally = spawn_stats(&mut sim, v(60.0, 65.0), 5.0, 0.0, 0, 10.0, 0.0, 0.0, 1);
+        let mover = spawn_stats(&mut sim, v(30.0, 50.0), 5.0, 20.0, 0, 10.0, 5.0, 8.0, 5);
+        sim.step(&[Command::AttackMove {
+            units: vec![mover],
+            goal: v(90.0, 50.0),
+        }]);
+        step_n(&mut sim, 200);
+        assert!(
+            unit(&sim, mover).target.is_none(),
+            "ally must never be acquired"
+        );
+        assert_eq!(unit(&sim, ally).health, 10.0, "ally must never take damage");
+        assert_eq!(unit(&sim, mover).pos, v(90.0, 50.0), "must reach the goal");
+    }
+
+    #[test]
+    fn test_direct_attack_on_ally_is_rejected() {
+        let mut sim = rooms_sim(1, 1, 1);
+        let attacker = spawn_stats(&mut sim, v(50.0, 50.0), 5.0, 20.0, 0, 100.0, 5.0, 8.0, 1);
+        let ally = spawn_stats(&mut sim, v(55.0, 50.0), 5.0, 0.0, 0, 10.0, 0.0, 0.0, 1);
+        sim.step(&[Command::Attack {
+            units: vec![attacker],
+            target: ally,
+        }]);
+        step_n(&mut sim, 20);
+        assert!(
+            unit(&sim, attacker).target.is_none(),
+            "ally must never be locked onto as a target"
+        );
+        assert_eq!(unit(&sim, ally).health, 10.0, "ally must never take damage");
+    }
+
+    #[test]
+    fn test_direct_attack_on_dead_target_does_not_softlock() {
+        let mut sim = rooms_sim(1, 1, 1);
+        let target = spawn_stats(&mut sim, v(60.0, 50.0), 5.0, 0.0, 1, 1.0, 0.0, 0.0, 1);
+        sim.step(&[Command::Damage {
+            unit: target,
+            amount: 5.0,
+        }]);
+        assert!(sim.units().get(target).is_none(), "target must be dead");
+        let attacker = spawn_stats(&mut sim, v(50.0, 50.0), 5.0, 20.0, 0, 100.0, 5.0, 8.0, 1);
+        sim.step(&[Command::Attack {
+            units: vec![attacker],
+            target,
+        }]);
+        step_n(&mut sim, 5);
+        assert!(
+            unit(&sim, attacker).target.is_none(),
+            "must never latch onto an already-dead target"
+        );
+    }
+
+    #[test]
+    fn test_chase_of_moving_target_uses_hysteresis_not_every_tick_repath() {
+        let mut sim = rooms_sim(3, 1, 1);
+        let attacker = spawn_stats(&mut sim, v(30.0, 50.0), 5.0, 15.0, 0, 1.0e6, 5.0, 8.0, 5);
+        // Faster than the attacker and periodically re-routed, so it's
+        // never caught and the chase path constantly needs updating.
+        let target = spawn_enemy(&mut sim, v(230.0, 50.0), 5.0, 40.0);
+        sim.step(&[Command::Attack {
+            units: vec![attacker],
+            target,
+        }]);
+        let mut repaths = 0u32;
+        let mut prev = unit(&sim, attacker).chase_repath_in;
+        let ticks = 200u32;
+        for t in 0..ticks {
+            let cmd = if t % 40 == 0 {
+                let goal = if (t / 40) % 2 == 0 {
+                    v(250.0, 150.0)
+                } else {
+                    v(250.0, 20.0)
+                };
+                vec![Command::Move {
+                    units: vec![target],
+                    goal,
+                }]
+            } else {
+                vec![]
+            };
+            sim.step(&cmd);
+            let cur = unit(&sim, attacker).chase_repath_in;
+            if cur > prev {
+                repaths += 1;
+            }
+            prev = cur;
+        }
+        assert!(
+            repaths < ticks,
+            "hysteresis must avoid a repath every tick: {repaths} over {ticks} ticks"
+        );
+        assert!(repaths > 0, "target motion must trigger at least one repath");
+    }
+
+    #[test]
+    fn test_attack_move_acquires_kills_and_resumes_goal() {
+        let mut sim = rooms_sim(3, 1, 1);
+        // One-shot kill, no cooldown lag, so the encounter resolves fast.
+        let mover = spawn_stats(&mut sim, v(30.0, 50.0), 5.0, 30.0, 0, 100.0, 100.0, 8.0, 1);
+        let goal = v(220.0, 50.0);
+        let enemy = spawn_stats(&mut sim, v(90.0, 50.0), 5.0, 0.0, 1, 5.0, 0.0, 0.0, 1);
+        sim.step(&[Command::AttackMove {
+            units: vec![mover],
+            goal,
+        }]);
+        step_n(&mut sim, 600);
+        assert!(
+            sim.units().get(enemy).is_none(),
+            "scattered enemy must be killed along the way"
+        );
+        let m = unit(&sim, mover);
+        assert_eq!(m.pos, goal, "must resume and reach the original goal");
+        assert!(!m.is_moving());
+        assert!(m.attack_move_goal.is_none(), "order completes on arrival");
+    }
+
+    #[test]
+    fn test_acquisition_picks_nearest_enemy() {
+        let mut sim = rooms_sim(1, 1, 1);
+        let mover = spawn_stats(&mut sim, v(50.0, 50.0), 5.0, 0.0, 0, 100.0, 5.0, 8.0, 5);
+        let far = spawn_stats(&mut sim, v(80.0, 50.0), 5.0, 0.0, 1, 10.0, 0.0, 0.0, 1);
+        let near = spawn_stats(&mut sim, v(70.0, 50.0), 5.0, 0.0, 1, 10.0, 0.0, 0.0, 1);
+        sim.step(&[Command::AttackMove {
+            units: vec![mover],
+            goal: v(50.0, 50.0),
+        }]);
+        step_n(&mut sim, 3);
+        assert_eq!(unit(&sim, mover).target, Some(near));
+        assert_ne!(unit(&sim, mover).target, Some(far));
+    }
+
+    #[test]
+    fn test_acquisition_ties_break_by_lowest_slot_index() {
+        let mut sim = rooms_sim(1, 1, 1);
+        let mover = spawn_stats(&mut sim, v(50.0, 50.0), 5.0, 0.0, 0, 100.0, 5.0, 8.0, 5);
+        // Both enemies exactly the same distance from `mover`: the tie must
+        // break toward the lower slot index regardless of grid scan order.
+        let first = spawn_stats(&mut sim, v(70.0, 50.0), 5.0, 0.0, 1, 10.0, 0.0, 0.0, 1);
+        let second = spawn_stats(&mut sim, v(30.0, 50.0), 5.0, 0.0, 1, 10.0, 0.0, 0.0, 1);
+        sim.step(&[Command::AttackMove {
+            units: vec![mover],
+            goal: v(50.0, 50.0),
+        }]);
+        step_n(&mut sim, 3);
+        assert_eq!(unit(&sim, mover).target, Some(first));
+        let _ = second;
+    }
+
+    #[test]
+    fn test_acquisition_respects_line_of_sight() {
+        let mut sim = rooms_sim(1, 1, 1);
+        let mover = spawn_stats(&mut sim, v(30.0, 50.0), 5.0, 0.0, 0, 100.0, 5.0, 8.0, 5);
+        let _enemy = spawn_stats(&mut sim, v(50.0, 50.0), 5.0, 0.0, 1, 10.0, 0.0, 0.0, 1);
+        // Wall directly between them, well inside acquisition range.
+        sim.step(&[Command::AddObstacle {
+            points: vec![v(40.0, 30.0), v(42.0, 30.0), v(42.0, 70.0), v(40.0, 70.0)],
+        }]);
+        sim.step(&[Command::AttackMove {
+            units: vec![mover],
+            goal: v(30.0, 50.0),
+        }]);
+        step_n(&mut sim, 5);
+        assert!(
+            unit(&sim, mover).target.is_none(),
+            "enemy behind a wall must not be acquired"
+        );
+    }
+
+    #[test]
+    fn test_attack_move_through_empty_space_behaves_like_move() {
+        let move_ticks = {
+            let mut sim = rooms_sim(3, 1, 1);
+            let id = spawn(&mut sim, v(30.0, 50.0), 5.0, 25.0);
+            sim.step(&[Command::Move {
+                units: vec![id],
+                goal: v(220.0, 50.0),
+            }]);
+            arrival_tick(&mut sim, id, 600)
+        };
+        let attack_move_ticks = {
+            let mut sim = rooms_sim(3, 1, 1);
+            let id = spawn_stats(&mut sim, v(30.0, 50.0), 5.0, 25.0, 0, 100.0, 5.0, 8.0, 5);
+            sim.step(&[Command::AttackMove {
+                units: vec![id],
+                goal: v(220.0, 50.0),
+            }]);
+            arrival_tick(&mut sim, id, 600)
+        };
+        assert_eq!(
+            move_ticks, attack_move_ticks,
+            "attack-move through empty space must behave exactly like a plain move"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3240,7 +4222,12 @@ mod conflict_tests {
         sim.step(&[Command::Spawn {
             pos: Vector2::new(50.0, 50.0),
             radius: 5.0,
-            speed: 20.0,
+            max_speed: 20.0,
+            team: 0,
+            max_health: 100.0,
+            damage: 0.0,
+            attack_range: 0.0,
+            attack_cooldown_ticks: 1,
         }]);
         let id = sim.units().iter().last().unwrap().0;
         sim.step(&[Command::Move {

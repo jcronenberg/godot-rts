@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use godot::prelude::Vector2;
 
-use crate::sim::{Command, DT, Order, Sim, UnitId};
+use crate::sim::{ACQUISITION_RANGE_MULT, Command, DT, Order, Sim, UnitId};
 
 /// Per-tick view state. Cheap parallel arrays; the view lerps two of these.
 #[derive(Default)]
@@ -25,11 +25,20 @@ pub struct Snapshot {
     /// extrapolate along the path without extra round-trips.
     pub waypoints: Vec<Vector2>,
     pub radii: Vec<f32>,
+    pub teams: Vec<u32>,
+    pub healths: Vec<f32>,
+    pub max_healths: Vec<f32>,
     /// Full remaining path per unit; filled only while the debug overlay is on.
     pub debug_paths: Option<Vec<Vec<Vector2>>>,
     /// Queued (not-yet-started) order goals per unit, so the view can draw
     /// pending waypoints; filled only while the debug overlay is on.
     pub debug_order_goals: Option<Vec<Vec<Vector2>>>,
+    /// Current combat target's position per unit (own position when none);
+    /// filled only while the debug overlay is on.
+    pub debug_targets: Option<Vec<Vector2>>,
+    /// Attack-move acquisition radius per unit (0 when not applicable);
+    /// filled only while the debug overlay is on.
+    pub debug_acquisition_radii: Option<Vec<f32>>,
     /// Wall-clock cost of the `step()` that produced this snapshot, in ms.
     /// Instrumentation only — never feeds back into sim state.
     pub step_ms: f32,
@@ -46,8 +55,13 @@ impl Snapshot {
             velocities: Vec::with_capacity(n),
             waypoints: Vec::with_capacity(n),
             radii: Vec::with_capacity(n),
+            teams: Vec::with_capacity(n),
+            healths: Vec::with_capacity(n),
+            max_healths: Vec::with_capacity(n),
             debug_paths: debug_overlay.then(|| Vec::with_capacity(n)),
             debug_order_goals: debug_overlay.then(|| Vec::with_capacity(n)),
+            debug_targets: debug_overlay.then(|| Vec::with_capacity(n)),
+            debug_acquisition_radii: debug_overlay.then(|| Vec::with_capacity(n)),
             step_ms: 0.0,
         };
         for (id, u) in sim.units().iter() {
@@ -56,6 +70,9 @@ impl Snapshot {
             snap.velocities.push((u.pos - u.prev_pos) / DT);
             snap.waypoints.push(u.waypoint());
             snap.radii.push(u.radius);
+            snap.teams.push(u.team);
+            snap.healths.push(u.health);
+            snap.max_healths.push(u.max_health);
             if let Some(paths) = &mut snap.debug_paths {
                 // Prepend the live position so the polyline starts at the
                 // unit, not at its next corner.
@@ -75,9 +92,31 @@ impl Snapshot {
                     .iter()
                     .map(|o| match o {
                         Order::Move { goal } => *goal,
+                        Order::Attack { target } => sim
+                            .units()
+                            .get(*target)
+                            .map(|t| t.pos)
+                            .unwrap_or(Vector2::ZERO),
+                        Order::AttackMove { goal } => *goal,
                     })
                     .collect();
                 order_goals.push(goals);
+            }
+            if let Some(targets) = &mut snap.debug_targets {
+                let pos = u
+                    .target
+                    .and_then(|t| sim.units().get(t))
+                    .map(|t| t.pos)
+                    .unwrap_or(u.pos);
+                targets.push(pos);
+            }
+            if let Some(radii) = &mut snap.debug_acquisition_radii {
+                let r = if u.attack_move_goal.is_some() {
+                    u.attack_range * ACQUISITION_RANGE_MULT.get()
+                } else {
+                    0.0
+                };
+                radii.push(r);
             }
         }
         snap
@@ -560,7 +599,12 @@ mod tests {
         handle.enqueue(Command::Spawn {
             pos: v(50.0, 50.0),
             radius: 5.0,
-            speed: 20.0,
+            max_speed: 20.0,
+            team: 0,
+            max_health: 100.0,
+            damage: 0.0,
+            attack_range: 0.0,
+            attack_cooldown_ticks: 1,
         });
         let snap = wait_for(&handle, |s| !s.ids.is_empty());
         handle.enqueue(Command::Move {
@@ -669,7 +713,12 @@ mod tests {
         handle.enqueue(Command::Spawn {
             pos: v(50.0, 50.0),
             radius: 5.0,
-            speed: 20.0,
+            max_speed: 20.0,
+            team: 0,
+            max_health: 100.0,
+            damage: 0.0,
+            attack_range: 0.0,
+            attack_cooldown_ticks: 1,
         });
         let snap = wait_for(&handle, |s| !s.ids.is_empty());
         handle.enqueue(Command::Move {

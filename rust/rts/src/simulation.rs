@@ -3,7 +3,7 @@ use std::sync::Arc;
 use godot::classes::Node;
 use godot::prelude::*;
 use rts_lib::navmesh::ObstacleId;
-use rts_lib::sim::{Command, Order, Sim, TICK_RATE, UnitId};
+use rts_lib::sim::{Command, Order, Relation, Sim, TICK_RATE, UnitId};
 use rts_lib::sim_runner::{Interpolator, SimHandle, Snapshot, display_pos};
 
 /// Godot view of the Rust sim thread: commands in, snapshots out.
@@ -69,9 +69,46 @@ impl Simulation {
     }
 
     /// Queue a unit spawn; it appears in snapshots after the next tick.
+    /// `attack_cooldown_ticks` is clamped to at least 1 by the sim.
     #[func]
-    pub fn spawn_unit(&self, pos: Vector2, radius: f32, speed: f32) {
-        self.enqueue(Command::Spawn { pos, radius, speed });
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_unit(
+        &self,
+        pos: Vector2,
+        radius: f32,
+        max_speed: f32,
+        team: i64,
+        max_health: f32,
+        damage: f32,
+        attack_range: f32,
+        attack_cooldown_ticks: i64,
+    ) {
+        self.enqueue(Command::Spawn {
+            pos,
+            radius,
+            max_speed,
+            team: team.max(0) as u32,
+            max_health,
+            damage,
+            attack_range,
+            attack_cooldown_ticks: attack_cooldown_ticks.max(0) as u32,
+        });
+    }
+
+    /// Override the default relation ("same team allied, different team
+    /// enemy") between two teams. `relation`: 0 = Ally, 1 = Enemy, 2 = Neutral.
+    #[func]
+    pub fn set_relation(&self, team_a: i64, team_b: i64, relation: i64) {
+        let relation = match relation {
+            0 => Relation::Ally,
+            2 => Relation::Neutral,
+            _ => Relation::Enemy,
+        };
+        self.enqueue(Command::SetRelation {
+            team_a: team_a as u32,
+            team_b: team_b as u32,
+            relation,
+        });
     }
 
     /// Order the given units (ids from `get_unit_ids`) to `goal`, interrupting
@@ -91,6 +128,46 @@ impl Simulation {
         self.enqueue(Command::Queue {
             units: Self::unit_ids(&ids),
             order: Order::Move { goal },
+        });
+    }
+
+    /// Order the given units to engage `target` directly, interrupting and
+    /// clearing any queued orders.
+    #[func]
+    pub fn attack_units(&self, ids: PackedInt64Array, target: i64) {
+        self.enqueue(Command::Attack {
+            units: Self::unit_ids(&ids),
+            target: UnitId::from_raw(target as u64),
+        });
+    }
+
+    /// Append an attack order to the given units' queues.
+    #[func]
+    pub fn queue_attack(&self, ids: PackedInt64Array, target: i64) {
+        self.enqueue(Command::Queue {
+            units: Self::unit_ids(&ids),
+            order: Order::Attack {
+                target: UnitId::from_raw(target as u64),
+            },
+        });
+    }
+
+    /// Order the given units to attack-move toward `goal`, interrupting and
+    /// clearing any queued orders.
+    #[func]
+    pub fn attack_move_units(&self, ids: PackedInt64Array, goal: Vector2) {
+        self.enqueue(Command::AttackMove {
+            units: Self::unit_ids(&ids),
+            goal,
+        });
+    }
+
+    /// Append an attack-move order to the given units' queues.
+    #[func]
+    pub fn queue_attack_move(&self, ids: PackedInt64Array, goal: Vector2) {
+        self.enqueue(Command::Queue {
+            units: Self::unit_ids(&ids),
+            order: Order::AttackMove { goal },
         });
     }
 
@@ -118,6 +195,15 @@ impl Simulation {
     pub fn remove_obstacle(&self, id: i64) {
         self.enqueue(Command::RemoveObstacle {
             id: ObstacleId::from_raw(id as u64),
+        });
+    }
+
+    /// Debug/test seam: damage a unit directly, bypassing targeting and range.
+    #[func]
+    pub fn debug_damage_unit(&self, id: i64, amount: f32) {
+        self.enqueue(Command::Damage {
+            unit: UnitId::from_raw(id as u64),
+            amount,
         });
     }
 
@@ -227,6 +313,47 @@ impl Simulation {
     #[func]
     pub fn get_radii(&self) -> PackedFloat32Array {
         self.interp.cur().radii.as_slice().into()
+    }
+
+    /// Team affiliation per unit; rows align with `get_unit_ids`.
+    #[func]
+    pub fn get_teams(&self) -> PackedInt32Array {
+        self.interp
+            .cur()
+            .teams
+            .iter()
+            .map(|&t| t as i32)
+            .collect()
+    }
+
+    #[func]
+    pub fn get_healths(&self) -> PackedFloat32Array {
+        self.interp.cur().healths.as_slice().into()
+    }
+
+    #[func]
+    pub fn get_max_healths(&self) -> PackedFloat32Array {
+        self.interp.cur().max_healths.as_slice().into()
+    }
+
+    /// Current combat target's position per unit (own position when none);
+    /// empty unless the debug overlay is on.
+    #[func]
+    pub fn get_unit_targets(&self) -> PackedVector2Array {
+        match &self.interp.cur().debug_targets {
+            Some(targets) => targets.as_slice().into(),
+            None => PackedVector2Array::new(),
+        }
+    }
+
+    /// Attack-move acquisition radius per unit (0 when not applicable); empty
+    /// unless the debug overlay is on.
+    #[func]
+    pub fn get_unit_acquisition_radii(&self) -> PackedFloat32Array {
+        match &self.interp.cur().debug_acquisition_radii {
+            Some(radii) => radii.as_slice().into(),
+            None => PackedFloat32Array::new(),
+        }
     }
 
     #[func]
