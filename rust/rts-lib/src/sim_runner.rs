@@ -295,8 +295,10 @@ struct Inline {
 #[cfg(target_family = "wasm")]
 const MAX_CATCHUP_STEPS: u32 = 1;
 
-/// Ceiling on one pump, so a huge `delta` (a backgrounded tab) costs a dropped
-/// frame rather than a freeze replaying the gap.
+/// Demand past which a frame is a gap in the render clock (a backgrounded tab)
+/// rather than a slow frame, and its debt is dropped instead of replayed.
+/// Just clear of the largest honest demand: `set_speed` caps at 64, so a
+/// 1/30 s frame owes at most 64 ticks.
 #[cfg(target_family = "wasm")]
 const MAX_STEPS_PER_PUMP: u32 = 64;
 
@@ -356,7 +358,9 @@ impl SimHandle {
     ///
     /// The whole pacing loop on the web: bank frame time as tick debt and pay
     /// it off, up to this frame's demand plus [`MAX_CATCHUP_STEPS`]. Steps run
-    /// on the main thread, so an overrun costs a frame, not sim lag.
+    /// on the main thread, so an overrun costs a frame, not sim lag. Past
+    /// [`MAX_STEPS_PER_PUMP`] the debt is dropped, as `run_loop` drops ticks
+    /// once it falls behind its deadline.
     #[cfg(target_family = "wasm")]
     pub fn pump(&mut self, delta: f64) {
         if self.shared.paused.load(Ordering::Relaxed) {
@@ -366,6 +370,12 @@ impl SimHandle {
         }
         let speed = f32::from_bits(self.shared.speed_bits.load(Ordering::Relaxed));
         let owed = delta * speed as f64 * crate::sim::TICK_RATE as f64;
+        if !(owed <= MAX_STEPS_PER_PUMP as f64) {
+            // Replaying a gap would freeze the tab for its full width.
+            // Negated compare so a NaN delta lands here too.
+            self.inline.debt = 0.0;
+            return;
+        }
         self.inline.debt += owed;
 
         // Budget from this frame's demand, so the ceiling tracks `set_speed`.

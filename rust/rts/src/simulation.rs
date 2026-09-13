@@ -18,7 +18,10 @@ use rts_lib::sim_runner::{Interpolator, SimHandle, Snapshot, display_pos};
 pub struct Simulation {
     handle: Option<SimHandle>,
     interp: Interpolator,
+    /// View-side copies: a fresh handle starts at 1x unpaused, so `load_map`
+    /// has to re-apply them.
     speed: f64,
+    paused: bool,
     base: Base<Node>,
 }
 
@@ -29,6 +32,7 @@ impl INode for Simulation {
             handle: None,
             interp: Interpolator::new(Arc::new(Snapshot::default())),
             speed: 1.0,
+            paused: false,
             base,
         }
     }
@@ -67,6 +71,10 @@ impl Simulation {
             .collect();
         let sim = Sim::new(points.as_slice().to_vec(), &constraints, seed as u64);
         let handle = SimHandle::start(sim);
+        // Or a reload drops the sim to 1x while `poll` keeps advancing the
+        // render clock at `self.speed`.
+        handle.set_speed(self.speed as f32);
+        handle.set_paused(self.paused);
         self.interp = Interpolator::new(handle.snapshot());
         self.handle = Some(handle);
     }
@@ -220,7 +228,8 @@ impl Simulation {
     }
 
     #[func]
-    pub fn set_paused(&self, paused: bool) {
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
         if let Some(h) = &self.handle {
             h.set_paused(paused);
         }

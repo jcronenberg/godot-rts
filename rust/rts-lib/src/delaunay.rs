@@ -1237,8 +1237,9 @@ impl CDT {
                 continue;
             }
             if self.he_constrained[he as usize] {
-                // Debug-only: conflicting input is rejected silently in release.
-                #[cfg(debug_assertions)]
+                // Not debug-only: the obstacle stays in the set and its other
+                // edges still went in, so a silent return ships a
+                // half-constrained mesh.
                 crate::report_error!(
                     "Cannot insert constraint ({}-{}): it intersects existing constraint ({}-{})",
                     v0,
