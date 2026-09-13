@@ -1,0 +1,12 @@
+[gd_scene format=3 uid="uid://b0q87bcmj2qw2"]
+
+[ext_resource type="Script" uid="uid://74g1uwd320bj" path="res://src/game/quality_replay.gd" id="1_qrepl"]
+[ext_resource type="Script" uid="uid://75ysqink0v4" path="res://src/game/rts_camera.gd" id="2_rtscam"]
+
+[node name="QualityReplay" type="Node2D" unique_id=1269457373]
+script = ExtResource("1_qrepl")
+trace_path = "res://rust/target/quality/trace_obstacle_drop.json"
+
+[node name="Camera2D" type="Camera2D" parent="." unique_id=76378743]
+script = ExtResource("2_rtscam")
+edge_pan_enabled = false

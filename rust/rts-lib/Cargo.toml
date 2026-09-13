@@ -9,7 +9,22 @@ godot = "0.4.5"
 [dev-dependencies]
 criterion = "0.5"
 serde = "1"
-serde_json = "1"
+# `float_roundtrip`: serde_json's default float parser is not correctly
+# rounded, so a scorecard read back from disk differed from the one that wrote
+# it in the last bits, which the quality harness reports as a delta on every
+# metric of every unchanged run.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+# The quality harness is an example, not a bench: examples get
+# `[dev-dependencies]` (so `serde` stays out of the shipped `cdylib`), and
+# criterion is the wrong host for a quantity with zero variance. `test = true`
+# so `cargo test` still runs the harness's own unit tests. The reference grid
+# is what every score is measured against, and a silent bug in it would poison
+# the whole scorecard.
+[[example]]
+name = "quality"
+path = "examples/quality/main.rs"
+test = true
 
 [[bench]]
 name = "delaunay"

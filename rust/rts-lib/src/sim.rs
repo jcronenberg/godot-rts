@@ -184,6 +184,17 @@ pub static DETOUR_LEN_RADII: TunableF32 = TunableF32::new(6.0);
 /// picking another enemy.
 pub static TARGET_SPREAD_PENALTY: TunableF32 = TunableF32::new(1.0);
 
+/// Diagnostic switch for [`Sim::last_push`]: while on, `flock` records how
+/// much separation push each unit received, split by ally and enemy.
+///
+/// Off by default and deliberately not a `set_tuning` knob, because it changes
+/// no behaviour. It is off rather than unconditional because accumulating it
+/// measurably costs the separation pass (~3% at 2000 units, ~7% at 100, where
+/// the per-unit setup dominates), and the game never reads it.
+/// `examples/quality` turns it on for itself.
+pub static PUSH_TRACKING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Max `wall_clamp` passes per unit per tick before giving up as unresolved.
 /// Internal convergence detail, not a gameplay knob — plain const rather than
 /// a `Tunable`.
@@ -832,6 +843,18 @@ struct StepScratch {
     /// Whether this unit overlapped an *ally* during the flock pair pass — the
     /// "blocked by bodies, not walls" half of the detour trigger.
     ally_contact: Vec<bool>,
+    /// Separation push received per unit this tick, in world units, split by
+    /// whether the body doing the pushing was an ally or an enemy. Summed as
+    /// magnitudes, not vectors: being shoved equally from both sides is two
+    /// shoves, not none. Pre-cap, so it is what separation *asked* for; the
+    /// combined displacement is then clamped (see [`SEPARATION_MAX_FRAC`]).
+    ///
+    /// Instrumentation for the quality harness (`examples/quality`), read via
+    /// [`Sim::last_push`]. Written during `flock` and never read back into sim
+    /// state, so it is not part of [`Sim::state_hash`] and cannot affect
+    /// determinism. Left empty unless [`PUSH_TRACKING`] is on.
+    push_ally: Vec<f32>,
+    push_enemy: Vec<f32>,
     /// Whether a moving unit is within its arrival radius of its goal (so it
     /// may crowd-stop); false for idle/parked units.
     within_arrival: Vec<bool>,
@@ -981,6 +1004,21 @@ impl Sim {
 
     pub fn navmesh(&self) -> &CDT {
         self.nav.navmesh()
+    }
+
+    /// Separation push each unit received on the most recent [`Sim::step`], as
+    /// `(id, from_allies, from_enemies)` in world units.
+    ///
+    /// A pure diagnostic for the quality harness: it is the shove separation
+    /// asked for, before the per-tick displacement cap, summed as magnitudes so
+    /// opposing shoves add rather than cancel. Empty before the first step.
+    pub fn last_push(&self) -> impl Iterator<Item = (UnitId, f32, f32)> + '_ {
+        let s = &self.step_scratch;
+        s.ids
+            .iter()
+            .zip(&s.push_ally)
+            .zip(&s.push_enemy)
+            .map(|((&id, &a), &e)| (id, a, e))
     }
 
     /// Id the next `AddObstacle` command will assign.
@@ -1551,6 +1589,8 @@ impl Sim {
         s.moving.clear();
         s.parked.clear();
         s.ally_contact.clear();
+        s.push_ally.clear();
+        s.push_enemy.clear();
         s.within_arrival.clear();
         s.arrive.clear();
         s.coh_sum.clear();
@@ -1594,6 +1634,13 @@ impl Sim {
         self.grid.rebuild(&s.positions, max_diameter.max(r_coh));
         let cdt = self.nav.navmesh();
         let separation_relax = SEPARATION_RELAX.get();
+        // Diagnostic only; sized here rather than pushed per unit above so the
+        // default path does no per-unit work at all.
+        let track_push = PUSH_TRACKING.load(std::sync::atomic::Ordering::Relaxed);
+        if track_push {
+            s.push_ally.resize(s.ids.len(), 0.0);
+            s.push_enemy.resize(s.ids.len(), 0.0);
+        }
         let arrival_touch_frac = ARRIVAL_TOUCH_FRAC.get();
         let hold_weight = HOLD_WEIGHT.get();
 
@@ -1634,13 +1681,28 @@ impl Sim {
                             );
                             let sum = w_i + w_j;
                             let overlap = min_dist - d;
-                            s.disp[i] += dir * (overlap * (w_j / sum) * separation_relax);
-                            s.disp[j] -= dir * (overlap * (w_i / sum) * separation_relax);
+                            let push_i = overlap * (w_j / sum) * separation_relax;
+                            let push_j = overlap * (w_i / sum) * separation_relax;
+                            s.disp[i] += dir * push_i;
+                            s.disp[j] -= dir * push_j;
                             // Body contact with an ally: the detour's "blocked
-                            // by units, not walls" precondition.
-                            if relation_of(&self.relations, t_i, s.teams[j]) == Relation::Ally {
+                            // by units, not walls" precondition. The same test
+                            // buckets the diagnostic push, so the split costs
+                            // no extra relation lookup.
+                            let ally = relation_of(&self.relations, t_i, s.teams[j])
+                                == Relation::Ally;
+                            if ally {
                                 s.ally_contact[i] = true;
                                 s.ally_contact[j] = true;
+                            }
+                            if track_push {
+                                if ally {
+                                    s.push_ally[i] += push_i;
+                                    s.push_ally[j] += push_j;
+                                } else {
+                                    s.push_enemy[i] += push_i;
+                                    s.push_enemy[j] += push_j;
+                                }
                             }
                         }
                         // Merge: adjacent, both-moving, same-goal, same-size units
@@ -4033,6 +4095,101 @@ mod tests {
                     u.pos
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_sealed_goal_is_refused_without_a_spin() {
+        // A goal inside a closed room can never be reached. The unit must
+        // notice once and stop, not acquire a partial path, walk at the wall,
+        // repath, and repeat. Re-clicking (the way a player who can see the
+        // goal does) must not change that.
+        //
+        // Distinct from `test_unreachable_goal_idles`, which puts the goal
+        // *off the mesh* so `locate_face` refuses it outright. Here the goal
+        // sits on a perfectly good face in a different component, which is the
+        // other refusal path, and this one adds the parts a single idle unit
+        // cannot show: a crowd, and an order re-issued for 900 ticks.
+        //
+        // Every quantity here is a flat must-be-zero, which is why it is a
+        // test and not a quality-harness scenario: there is no "slightly
+        // better" version of spinning.
+        let mut b = vec![
+            v(0.0, 0.0),
+            v(400.0, 0.0),
+            v(400.0, 400.0),
+            v(0.0, 400.0),
+            v(160.0, 160.0),
+            v(240.0, 160.0),
+            v(240.0, 240.0),
+            v(160.0, 240.0),
+        ];
+        let cons = vec![
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 0),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 4),
+        ];
+        let walls = wall_segments(&b, &cons);
+        let mut sim = Sim::new(std::mem::take(&mut b), &cons, 0x5EA1);
+        let goal = v(200.0, 200.0); // dead centre of the sealed room
+        let mut ids = Vec::new();
+        let mut starts = Vec::new();
+        for i in 0..20 {
+            let p = v(40.0 + 14.0 * (i % 5) as f32, 40.0 + 14.0 * (i / 5) as f32);
+            ids.push(spawn(&mut sim, p, 5.0, 40.0));
+            starts.push(p);
+        }
+        for t in 0..900u32 {
+            let cmd = if t.is_multiple_of(100) {
+                vec![Command::Move {
+                    units: ids.clone(),
+                    goal,
+                }]
+            } else {
+                Vec::new()
+            };
+            sim.step(&cmd);
+            assert_no_wall_crossing(&sim, &walls);
+        }
+        for (&id, &start) in ids.iter().zip(&starts) {
+            let u = unit(&sim, id);
+            assert!(u.path.is_empty(), "a refused goal must leave no path");
+            assert!(!u.parked, "never reached, so never parked");
+            assert_eq!(u.stall, 0, "not stuck against anything: it never set off");
+            assert_eq!(u.ally_stall, 0);
+            assert!(
+                (u.pos - start).length() < 1e-3,
+                "walked {:?} toward an unreachable goal",
+                u.pos - start
+            );
+        }
+    }
+
+    #[test]
+    fn test_dense_crowd_through_a_doorway_never_crosses_a_wall() {
+        // `test_movement_never_crosses_walls` covers six units strolling. This
+        // is the same guarantee under funnel pressure: sixty bodies converging
+        // on one 30-wide door, which is where the clamp has to hold hardest.
+        let (points, constraints) = rooms_map(2, 2);
+        let walls = wall_segments(&points, &constraints);
+        let mut sim = Sim::new(points, &constraints, 0xD00B);
+        let mut ids = Vec::new();
+        for i in 0..60 {
+            let p = v(12.0 + 12.0 * (i % 7) as f32, 12.0 + 12.0 * (i / 7) as f32);
+            ids.push(spawn(&mut sim, p, 5.0, 40.0));
+        }
+        sim.step(&[Command::Move {
+            units: ids,
+            goal: v(150.0, 150.0),
+        }]);
+        for _ in 0..900 {
+            sim.step(&[]);
+            assert_no_wall_crossing(&sim, &walls);
         }
     }
 

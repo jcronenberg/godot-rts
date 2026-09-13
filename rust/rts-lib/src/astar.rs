@@ -1111,6 +1111,54 @@ fn polyline_len(path: &[Vector2]) -> f32 {
     path.windows(2).map(|w| dist(w[0], w[1])).sum()
 }
 
+/// Minimum distance from any path SEGMENT to any constraint EDGE (segment).
+///
+/// O(path * faces): a diagnostic, not a hot-path query. Used by the clearance
+/// tests below and by the quality harness (`examples/quality`), which scores
+/// the same quantity instead of asserting on it.
+pub fn path_min_clearance(cdt: &CDT, path: &[Vector2]) -> f32 {
+    let pt_seg = |p: Vector2, a: Vector2, b: Vector2| -> f32 {
+        let ab = b - a;
+        let len2 = ab.x * ab.x + ab.y * ab.y;
+        if len2 < 1e-12 {
+            let dx = p.x - a.x;
+            let dy = p.y - a.y;
+            return (dx * dx + dy * dy).sqrt();
+        }
+        let t = (((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / len2).clamp(0.0, 1.0);
+        let cx = a.x + t * ab.x;
+        let cy = a.y + t * ab.y;
+        let dx = p.x - cx;
+        let dy = p.y - cy;
+        (dx * dx + dy * dy).sqrt()
+    };
+    // For non-intersecting segments, the closest pair is always one endpoint
+    // and one segment-interior point (or two endpoints), so taking the
+    // minimum of the four endpoint-to-other-segment distances is exact.
+    let seg_seg = |p1: Vector2, p2: Vector2, a: Vector2, b: Vector2| -> f32 {
+        pt_seg(p1, a, b)
+            .min(pt_seg(p2, a, b))
+            .min(pt_seg(a, p1, p2))
+            .min(pt_seg(b, p1, p2))
+    };
+    let mut min_dist = f32::INFINITY;
+    for w in path.windows(2) {
+        let (p1, p2) = (w[0], w[1]);
+        for f in 0..cdt.num_faces() {
+            for j in 0..3u32 {
+                let he = f * 3 + j;
+                if !cdt.he_is_constrained(he) {
+                    continue;
+                }
+                let a = cdt.points()[cdt.he_origin(he) as usize];
+                let b = cdt.points()[cdt.he_dest(he) as usize];
+                min_dist = min_dist.min(seg_seg(p1, p2, a, b));
+            }
+        }
+    }
+    min_dist
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1163,50 +1211,6 @@ mod tests {
                 w[1],
             );
         }
-    }
-
-    /// Minimum distance from any path SEGMENT to any constraint EDGE (segment).
-    fn path_min_clearance(cdt: &CDT, path: &[Vector2]) -> f32 {
-        let pt_seg = |p: Vector2, a: Vector2, b: Vector2| -> f32 {
-            let ab = b - a;
-            let len2 = ab.x * ab.x + ab.y * ab.y;
-            if len2 < 1e-12 {
-                let dx = p.x - a.x;
-                let dy = p.y - a.y;
-                return (dx * dx + dy * dy).sqrt();
-            }
-            let t = (((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / len2).clamp(0.0, 1.0);
-            let cx = a.x + t * ab.x;
-            let cy = a.y + t * ab.y;
-            let dx = p.x - cx;
-            let dy = p.y - cy;
-            (dx * dx + dy * dy).sqrt()
-        };
-        // For non-intersecting segments, the closest pair is always one endpoint
-        // and one segment-interior point (or two endpoints), so taking the
-        // minimum of the four endpoint-to-other-segment distances is exact.
-        let seg_seg = |p1: Vector2, p2: Vector2, a: Vector2, b: Vector2| -> f32 {
-            pt_seg(p1, a, b)
-                .min(pt_seg(p2, a, b))
-                .min(pt_seg(a, p1, p2))
-                .min(pt_seg(b, p1, p2))
-        };
-        let mut min_dist = f32::INFINITY;
-        for w in path.windows(2) {
-            let (p1, p2) = (w[0], w[1]);
-            for f in 0..cdt.num_faces() {
-                for j in 0..3u32 {
-                    let he = f * 3 + j;
-                    if !cdt.he_is_constrained(he) {
-                        continue;
-                    }
-                    let a = cdt.points()[cdt.he_origin(he) as usize];
-                    let b = cdt.points()[cdt.he_dest(he) as usize];
-                    min_dist = min_dist.min(seg_seg(p1, p2, a, b));
-                }
-            }
-        }
-        min_dist
     }
 
     /// Assert the path stays at least `radius * 0.35` from every constraint
