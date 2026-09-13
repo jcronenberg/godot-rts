@@ -128,11 +128,18 @@ fn duel_sim(n: usize, spacing: f32, health: f32) -> Sim {
     let half = n / 2;
     let spawns: Vec<Command> = (0..n)
         .map(|i| {
-            let (team, row) = if i < half { (0u32, i) } else { (1u32, i - half) };
+            let (team, row) = if i < half {
+                (0u32, i)
+            } else {
+                (1u32, i - half)
+            };
             let (rx, ry) = (row % SIDE, row / SIDE % SIDE);
             let x_off = if team == 0 { 0.0 } else { spacing };
             Command::Spawn {
-                pos: Vector2::new((rx as f32 + 0.3) * ROOM_SIZE + x_off, (ry as f32 + 0.3) * ROOM_SIZE),
+                pos: Vector2::new(
+                    (rx as f32 + 0.3) * ROOM_SIZE + x_off,
+                    (ry as f32 + 0.3) * ROOM_SIZE,
+                ),
                 radius: RADIUS,
                 max_speed: SPEED,
                 team,
@@ -401,6 +408,100 @@ fn bench_combat_idle(c: &mut Criterion) {
     group.finish();
 }
 
+/// The cost of standing still: two armed teams, no orders at all. Idle units
+/// self-defend, so every one of them runs the acquisition scan every tick —
+/// the price a peacetime army pays, which `combat_idle` (all attack-moving)
+/// doesn't isolate.
+fn standing_army_sim(n: usize) -> Sim {
+    let mut sim = two_team_sim(n);
+    for _ in 0..4 {
+        sim.step(&[]);
+    }
+    sim
+}
+
+/// Acquisition scan for an idle army under no orders.
+fn bench_combat_standing(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sim/combat_standing");
+    group.sample_size(20);
+    for &n in &[100usize, 500, 1_000, 2_000] {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_custom(|iters| chunked(iters, 1024, || standing_army_sim(n), |_, _| Vec::new()));
+        });
+    }
+    group.finish();
+}
+
+/// The positioning path: `n` attackers converging on a handful of defenders,
+/// so most of them are blocked, scanning approach slots and detouring around
+/// allies. The other combat benches never reach that code — `combat_idle`
+/// acquires nothing and `combat_engaged` is in range from tick one — and slot
+/// scanning plus the acquisition scan is now the expensive per-tick path.
+fn combat_blob_sim(n: usize) -> Sim {
+    let (points, constraints) = rooms_map(SIDE, SIDE);
+    let mut sim = Sim::new(points, &constraints, 0xB10B);
+    // One defender per 40 attackers, each in its own room, with the attackers
+    // packed around it: a genuine crush, not a line of duels.
+    let defenders = (n / 40).max(1);
+    let spawns: Vec<Command> = (0..n + defenders)
+        .map(|i| {
+            let defender = i < defenders;
+            let room = if defender { i } else { (i - defenders) / 40 };
+            let (rx, ry) = (room % SIDE, room / SIDE % SIDE);
+            // Defender at the room's centre; attackers packed in an 8-wide
+            // block just off it.
+            let (ox, oy) = if defender {
+                (0.0, 0.0)
+            } else {
+                let k = ((i - defenders) % 40) as f32;
+                (-30.0 + 3.0 * (k % 8.0), -12.0 + 3.0 * (k / 8.0))
+            };
+            Command::Spawn {
+                pos: Vector2::new(
+                    (rx as f32 + 0.5) * ROOM_SIZE + ox,
+                    (ry as f32 + 0.5) * ROOM_SIZE + oy,
+                ),
+                radius: RADIUS,
+                max_speed: SPEED,
+                team: if defender { 1 } else { 0 },
+                max_health: f32::MAX,
+                damage: if defender { 0.0 } else { COMBAT_DAMAGE },
+                attack_range: if defender { 0.0 } else { 2.0 },
+                attack_cooldown_ticks: COMBAT_COOLDOWN,
+            }
+        })
+        .collect();
+    sim.step(&spawns);
+    let ids = unit_ids(&sim);
+    let (defs, atks) = ids.split_at(defenders);
+    let cmds: Vec<Command> = atks
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| Command::Attack {
+            units: vec![id],
+            target: defs[(i / 40).min(defenders - 1)],
+        })
+        .collect();
+    sim.step(&cmds);
+    // Past the approach, into the steady-state crush the bench is about.
+    for _ in 0..90 {
+        sim.step(&[]);
+    }
+    sim
+}
+
+/// Steady-state crush: acquisition, engage, slot scanning and detours.
+fn bench_combat_blob(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sim/combat_blob");
+    group.sample_size(20);
+    for &n in &[100usize, 500, 1_000, 2_000] {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_custom(|iters| chunked(iters, 512, || combat_blob_sim(n), |_, _| Vec::new()));
+        });
+    }
+    group.finish();
+}
+
 /// Paired duels already in range, firing on cooldown every tick: targeting,
 /// damage buffering and resolution, with population held fixed (huge health)
 /// so the scenario doesn't decay into `combat_idle`.
@@ -543,20 +644,25 @@ fn bench_attack_move(c: &mut Criterion) {
     for &n in &[500usize, 2_000] {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_custom(|iters| {
-                chunked(iters, 256, || two_team_sim(n), |k, sim| {
-                    let goal = if k % 2 == 0 {
-                        Vector2::new(50.0, 50.0)
-                    } else {
-                        Vector2::new(
-                            SIDE as f32 * ROOM_SIZE - 50.0,
-                            SIDE as f32 * ROOM_SIZE - 50.0,
-                        )
-                    };
-                    vec![Command::AttackMove {
-                        units: unit_ids(sim),
-                        goal,
-                    }]
-                })
+                chunked(
+                    iters,
+                    256,
+                    || two_team_sim(n),
+                    |k, sim| {
+                        let goal = if k % 2 == 0 {
+                            Vector2::new(50.0, 50.0)
+                        } else {
+                            Vector2::new(
+                                SIDE as f32 * ROOM_SIZE - 50.0,
+                                SIDE as f32 * ROOM_SIZE - 50.0,
+                            )
+                        };
+                        vec![Command::AttackMove {
+                            units: unit_ids(sim),
+                            goal,
+                        }]
+                    },
+                )
             });
         });
     }
@@ -573,6 +679,8 @@ criterion_group!(
     bench_flock,
     bench_combat_idle,
     bench_combat_engaged,
+    bench_combat_blob,
+    bench_combat_standing,
     bench_combat_kite_target,
     bench_combat_stutter_step,
     bench_attack_move,
