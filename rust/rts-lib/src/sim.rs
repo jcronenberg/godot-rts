@@ -4993,6 +4993,145 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_counterflow_groups_pass_through_corridor() {
+        // Two flocks ordered through the same two doorways in opposite
+        // directions. They meet head-on in a 30px door, so they must work
+        // past each other and both arrive; a jam that never resolves is the
+        // failure this catches.
+        let (points, constraints) = rooms_map(3, 1);
+        let walls = wall_segments(&points, &constraints);
+        let mut sim = Sim::new(points, &constraints, 3);
+        let west = v(30.0, 50.0);
+        let east = v(270.0, 50.0);
+        let spawn_block = |sim: &mut Sim, x0: f32| -> Vec<UnitId> {
+            (0..6)
+                .map(|i| {
+                    let p = v(x0 + 12.0 * (i % 3) as f32, 35.0 + 14.0 * (i / 3) as f32);
+                    spawn(sim, p, 5.0, 30.0)
+                })
+                .collect()
+        };
+        let eastbound = spawn_block(&mut sim, 20.0);
+        let westbound = spawn_block(&mut sim, 250.0);
+        sim.step(&[Command::Move {
+            units: eastbound.clone(),
+            goal: east,
+        }]);
+        sim.step(&[Command::Move {
+            units: westbound.clone(),
+            goal: west,
+        }]);
+        // ~240px at 1px/tick, so 2000 ticks is many times over the travel time:
+        // anything still short of its goal here is stuck, not slow.
+        for _ in 0..2000 {
+            sim.step(&[]);
+            assert_no_wall_crossing(&sim, &walls);
+        }
+        for (ids, goal, dir) in [
+            (&eastbound, east, "eastbound"),
+            (&westbound, west, "westbound"),
+        ] {
+            for &id in ids {
+                let u = unit(&sim, id);
+                let d = dist(u.pos, goal);
+                assert!(
+                    !u.is_moving() && d < 45.0,
+                    "{dir} unit never got through: at {:?}, {d} from goal {goal:?}",
+                    u.pos
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_flock_repaths_when_obstacle_seals_its_door() {
+        // A building dropped across the doorway a moving flock is headed for.
+        // The upper row of rooms still connects start to goal, so the whole
+        // flock must re-route and arrive rather than pile up at the seal.
+        crate::report::install_collector();
+        let (points, constraints) = rooms_map(3, 2);
+        let walls = wall_segments(&points, &constraints);
+        let mut sim = Sim::new(points, &constraints, 9);
+        let goal = v(250.0, 50.0);
+        let ids: Vec<UnitId> = (0..6)
+            .map(|i| {
+                let p = v(20.0 + 12.0 * (i % 3) as f32, 35.0 + 14.0 * (i / 3) as f32);
+                spawn(&mut sim, p, 5.0, 30.0)
+            })
+            .collect();
+        sim.step(&[Command::Move {
+            units: ids.clone(),
+            goal,
+        }]);
+        // Under way and past the first door, but well short of the second.
+        step_n(&mut sim, 60);
+        for &id in &ids {
+            assert!(unit(&sim, id).pos.x < 190.0, "flock reached the door early");
+        }
+        // Seal the bottom-row door at x=200 (gap y 35..65): a slab sitting
+        // flush against the wall plane, spanning past both jambs. Flush, not
+        // crossing — a crossing obstacle is rejected outright.
+        sim.step(&[Command::AddObstacle {
+            points: vec![
+                v(200.0, 30.0),
+                v(212.0, 30.0),
+                v(212.0, 70.0),
+                v(200.0, 70.0),
+            ],
+        }]);
+        assert!(
+            crate::report::drain().is_empty(),
+            "a building that doesn't cross a wall must be accepted"
+        );
+        for _ in 0..2000 {
+            sim.step(&[]);
+            assert_no_wall_crossing(&sim, &walls);
+        }
+        for &id in &ids {
+            let u = unit(&sim, id);
+            let d = dist(u.pos, goal);
+            assert!(
+                !u.is_moving() && d < 45.0,
+                "unit never re-routed around the sealed door: at {:?}, {d} from goal {goal:?}",
+                u.pos
+            );
+        }
+    }
+
+    #[test]
+    fn test_mixed_radius_clump_separates_without_overlap() {
+        // `test_separation_disperses_clump_without_overlap` with two body
+        // sizes: separation must clear a big/small pair by the *sum* of their
+        // radii, not by some shared size.
+        let (points, constraints) = rooms_map(3, 3);
+        let mut sim = Sim::new(points, &constraints, 17);
+        // Stacked in the middle room's interior, big and small interleaved.
+        for i in 0..9 {
+            let radius = if i % 3 == 0 { 10.0 } else { 4.0 };
+            spawn(
+                &mut sim,
+                v(150.0 + 0.01 * i as f32, 150.0 + 0.013 * i as f32),
+                radius,
+                30.0,
+            );
+        }
+        step_n(&mut sim, 600);
+        let units: Vec<&Unit> = sim.units().iter().map(|(_, u)| u).collect();
+        for i in 0..units.len() {
+            for j in (i + 1)..units.len() {
+                let d = dist(units[i].pos, units[j].pos);
+                let min = units[i].radius + units[j].radius;
+                assert!(
+                    d >= min - 0.1,
+                    "units {i} (r {}) and {j} (r {}) still overlap: dist {d} < {min}",
+                    units[i].radius,
+                    units[j].radius
+                );
+            }
+        }
+    }
+
     // ── Combat (teams, stats, targeting, engagement) ─────────────────────────
 
     #[test]
