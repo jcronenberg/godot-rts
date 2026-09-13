@@ -1,28 +1,17 @@
-//! Kiting a retreating target: what stutter-stepping is actually for.
+//! Kiting a retreating target. A defender walks a straight line slower than
+//! its pursuers, which follow by alternating a batched `Attack` (commit,
+//! stand, fire) with a batched `Move` onto its current position: trading
+//! standing time for distance so a fleeing enemy neither escapes nor gets a
+//! free ride.
 //!
-//! A defender walks a straight line at a speed the attackers can beat, and the
-//! attackers follow it, alternating a batched `Attack` (commit, stand, fire)
-//! with a batched `Move` onto the target's current position (close the gap the
-//! standing just cost). That is the real micro: trading standing time for
-//! distance so a fleeing enemy neither escapes nor gets a free ride.
+//! `fire_efficiency` is the metric that matters, the payoff the manoeuvre
+//! buys, bounded by how much of the chase is spent inside reach. `in_range`
+//! says the same about position rather than output; the two coming apart means
+//! units standing in reach without shooting, or shooting off station.
 //!
-//! The earlier version of this scenario oscillated the group left and right
-//! around a *stationary* defender, which measured what order churn does to
-//! chase state but nothing about keeping up, and left `in_range` reading a
-//! fixture artefact rather than a behaviour.
-//!
-//! `fire_efficiency` is the metric that matters here: shots landed over shots
-//! the cooldown would have allowed. It is the payoff the whole manoeuvre
-//! exists to buy, and it is bounded by how much of the chase is spent inside
-//! weapon reach, so it moves with the thing being tested rather than with the
-//! command cadence. `in_range` says the same thing about position rather than
-//! output; the two coming apart would mean units standing in reach without
-//! shooting, or shooting without holding station.
-//!
-//! Commands go out every [`CYCLE`] ticks, six a second at 30 Hz. Every tick
-//! (the `benches/sim.rs` cadence, which exists to stress command cost) leaves
-//! the sim no two consecutive ticks to act in, and every quality metric pins
-//! at its floor reporting the fixture instead of the simulation.
+//! Commands go out every [`CYCLE`] ticks. Every tick (the `benches/sim.rs`
+//! cadence) leaves the sim no two consecutive ticks to act in, pinning every
+//! metric at its floor and reporting the fixture instead of the simulation.
 
 use godot::prelude::Vector2;
 use rts_lib::sim::{Command, Sim};
@@ -37,22 +26,19 @@ pub const SPEC: ScenarioSpec = ScenarioSpec {
 };
 
 const RADIUS: f32 = 5.0;
-/// Attacker speed against [`PREY_SPEED`]. The margin is deliberately thin: a
-/// large one would let a unit that never stutter-steps at all keep up anyway,
-/// and the scenario would stop measuring the manoeuvre.
+/// Attacker speed against [`PREY_SPEED`]. Deliberately a thin margin: a large
+/// one lets a unit that never stutter-steps keep up anyway.
 const SPEED: f32 = 10.0;
 const PREY_SPEED: f32 = 7.0;
 const ATTACKERS: usize = 8;
-/// Two body diameters. Chosen so the trailing formation *could* shoot as a
-/// body rather than as a front rank; that it does not is finding 6, and the
-/// reach is not what is stopping it (8, 12, 16, 20 and 24 all leave the same
-/// two or three units firing).
+/// Two body diameters, so the formation *could* shoot as a body rather than a
+/// front rank. That it does not is an open positioning defect, and reach is
+/// not the cause: 8 through 24 all leave the same two or three units firing.
 const RANGE: f32 = 20.0;
 const COOLDOWN: u32 = 10;
 /// Ticks between clicks: six commands a second at 30 Hz.
 const CYCLE: u64 = 5;
-/// The defender covers `PREY_SPEED * DT` per tick, so this is sized to keep it
-/// walking for essentially the whole run rather than arriving and standing.
+/// Sized to keep the defender walking for the whole run, not arriving early.
 const TICKS: u64 = 1_300;
 const PREY_START: Vector2 = Vector2::new(120.0, 150.0);
 const PREY_GOAL: Vector2 = Vector2::new(420.0, 150.0);
@@ -73,13 +59,10 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         attack_range: 0.0,
         attack_cooldown_ticks: 1,
     }];
-    // Attackers in a 4x2 block behind it, with the front rank already inside
-    // reach (surface gap 7 against a reach of 8). Eight bodies cannot all sit
-    // in reach behind one target anyway, so the block starts as a real
-    // following formation: a front rank shooting and a back rank closing. It
-    // starts in contact on purpose, so the scenario scores whether contact is
-    // *held* against a retreating target; closing from cold is `combat_blob`'s
-    // job.
+    // A 4x2 block behind it, front rank already inside reach (surface gap 7).
+    // Eight bodies cannot all sit in reach behind one target, so this starts
+    // as a real following formation. In contact on purpose: the scenario
+    // scores whether contact is *held*, not closed from cold.
     spawns.extend((0..ATTACKERS).map(|i| Command::Spawn {
         pos: v(
             PREY_START.x - 52.0 + 12.0 * (i % 4) as f32,
@@ -118,9 +101,8 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
                 target: prey,
             }]
         } else {
-            // Step-click: close onto where the target is *now*. Standing still
-            // costs ground against something that is walking away, and this is
-            // the half of the cycle that buys it back.
+            // Step-click: close onto where the target is *now*, buying back
+            // the ground the standing half of the cycle cost.
             let Some(at) = run.sim.units().get(prey).map(|u| u.pos) else {
                 break;
             };

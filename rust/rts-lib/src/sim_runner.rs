@@ -2,11 +2,10 @@
 //! `Arc`-swapped snapshots out. Pacing lives here, never in the sim core —
 //! tests/benches/replays call `step` directly. No Godot dependencies.
 //!
-//! Two pacing strategies behind one [`SimHandle`] API. Off the web the sim
-//! owns a thread and paces itself against the wall clock. On the web there
-//! are no threads to pace with, so the view drives [`SimHandle::pump`] once
-//! per frame and the ticks run inline. Both funnel into [`tick_once`], which
-//! holds the actual tick body and no pacing at all.
+//! Two pacing strategies behind one [`SimHandle`] API: off the web the sim
+//! owns a thread and paces against the wall clock; on the web there are no
+//! threads, so the view drives [`SimHandle::pump`] once a frame and ticks run
+//! inline. Both funnel into [`tick_once`], which holds no pacing at all.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -278,8 +277,8 @@ pub struct SimHandle {
     inline: Inline,
 }
 
-/// Inline stepping state. Without threads the sim lives in the handle itself
-/// and [`SimHandle::pump`] advances it from the view's frame delta.
+/// Inline stepping state: without threads the sim lives in the handle, and
+/// [`SimHandle::pump`] advances it from the view's frame delta.
 #[cfg(target_family = "wasm")]
 struct Inline {
     sim: Sim,
@@ -289,11 +288,17 @@ struct Inline {
     commands: Vec<Command>,
 }
 
-/// Ticks one [`SimHandle::pump`] will run before it gives up and drops the
-/// rest of the debt. Mirrors the threaded loop's overrun rule: fall far
-/// enough behind and the lost ticks are dropped, never replayed in a burst.
+/// Ticks a pump runs beyond the frame's own demand before dropping the rest of
+/// the debt. Budget is `demand + this` rather than a constant because demand
+/// scales with `set_speed`: a fixed cap would pin the sim below the speed the
+/// view's render clock is already running at.
 #[cfg(target_family = "wasm")]
-const MAX_CATCHUP_STEPS: u32 = 2;
+const MAX_CATCHUP_STEPS: u32 = 1;
+
+/// Ceiling on one pump, so a huge `delta` (a backgrounded tab) costs a dropped
+/// frame rather than a freeze replaying the gap.
+#[cfg(target_family = "wasm")]
+const MAX_STEPS_PER_PUMP: u32 = 64;
 
 impl SimHandle {
     /// Take ownership of `sim` and start stepping it at [`crate::sim::TICK_RATE`].
@@ -337,22 +342,21 @@ impl SimHandle {
         }
     }
 
-    /// Advance the sim by `delta` seconds of frame time. Call once per frame
-    /// from the view, before reading [`SimHandle::snapshot`].
+    /// Advance the sim by `delta` seconds of frame time. Call once per frame,
+    /// before reading [`SimHandle::snapshot`].
     ///
-    /// No-op off the web, where the sim thread paces itself against the wall
-    /// clock and this only exists so the view needs no `cfg` of its own.
+    /// No-op off the web, where the thread paces itself; it exists so the view
+    /// needs no `cfg` of its own.
     #[cfg(not(target_family = "wasm"))]
     #[inline]
     pub fn pump(&mut self, _delta: f64) {}
 
-    /// Advance the sim by `delta` seconds of frame time. Call once per frame
-    /// from the view, before reading [`SimHandle::snapshot`].
+    /// Advance the sim by `delta` seconds of frame time. Call once per frame,
+    /// before reading [`SimHandle::snapshot`].
     ///
-    /// This is the whole pacing loop on the web: accumulate frame time as
-    /// tick debt and run up to [`MAX_CATCHUP_STEPS`] ticks to pay it off.
-    /// Steps run on the calling (main) thread, so a tick that overruns the
-    /// frame budget costs a dropped frame rather than sim lag.
+    /// The whole pacing loop on the web: bank frame time as tick debt and pay
+    /// it off, up to this frame's demand plus [`MAX_CATCHUP_STEPS`]. Steps run
+    /// on the main thread, so an overrun costs a frame, not sim lag.
     #[cfg(target_family = "wasm")]
     pub fn pump(&mut self, delta: f64) {
         if self.shared.paused.load(Ordering::Relaxed) {
@@ -361,10 +365,16 @@ impl SimHandle {
             return;
         }
         let speed = f32::from_bits(self.shared.speed_bits.load(Ordering::Relaxed));
-        self.inline.debt += delta * speed as f64 * crate::sim::TICK_RATE as f64;
+        let owed = delta * speed as f64 * crate::sim::TICK_RATE as f64;
+        self.inline.debt += owed;
+
+        // Budget from this frame's demand, so the ceiling tracks `set_speed`.
+        let budget = (owed.ceil().max(0.0) as u32)
+            .saturating_add(MAX_CATCHUP_STEPS)
+            .min(MAX_STEPS_PER_PUMP);
 
         let mut steps = 0;
-        while self.inline.debt >= 1.0 && steps < MAX_CATCHUP_STEPS {
+        while self.inline.debt >= 1.0 && steps < budget {
             tick_once(
                 &mut self.inline.sim,
                 &self.shared,
@@ -374,7 +384,7 @@ impl SimHandle {
             steps += 1;
         }
         if self.inline.debt >= 1.0 {
-            self.inline.debt = 0.0; // >MAX_CATCHUP_STEPS behind: drop the lost ticks
+            self.inline.debt = 0.0; // further behind than the budget: drop the lost ticks
         }
     }
 
@@ -483,10 +493,9 @@ fn run_loop(mut sim: Sim, shared: &Shared) {
     }
 }
 
-/// One tick: drain the command queue, step, publish a snapshot, and fill a
-/// requested mesh dump. No pacing and no blocking — the caller decides when
-/// a tick is due, which is what lets the threaded loop and the inline pump
-/// share it.
+/// One tick: drain the queue, step, publish a snapshot, fill any requested
+/// mesh dump. No pacing and no blocking, so the threaded loop and the inline
+/// pump can share it; the caller decides when a tick is due.
 fn tick_once(sim: &mut Sim, shared: &Shared, commands: &mut Vec<Command>) {
     {
         let mut queue = shared.commands.lock().unwrap();
@@ -497,8 +506,8 @@ fn tick_once(sim: &mut Sim, shared: &Shared, commands: &mut Vec<Command>) {
     let step_ms = step_start.elapsed().as_secs_f32() * 1000.0;
     commands.clear();
 
-    // Empty unless a collector is installed (threaded path); without one
-    // `report_error!` has already printed engine-side from the main thread.
+    // Empty unless a collector is installed (threaded path); otherwise
+    // `report_error!` has already printed from the main thread.
     let errors = crate::report::drain();
     if !errors.is_empty() {
         shared.errors.lock().unwrap().extend(errors);

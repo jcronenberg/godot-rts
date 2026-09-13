@@ -50,11 +50,9 @@ impl Simulation {
         constraints: PackedInt32Array,
         seed: i64,
     ) {
-        // `Sim::new` -> `CDT::from_points` asserts on <3 points. Reject it here
-        // instead: an empty map is a caller mistake, not an invariant break, and
-        // on the web (panic=abort) that assert takes the whole instance down
-        // rather than being caught and reported. Mirrors the same guard in
-        // `DelaunayTriangulator::triangulate`.
+        // `CDT::from_points` asserts on <3 points, and on the web (panic=abort)
+        // that takes the instance down. A caller mistake, not an invariant
+        // break, so reject it here as `DelaunayTriangulator` does.
         if points.len() < 3 {
             godot_error!(
                 "Simulation: load_map needs at least 3 points, got {}",

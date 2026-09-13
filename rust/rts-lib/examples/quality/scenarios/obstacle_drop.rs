@@ -1,10 +1,9 @@
 //! A building lands in front of a marching group, mid-run.
 //!
-//! The navmesh rebuild repaths every moving unit at once, so this is where a
-//! regression in repath cost or in how a group re-forms after one shows up.
-//! The reference optimum is taken against the *post-drop* geometry, the route
-//! the group spends most of the run on, so `detour` reads a little high by the
-//! distance walked before the drop, consistently, run to run.
+//! The navmesh rebuild repaths every moving unit at once, so a regression in
+//! repath cost or in group re-forming shows up here. The reference optimum is
+//! taken against *post-drop* geometry, so `detour` reads high by the distance
+//! walked before the drop, consistently run to run.
 
 use godot::prelude::Vector2;
 use rts_lib::sim::{Command, Sim};
@@ -73,8 +72,8 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         m("arrival",      "frac",      1.00,  0.00, 2.0).at(s.arrival),
         m("lateness_p95", "ratio",     1.30,  6.00, 1.0).or_bad(s.lateness_p95),
         m("stall_trips",  "per unit",  0.00, 10.00, 2.0).at(s.stall_trips),
-        // One is the floor: the drop's forced rebuild. The march order itself
-        // is issued before tracking starts, so it isn't counted.
+        // One is the floor (the drop's rebuild); the march order is issued
+        // before tracking starts.
         m("repaths",      "per unit",  2.00, 20.00, 2.0).at(s.repaths),
         m("jitter",       "rad/tick",  0.05,  0.50, 1.0).at(s.jitter),
         m("push_ally",    "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),

@@ -1,37 +1,27 @@
 //! Grid ground truth: what an *optimal* route for a disc of a given radius
-//! actually costs, and whether one exists at all.
+//! costs, and whether one exists. The sim's pathfinder is under test, so it
+//! cannot also be the yardstick; this shares no code with `astar`, rasterising
+//! free space at the query radius and running Dijkstra from the goal.
 //!
-//! The sim's own pathfinder is the thing under test, so it cannot also be the
-//! yardstick. This module answers both questions from the raw wall geometry
-//! with a method that shares no code with `astar`: rasterise free space at the
-//! query radius, then Dijkstra from the goal.
+//! Accuracy:
 //!
-//! Accuracy, so the numbers are read with the right eyes:
-//!
-//! - **Metrication.** Grid distance overestimates Euclidean distance. Plain
-//!   8-connectivity is off by up to 8.2%; the 16-neighbour stencil used here
-//!   (the 8 plus the knight moves, Euclidean edge costs) caps it near 1.3%.
-//!   So a *true* optimum scores a suboptimality ratio a hair *below* 1.
+//! - **Metrication.** Grid distance overestimates Euclidean. The 16-neighbour
+//!   stencil here caps the error near 1.3% (plain 8-connectivity is 8.2%), so
+//!   a *true* optimum scores a suboptimality ratio a hair below 1.
 //! - **Sampling.** A cell is free when its centre clears every wall by
-//!   `radius - cell/2`. The half-cell slack keeps an exact-fit corridor (gap
-//!   == 2r, which the crate has tests for) from reading as sealed just because
-//!   no sample landed on its centre line. It biases the reference toward
-//!   *reachable*, which makes `phantoms` conservative and `refusals` eager,
-//!   the right way round, since a phantom is the serious defect.
-//! - **Endpoints** snap to the nearest free cell within two cells; past that
-//!   the endpoint itself is treated as not fitting at that radius. A query is
-//!   answered at the snapped cell *centres*, so each endpoint contributes up
-//!   to `cell * sqrt(2)` of error in either direction, which is why a
-//!   reference length can come out a whisker *under* the straight line.
+//!   `radius - cell/2`. The half-cell slack keeps an exact-fit corridor from
+//!   reading as sealed, biasing toward *reachable*: `phantoms` conservative
+//!   and `refusals` eager, which is the right way round.
+//! - **Endpoints** snap to the nearest free cell within two cells, past which
+//!   the endpoint is treated as not fitting. Queries are answered at snapped
+//!   cell *centres*, so each contributes up to `cell * sqrt(2)` either way.
 //!
-//! Budget, then: up to +1.3% relative from the stencil, plus roughly
-//! `±2 * cell * sqrt(2)` absolute from the endpoints, and the raster pitch is
-//! a quarter of the query radius. On the scenarios here that is well under a
-//! percent either way. It is a fixed bias per (map, radius, goal), so scorecard
-//! *deltas* are unaffected by it; only the absolute ratios carry it.
+//! Budget: +1.3% relative plus `±2 * cell * sqrt(2)` absolute, at a pitch of a
+//! quarter radius, which is well under a percent here. Fixed per (map, radius,
+//! goal), so it biases absolute ratios but never scorecard *deltas*.
 //!
 //! Fields are keyed by (walls, radius, cell, goal) and cached under
-//! `target/quality/ref_*.bin`, so a rerun pays for them once.
+//! `target/quality/ref_*.bin`.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -82,9 +72,8 @@ impl Field {
     }
 
     /// Cell nearest `p` that `ok` accepts, within [`SNAP_CELLS`]. *Nearest*,
-    /// not first-found: the seed for the whole field goes through here too, and
-    /// picking a corner of the search square instead of the containing cell
-    /// would shift every distance in the field by a couple of cells.
+    /// not first-found: the field seed comes through here too, and a corner of
+    /// the search square would shift every distance by a couple of cells.
     fn nearest(&self, p: Vector2, ok: impl Fn(usize) -> bool) -> Option<usize> {
         let (cx, cy) = self.cell_of(p);
         if let Some(i) = self.idx(cx, cy)
@@ -101,8 +90,7 @@ impl Field {
                 if !ok(i) {
                     continue;
                 }
-                // Squared cell distance; strict `<` and a fixed scan order
-                // break ties the same way every run.
+                // Strict `<` and a fixed scan order break ties identically.
                 let d2 = dx * dx + dy * dy;
                 if best.is_none_or(|(bd, _)| d2 < bd) {
                     best = Some((d2, i));
@@ -118,9 +106,9 @@ impl Field {
     }
 }
 
-/// One stencil entry: `(dx, dy, cost, cells the move passes over)`. A knight
-/// move that would cut a wall corner is rejected by checking those two cells;
-/// straight and diagonal moves leave them `(0, 0)`, which means "no check".
+/// One stencil entry: `(dx, dy, cost, cells the move passes over)`. Those two
+/// cells reject a knight move that cuts a wall corner; straight and diagonal
+/// moves leave them `(0, 0)`, meaning "no check".
 type Step = (i32, i32, f32, [(i32, i32); 2]);
 
 /// The 16-neighbour stencil.
@@ -184,9 +172,8 @@ fn compute(walls: &[(Vector2, Vector2)], radius: f32, cell: f32, goal: Vector2) 
     let rows = (((hi.y + margin) - origin.y) / cell).ceil() as i32 + 1;
     let n = (cols * rows) as usize;
 
-    // Free everywhere, then stamp the radius-dilated neighbourhood of each
-    // wall shut. Per-segment stamping keeps this linear in wall length rather
-    // than cells * walls.
+    // Free everywhere, then stamp each wall's radius-dilated neighbourhood
+    // shut. Per-segment, so this is linear in wall length, not cells * walls.
     let clear = (radius - cell * SAMPLE_SLACK_CELLS).max(0.0);
     let mut free = vec![true; n];
     for &(a, b) in walls {
@@ -212,8 +199,8 @@ fn compute(walls: &[(Vector2, Vector2)], radius: f32, cell: f32, goal: Vector2) 
             }
         }
     }
-    // Seal the raster border: off-map space is free of walls but must never
-    // serve as a shortcut round the outside of a boundary wall.
+    // Seal the border: off-map space has no walls, but must not be a shortcut
+    // around the outside of a boundary wall.
     for cx in 0..cols {
         free[cx as usize] = false;
         free[((rows - 1) * cols + cx) as usize] = false;
@@ -242,8 +229,7 @@ fn compute(walls: &[(Vector2, Vector2)], radius: f32, cell: f32, goal: Vector2) 
     heap.push(Reverse((0u32, seed as u32)));
     while let Some(Reverse((dbits, ci))) = heap.pop() {
         let ci = ci as usize;
-        // Non-negative f32 compares as its bit pattern, so no ordered-float
-        // wrapper is needed for the heap key.
+        // Non-negative f32 compares as its bit pattern: no wrapper needed.
         if f32::from_bits(dbits) > f.dist[ci] {
             continue;
         }
@@ -302,7 +288,8 @@ fn cache_key(walls: &[(Vector2, Vector2)], radius: f32, cell: f32, goal: Vector2
 fn load(path: &PathBuf) -> Option<Field> {
     let mut buf = Vec::new();
     std::fs::File::open(path).ok()?.read_to_end(&mut buf).ok()?;
-    if buf.len() < 24 || &buf[..4] != MAGIC {
+    // 28 = MAGIC + FORMAT + origin + cell + cols + rows; short means truncated.
+    if buf.len() < 28 || &buf[..4] != MAGIC {
         return None;
     }
     let u32_at = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
@@ -348,7 +335,10 @@ fn store(path: &PathBuf, f: &Field) -> std::io::Result<()> {
     for d in &f.dist {
         out.extend_from_slice(&d.to_le_bytes());
     }
-    std::fs::File::create(path)?.write_all(&out)
+    // Rename in, so an interrupted write leaves no cache rather than a stub.
+    let tmp = path.with_extension("tmp");
+    std::fs::File::create(&tmp)?.write_all(&out)?;
+    std::fs::rename(&tmp, path)
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -380,9 +370,8 @@ mod tests {
         let f = field_of(&rect(0.0, 0.0, 400.0, 400.0), 5.0, v(350.0, 350.0));
         let got = f.optimal_len(v(50.0, 50.0)).expect("reachable");
         let euclid = (v(350.0, 350.0) - v(50.0, 50.0)).length();
-        // The module's stated budget: +1.3% relative from the stencil, and
-        // `2 * cell * sqrt(2)` absolute either way from snapping both
-        // endpoints onto cell centres (cell here is `radius / 4` = 1.25).
+        // The module's stated budget: +1.3% relative plus `2 * cell * sqrt(2)`
+        // absolute from snapping both endpoints (cell = `radius / 4` = 1.25).
         let snap = 2.0 * 1.25 * std::f32::consts::SQRT_2;
         assert!(
             got >= euclid - snap && got <= euclid * 1.013 + snap,
@@ -434,8 +423,8 @@ mod tests {
 
     #[test]
     fn test_never_leaks_around_the_outside_of_a_boundary_wall() {
-        // Two rooms, no door: off-map space is free of walls, so without the
-        // sealed raster border the field would happily route around the box.
+        // Two rooms, no door. Without the sealed border the field would
+        // happily route around the outside of the box.
         let mut walls = rect(0.0, 0.0, 400.0, 200.0);
         walls.push((v(200.0, 0.0), v(200.0, 200.0)));
         let f = field_of(&walls, 5.0, v(300.0, 100.0));

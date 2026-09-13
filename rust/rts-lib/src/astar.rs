@@ -308,7 +308,7 @@ fn walk_segment(
 /// the [`straight_channel`] walk but discards the portal list. Allocation-free.
 ///
 /// The validity gate for shared-channel assignment and the merge adjacency
-/// test (see `group_pathing_plan.md`).
+/// test.
 pub fn clear_los(cdt: &CDT, a: Vector2, b: Vector2, radius: f32) -> bool {
     let Some(fa) = cdt.locate_face(a) else {
         return false;
@@ -1114,8 +1114,7 @@ fn polyline_len(path: &[Vector2]) -> f32 {
 /// Minimum distance from any path SEGMENT to any constraint EDGE (segment).
 ///
 /// O(path * faces): a diagnostic, not a hot-path query. Used by the clearance
-/// tests below and by the quality harness (`examples/quality`), which scores
-/// the same quantity instead of asserting on it.
+/// tests below and by `examples/quality`, which scores it instead.
 pub fn path_min_clearance(cdt: &CDT, path: &[Vector2]) -> f32 {
     let pt_seg = |p: Vector2, a: Vector2, b: Vector2| -> f32 {
         let ab = b - a;
@@ -1132,9 +1131,8 @@ pub fn path_min_clearance(cdt: &CDT, path: &[Vector2]) -> f32 {
         let dy = p.y - cy;
         (dx * dx + dy * dy).sqrt()
     };
-    // For non-intersecting segments, the closest pair is always one endpoint
-    // and one segment-interior point (or two endpoints), so taking the
-    // minimum of the four endpoint-to-other-segment distances is exact.
+    // For non-intersecting segments the closest pair always involves an
+    // endpoint, so the min of the four endpoint-to-segment distances is exact.
     let seg_seg = |p1: Vector2, p2: Vector2, a: Vector2, b: Vector2| -> f32 {
         pt_seg(p1, a, b)
             .min(pt_seg(p2, a, b))

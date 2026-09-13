@@ -63,10 +63,9 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
 
     //                     name              unit        good    bad  weight
     vec![
-        // Measured over the window the door is in use, so it reads the door's
-        // rate and not the tick budget's. High only *looks* free: a crowd that
-        // squeezes through compressed beats the 3-abreast geometry, and pays
-        // for it in the overlap rows below.
+        // Over the window the door is in use, so it reads the door's rate and
+        // not the tick budget's. High only *looks* free: a compressed crowd
+        // beats the 3-abreast geometry and pays for it in the overlap rows.
         m("throughput",   "units/s",  36.00,  6.00, 3.0).at(s.throughput),
         m("arrival",      "frac",      1.00,  0.00, 2.0).at(s.arrival),
         m("lateness_p95", "ratio",     2.00, 12.00, 1.0).or_bad(s.lateness_p95),

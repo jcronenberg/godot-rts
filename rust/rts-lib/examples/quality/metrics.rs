@@ -1,13 +1,7 @@
-//! Probes. Two families, matching the two questions the scorecard asks.
-//!
-//! [`Run`] wraps a `Sim` and watches what the units actually *do* while it
-//! steps: how far they walked, when they settled, how much they overlapped,
-//! how often they gave up on a path. [`PathProbe`] never steps anything: it
-//! calls `find_path` directly and scores the polyline it gets back.
-//!
-//! Everything here is pure observation. The probe holds `&Sim` by value and
-//! never writes to it, so a scored run is bit-identical to the same run
-//! without the harness.
+//! Probes, in two families. [`Run`] wraps a `Sim` and watches what the units
+//! do while it steps; [`PathProbe`] never steps anything, scoring the polyline
+//! `find_path` returns. Pure observation: a scored run is bit-identical to the
+//! same run without the harness.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -56,11 +50,9 @@ pub fn side_of(a: Vector2, b: Vector2, p: Vector2) -> f32 {
 /// Proper segment intersection: strictly opposite orientations on both sides,
 /// so a shared endpoint or a collinear touch is not a crossing.
 ///
-/// Deliberately the same formulation (f64 orientation, sign product) as
-/// `assert_no_wall_crossing` in `sim.rs`'s tests. The penetration metric is
-/// meant to count exactly what that assertion forbids; a slightly different
-/// predicate here would make the score and the test disagree at the boundary
-/// which is precisely where a unit sliding along a wall lives.
+/// Same formulation as `assert_no_wall_crossing` in `sim.rs`'s tests on
+/// purpose: a different predicate would disagree at the boundary, which is
+/// where a unit sliding along a wall lives.
 pub fn segments_cross(p1: Vector2, p2: Vector2, q1: Vector2, q2: Vector2) -> bool {
     let orient = |p: Vector2, q: Vector2, r: Vector2| {
         ((q.x - p.x) as f64 * (r.y - p.y) as f64) - ((q.y - p.y) as f64 * (r.x - p.x) as f64)
@@ -114,12 +106,13 @@ struct Tracked {
     turn_sum: f64,
     moving_ticks: u64,
     // combat
-    /// Last station this unit actually held. `None` before it has held one.
-    /// Losing a station (every new order calls `clear_combat_state`) is not a
-    /// change of mind, so it must not count as churn. Only walking from one
-    /// held station to a *different* one does.
+    /// Last station actually held. Losing one to a new order is not a change
+    /// of mind, so only walking to a *different* station counts as churn.
     prev_slot: Option<u16>,
     slot_changes: u32,
+    /// Carries a weapon. Weapon metrics are scored over armed units only,
+    /// or an unarmed one scores a hard zero for having nothing to fire.
+    armed: bool,
     prev_cooldown: u32,
     first_shot_tick: Option<u64>,
     /// Shots landed, and the cooldown they are landed on, so the pair can be
@@ -130,7 +123,9 @@ struct Tracked {
     engaged_ticks: u64,
     /// Surface gap to the target, summed over engaged ticks and expressed in
     /// the unit's own weapon reaches, so 1.0 is exactly at maximum range.
+    /// Armed units only, hence its own tick count and not `engaged_ticks`.
     gap_sum: f64,
+    gap_ticks: u64,
 }
 
 /// Scenario knobs the probe needs but cannot infer.
@@ -138,10 +133,9 @@ pub struct Cfg {
     /// Multiple of the ideal traversal time a unit gets to arrive in. Map size
     /// therefore never leaks into the arrival number.
     pub deadline_mult: f64,
-    /// Line units are counted across, for throughput. Counted *net*, so a
-    /// unit shoved back out of a doorway and in again doesn't inflate its
-    /// rate. That makes the segment directed: orient it so that
-    /// `side_of(a, b, goal) > 0`, and crossings toward the goal count `+1`.
+    /// Line units are counted across, for throughput. Counted *net*, so the
+    /// segment is directed: orient it so `side_of(a, b, goal) > 0`, and
+    /// crossings toward the goal count `+1`.
     pub choke: Option<(Vector2, Vector2)>,
 }
 
@@ -166,16 +160,13 @@ pub struct Run {
     overlap_depth_max: f64,
     overlapping_unit_ticks: u64,
     unit_ticks: u64,
-    /// Deepest overlap each unit was in, one entry per unit-tick, zeros
-    /// included. The mean is diluted by every tick nothing is touching and the
-    /// max is a single event out of hundreds of thousands; the percentile of
-    /// this is what says how bad it is when it is bad.
+    /// Deepest overlap per unit-tick, zeros included. Mean is diluted and max
+    /// is a single event; the percentile of this says how bad it gets.
     overlap_depths: Vec<f32>,
     // throughput
     net_crossings: i64,
-    /// First and last tick anything crossed the choke, so the rate is the
-    /// door's, not the tick budget's: a run that keeps stepping after the last
-    /// unit is through would otherwise report an ever-lower throughput.
+    /// First and last tick anything crossed, so the rate is the door's and not
+    /// the tick budget's.
     crossing_window: Option<(u64, u64)>,
     prev_side: BTreeMap<UnitId, bool>,
     // cohesion
@@ -187,10 +178,8 @@ pub struct Run {
 
 impl Run {
     pub fn new(sim: Sim, cfg: Cfg) -> Run {
-        // The push split is a diagnostic the sim leaves off by default, since
-        // accumulating it costs the separation pass a few percent and only the
-        // harness reads it. Turned on here rather than in `main`, so it is on
-        // for anything that builds a `Run` and cannot be forgotten.
+        // Off by default (it costs the separation pass a few percent). Set
+        // here, not in `main`, so anything building a `Run` gets it.
         rts_lib::sim::PUSH_TRACKING.store(true, std::sync::atomic::Ordering::Relaxed);
         Run {
             sim,
@@ -213,11 +202,8 @@ impl Run {
         }
     }
 
-    /// Start dumping a per-tick trace; written by [`Run::write_trace`].
-    ///
-    /// Walls are read from the live navmesh rather than passed in, so the
-    /// replay always draws the geometry the sim actually had, including
-    /// obstacles added or removed part-way through.
+    /// Start dumping a per-tick trace; written by [`Run::write_trace`]. Walls
+    /// come from the live navmesh, so mid-run obstacle edits are drawn too.
     pub fn record_trace(&mut self, scenario: &str) {
         self.trace = Some(Trace {
             scenario: scenario.to_string(),
@@ -231,11 +217,9 @@ impl Run {
     }
 
     /// Watch `id` on its way to its current goal. `optimal` is the reference
-    /// cost of that route; `None` when the scenario has no ground truth for it
-    /// (an unreachable goal, a combat approach).
-    ///
-    /// The goal itself isn't passed in: `Unit::parked` already means "settled
-    /// at the goal", so a second copy of it here could only disagree.
+    /// cost of that route; `None` when there is no ground truth for it (an
+    /// unreachable goal, a combat approach). The goal itself is not passed in:
+    /// `Unit::parked` already means "settled at the goal".
     pub fn track(&mut self, id: UnitId, optimal: Option<f32>) {
         let Some(u) = self.sim.units().get(id) else {
             return;
@@ -243,6 +227,15 @@ impl Run {
         let ideal_ticks = optimal
             .map(|o| (o / (u.max_speed * DT)) as f64)
             .unwrap_or(0.0);
+        let armed = u.damage > 0.0 && u.attack_range > 1e-3;
+        // Firing sets `cooldown_left = ticks - 1`, so at a cooldown of 1 the
+        // rising edge `shots` counts never trips. Fail loudly, not silently.
+        assert!(
+            !armed || u.attack_cooldown_ticks >= 2,
+            "tracked unit {id:?} is armed with attack_cooldown_ticks = {}; \
+             shot detection needs >= 2 (see Tracked::shots)",
+            u.attack_cooldown_ticks,
+        );
         self.index.insert(id, self.tracked.len());
         self.tracked.push(Tracked {
             id,
@@ -266,6 +259,7 @@ impl Run {
             moving_ticks: 0,
             prev_slot: (u.chase_slot != NO_SLOT).then_some(u.chase_slot),
             slot_changes: 0,
+            armed,
             prev_cooldown: u.cooldown_left,
             first_shot_tick: None,
             shots: 0,
@@ -273,6 +267,7 @@ impl Run {
             in_range_ticks: 0,
             engaged_ticks: 0,
             gap_sum: 0.0,
+            gap_ticks: 0,
         });
     }
 
@@ -365,14 +360,13 @@ impl Run {
                 }
                 if u.attack_range > 1e-3 {
                     t.gap_sum += (surf / u.attack_range) as f64;
+                    t.gap_ticks += 1;
                 }
             }
         }
 
-        // Separation push, taken straight from the sim: it is computed
-        // mid-step from positions and movement flags that are gone by the time
-        // `step` returns, so it is the one quantity here that cannot be
-        // re-derived by watching from outside.
+        // Straight from the sim: computed mid-step from state that is gone by
+        // the time `step` returns, so it cannot be re-derived from outside.
         for (id, ally, enemy) in self.sim.last_push() {
             let Some(&t) = self.index.get(&id) else {
                 continue;
@@ -389,13 +383,10 @@ impl Run {
             positions.push((u.pos, u.radius));
         }
         self.unit_ticks += positions.len() as u64;
-        // Per unit, the deepest overlap it is in this tick. `mean`, `p95` and
-        // `max` are all statistics of *this* population, so the three columns
-        // describe one distribution and share a scale: 0 is clear, 2.0 is
-        // coincident centres. (They are not ordered: a short violent crush
-        // followed by a long clean run puts the mean above the p95.) Summing
-        // pair depths instead would scale with neighbour count rather than
-        // depth, and could report a "mean overlap" larger than a whole body.
+        // Deepest overlap per unit this tick. `mean`, `p95` and `max` are all
+        // statistics of this one population, sharing a scale: 0 is clear, 2.0
+        // is coincident centres. Summing pair depths instead would scale with
+        // neighbour count rather than depth.
         let mut deepest = vec![0.0f32; positions.len()];
         for_each_overlapping_pair(&positions, |i, j, depth| {
             deepest[i] = deepest[i].max(depth);
@@ -460,9 +451,8 @@ impl Run {
         }
 
         if let Some(tr) = self.trace.as_mut() {
-            // Geometry only moves when an obstacle is added or removed, which
-            // bumps the navmesh version, so this costs one integer compare a
-            // tick in the common case.
+            // Geometry only moves when the navmesh version bumps, so this is
+            // one integer compare a tick in the common case.
             let cdt = self.sim.navmesh();
             if cdt.version() != tr.nav_version {
                 tr.nav_version = cdt.version();
@@ -502,11 +492,8 @@ impl Run {
     }
 
     /// Write the collected trace to `<dir>/trace_<scenario>.json`; a no-op
-    /// when tracing wasn't turned on.
-    ///
-    /// Reports the path and size on stderr, because a trace is one JSON object
-    /// per unit per tick and `--trace all` can put a few hundred megabytes on
-    /// disk without saying so.
+    /// when tracing wasn't turned on. Reports path and size on stderr, since
+    /// `--trace all` can quietly put hundreds of megabytes on disk.
     pub fn write_trace(&self, dir: &Path) -> Option<std::path::PathBuf> {
         let tr = self.trace.as_ref()?;
         std::fs::create_dir_all(dir).ok()?;
@@ -528,17 +515,14 @@ impl Run {
     }
 }
 
-/// Overlap depth, in radii, below which a pair counts as merely *touching*: a
-/// settled packing sits exactly at contact and f32 noise straddles zero either
-/// way, so without this every parked blob would read as 100% overlapping.
+/// Overlap depth, in radii, below which a pair is merely *touching*. A settled
+/// packing sits at contact with f32 noise either side of zero; without this
+/// every parked blob would read as 100% overlapping.
 const CONTACT_EPS_FRAC: f32 = 0.02;
 
 /// Pairwise overlap via a uniform grid sized to the largest diameter, so a
-/// crush of hundreds stays linear instead of quadratic.
-///
-/// Depth is reported in *radii* (of the smaller of the pair), not pixels, so
-/// the numbers mean the same thing whatever size the units are and nothing
-/// downstream has to go looking for a radius to divide by.
+/// crush of hundreds stays linear. Depth is in *radii* of the smaller of the
+/// pair, so the numbers mean the same whatever size the units are.
 fn for_each_overlapping_pair(
     units: &[(Vector2, f32)],
     mut f: impl FnMut(usize, usize, f32),
@@ -594,16 +578,13 @@ pub struct Stats {
     /// Fraction of tracked units parked at their goal within the deadline.
     pub arrival: f64,
     /// Distance walked over the reference optimum, averaged over units that
-    /// arrived. `None` when none did, since a unit that stopped early would
-    /// otherwise score a flattering ratio below 1.
+    /// arrived. `None` when none did: one that stopped early would score a
+    /// flattering ratio below 1.
     pub detour: Option<f64>,
     /// Ticks taken over ideal ticks; a unit that never arrived is charged the
-    /// whole run. p50 and p95 across units.
-    ///
-    /// Ideal is measured to the goal *point*, while a crowd parks at the edge
-    /// of the blob around it (see `ARRIVAL_RADIUS_FACTOR`), so a large group
-    /// reads slightly below 1.0 on an unobstructed march. The bias is constant
-    /// per scenario, which is all a delta needs.
+    /// whole run. p50 and p95 across units. Ideal is measured to the goal
+    /// *point* while a crowd parks at the blob's edge, so a large group reads
+    /// slightly below 1.0. The bias is constant per scenario.
     pub lateness_p50: Option<f64>,
     pub lateness_p95: Option<f64>,
     /// Mean distance walked per tracked unit.
@@ -628,11 +609,9 @@ pub struct Stats {
     /// Mean heading change per moving tick, in radians.
     pub jitter: f64,
     /// Mean separation push received per unit-tick, in radii, from allied and
-    /// from enemy bodies respectively.
-    ///
-    /// This is the *shove*, where `overlap_*` is the *result*. They can move
-    /// independently: a stiffer separation resolves overlap faster and pushes
-    /// harder, so a change that improves one can easily worsen the other.
+    /// from enemy bodies. The *shove*, where `overlap_*` is the *result*:
+    /// stiffer separation clears overlap faster but pushes harder, so a change
+    /// can improve one and worsen the other.
     pub push_ally: f64,
     pub push_enemy: f64,
     /// Mean flock radius of gyration over the run, in packed-blob radii.
@@ -648,8 +627,12 @@ pub struct Stats {
     /// exactly at maximum range, above that is out of it. The continuous form
     /// of `in_range`, which a threshold hides: a group that settles two reaches
     /// back scores the same 0 on `in_range` as one that settles ten back.
+    /// Armed units only.
     pub chase_gap: Option<f64>,
-    /// p95 ticks from the first tick of the run to a unit's first shot.
+    /// p95 ticks from the start of the run to a unit's first shot, over armed
+    /// units. One that never fires is charged the whole run, so stranding
+    /// attackers worsens this instead of shrinking the sample. `None` when
+    /// nothing carries a weapon.
     pub first_shot_p95: Option<f64>,
     /// Shots landed over shots the cooldown would have allowed, averaged over
     /// armed units. The payoff metric for a chase: a unit that keeps up and
@@ -698,7 +681,7 @@ impl Stats {
         let mut first_shots: Vec<f64> = run
             .tracked
             .iter()
-            .filter(|t| t.prev_cooldown > 0 || t.first_shot_tick.is_some())
+            .filter(|t| t.armed)
             .map(|t| {
                 t.first_shot_tick
                     .map(|s| s as f64)
@@ -728,8 +711,7 @@ impl Stats {
             lateness_p50: percentile(&mut lateness, 0.50),
             lateness_p95: percentile(&mut lateness, 0.95),
             travelled: fdiv(run.tracked.iter().map(|t| t.travelled).sum(), n),
-            // Per unit-tick, so the number does not scale with how long the
-            // scenario happens to run.
+            // Per unit-tick, so it doesn't scale with run length.
             push_ally: fdiv(
                 run.tracked.iter().map(|t| t.push_ally).sum::<f64>() / run.ticks.max(1) as f64,
                 n,
@@ -745,8 +727,7 @@ impl Stats {
             ),
             hold_trips: fdiv(run.tracked.iter().map(|t| t.hold_trips as f64).sum(), n),
             repaths: fdiv(run.tracked.iter().map(|t| t.repaths as f64).sum(), n),
-            // Depths already arrive in radii, so these are comparable across
-            // unit sizes and crowd sizes without further scaling.
+            // Already in radii, so comparable across unit and crowd sizes.
             overlap_mean: if run.unit_ticks == 0 {
                 0.0
             } else {
@@ -779,15 +760,15 @@ impl Stats {
             chase_gap: mean(
                 &run.tracked
                     .iter()
-                    .filter(|t| t.engaged_ticks > 0)
-                    .map(|t| t.gap_sum / t.engaged_ticks as f64)
+                    .filter(|t| t.gap_ticks > 0)
+                    .map(|t| t.gap_sum / t.gap_ticks as f64)
                     .collect::<Vec<f64>>(),
             ),
             first_shot_p95: percentile(&mut first_shots, 0.95),
             fire_efficiency: mean(
                 &run.tracked
                     .iter()
-                    .filter(|t| t.cooldown_ticks > 0 && t.engaged_ticks > 0)
+                    .filter(|t| t.armed && t.engaged_ticks > 0)
                     .map(|t| {
                         let ceiling = run.ticks as f64 / t.cooldown_ticks as f64;
                         if ceiling > 0.0 {
@@ -887,8 +868,7 @@ impl PathProbe {
             .copied()
             .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.min(v))))
     }
-    /// 5th-percentile path clearance, in radii: the body of the distribution,
-    /// not just its worst single query.
+    /// 5th-percentile path clearance, in radii: the body of the distribution.
     pub fn clearance_p5(&self) -> Option<f64> {
         percentile(&mut self.clearances.clone(), 0.05)
     }
@@ -927,12 +907,9 @@ struct TraceTick {
     units: Vec<TraceUnit>,
 }
 
-/// The complete wall set from `tick` onward, not a delta.
-///
-/// Timed rather than captured once, because a scenario can add or remove
-/// obstacles mid-run: `obstacle_drop` inserts a building at tick 150, and a
-/// static list drawn from frame 0 showed units walking through a wall that did
-/// not exist yet.
+/// The complete wall set from `tick` onward, not a delta. Timed rather than
+/// captured once because a scenario can edit obstacles mid-run, and a static
+/// list from frame 0 draws units walking through a wall that isn't there yet.
 #[derive(serde::Serialize)]
 struct WallEvent {
     tick: u64,
@@ -944,8 +921,8 @@ struct WallEvent {
 struct Trace {
     scenario: String,
     wall_events: Vec<WallEvent>,
-    /// Navmesh version the last event was taken at; a change means the
-    /// geometry moved and a fresh event is due. Not part of the file.
+    /// Navmesh version of the last event; a change means one is due. Not
+    /// part of the file.
     #[serde(skip)]
     nav_version: u64,
     ticks: Vec<TraceTick>,
@@ -1066,13 +1043,10 @@ mod tests {
         assert!((found[0].2 - 0.8).abs() < 1e-4, "{found:?}");
     }
 
-    /// End to end through a real `Sim`, because overlap is the metric the
-    /// scorecard leans on hardest. The three columns are statistics of one
-    /// population (per-unit-tick deepest overlap, in radii), so they share a
-    /// scale and a cap: 2.0 radii is coincident centres and nothing can exceed
-    /// it. They are deliberately *not* asserted to be ordered; a short crush
-    /// followed by a long clean run legitimately puts the mean above the p95,
-    /// which is exactly what this fixture produces.
+    /// End to end through a real `Sim`. The three columns are statistics of
+    /// one population, so they share a scale capped at 2.0 radii (coincident
+    /// centres). Deliberately *not* asserted to be ordered: this fixture's
+    /// short crush then long clean run puts the mean above the p95.
     #[test]
     fn test_overlap_stats_describe_one_distribution() {
         let (points, constraints) = crate::maps::box_map(200.0, 200.0);
@@ -1080,8 +1054,8 @@ mod tests {
             Sim::new(points, &constraints, 1),
             Cfg::default(),
         );
-        // Three bodies spawned almost on top of each other: deep overlap that
-        // separation then resolves, so the run spans both regimes.
+        // Spawned almost coincident: deep overlap, then separation resolves
+        // it, so the run spans both regimes.
         run.sim.step(&[
             spawn_cmd(Vector2::new(100.0, 100.0), 5.0, 20.0),
             spawn_cmd(Vector2::new(100.5, 100.0), 5.0, 20.0),
@@ -1109,8 +1083,7 @@ mod tests {
         assert!(s.overlap_mean <= s.overlap_max);
         assert!(s.overlap_p95 <= s.overlap_max);
         assert!(s.overlap_frac > 0.0 && s.overlap_frac <= 1.0);
-        // Separation resolves the spawn crush rather than tolerating it: the
-        // typical tick ends up far cleaner than the worst one.
+        // Separation resolves the crush, so the typical tick beats the worst.
         assert!(
             s.overlap_mean < s.overlap_max * 0.2,
             "mean {} vs max {}",
@@ -1121,8 +1094,8 @@ mod tests {
 
     #[test]
     fn test_overlapping_pairs_counted_once_across_grid_cells() {
-        // Three mutually overlapping units spanning more than one grid cell:
-        // three pairs, each reported exactly once.
+        // Three mutually overlapping units spanning >1 grid cell: three pairs,
+        // each reported once.
         let units = [
             (v(0.0, 0.0), 5.0),
             (v(6.0, 0.0), 5.0),

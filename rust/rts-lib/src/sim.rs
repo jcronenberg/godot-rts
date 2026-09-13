@@ -1,4 +1,4 @@
-//! Deterministic fixed-tick unit simulation (see `simulation_plan.md`).
+//! Deterministic fixed-tick unit simulation.
 //!
 //! `Sim::step` is a pure state transition: commands in, state out. Pacing,
 //! threading and snapshots live in [`crate::sim_runner`]. Determinism rules:
@@ -163,9 +163,8 @@ pub static SLOT_SWITCH_MARGIN: TunableF32 = TunableF32::new(1.5);
 /// and packing behaviour is bit-for-bit unchanged.
 ///
 /// Swept against a 12-attacker blob *and* a unit crossing a stationary ally
-/// line at once, per `combat_positioning_plan.md`: the two want opposite ends
-/// (a stiff front rank helps the blob, a soft one lets a traveller through),
-/// and 4 is where neither loses. Past ~8 the transit slows back past baseline;
+/// line at once. The two want opposite ends (a stiff front rank helps the
+/// blob, a soft one lets a traveller through), and 4 is where neither loses. Past ~8 the transit slows back past baseline;
 /// below ~2 the blob's stutter returns.
 pub static HOLD_WEIGHT: TunableF32 = TunableF32::new(4.0);
 /// Fraction of a full step of remaining-path progress below which a moving
@@ -184,14 +183,12 @@ pub static DETOUR_LEN_RADII: TunableF32 = TunableF32::new(6.0);
 /// picking another enemy.
 pub static TARGET_SPREAD_PENALTY: TunableF32 = TunableF32::new(1.0);
 
-/// Diagnostic switch for [`Sim::last_push`]: while on, `flock` records how
-/// much separation push each unit received, split by ally and enemy.
+/// Diagnostic switch for [`Sim::last_push`]: while on, `flock` records how much
+/// separation push each unit received, split by ally and enemy.
 ///
-/// Off by default and deliberately not a `set_tuning` knob, because it changes
-/// no behaviour. It is off rather than unconditional because accumulating it
-/// measurably costs the separation pass (~3% at 2000 units, ~7% at 100, where
-/// the per-unit setup dominates), and the game never reads it.
-/// `examples/quality` turns it on for itself.
+/// Not a `set_tuning` knob, since it changes no behaviour. Off by default
+/// because accumulating it costs the separation pass ~3% at 2000 units (~7% at
+/// 100) and only `examples/quality` reads it.
 pub static PUSH_TRACKING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -417,8 +414,8 @@ pub struct Unit {
     pub damage: f32,
     /// Surface-to-surface (centre distance minus both radii) engagement range.
     pub attack_range: f32,
-    /// Ticks between attacks; authored and clamped to at least 1 at spawn (see
-    /// `combat_plan.md`'s "Combat stats" for why this stays in ticks).
+    /// Ticks between attacks; authored and clamped to at least 1 at spawn.
+    /// Kept in ticks, not seconds, so combat stays exactly reproducible.
     pub attack_cooldown_ticks: u32,
     /// Ticks remaining before this unit may fire again.
     pub cooldown_left: u32,
@@ -844,15 +841,12 @@ struct StepScratch {
     /// "blocked by bodies, not walls" half of the detour trigger.
     ally_contact: Vec<bool>,
     /// Separation push received per unit this tick, in world units, split by
-    /// whether the body doing the pushing was an ally or an enemy. Summed as
-    /// magnitudes, not vectors: being shoved equally from both sides is two
-    /// shoves, not none. Pre-cap, so it is what separation *asked* for; the
-    /// combined displacement is then clamped (see [`SEPARATION_MAX_FRAC`]).
+    /// ally and enemy. Summed as magnitudes, not vectors: equal shoves from
+    /// both sides are two shoves, not none. Pre-cap, so it is what separation
+    /// *asked* for (see [`SEPARATION_MAX_FRAC`]).
     ///
-    /// Instrumentation for the quality harness (`examples/quality`), read via
-    /// [`Sim::last_push`]. Written during `flock` and never read back into sim
-    /// state, so it is not part of [`Sim::state_hash`] and cannot affect
-    /// determinism. Left empty unless [`PUSH_TRACKING`] is on.
+    /// Written during `flock` and never read back into sim state, so it is not
+    /// part of [`Sim::state_hash`]. Empty unless [`PUSH_TRACKING`] is on.
     push_ally: Vec<f32>,
     push_enemy: Vec<f32>,
     /// Whether a moving unit is within its arrival radius of its goal (so it
@@ -1009,9 +1003,9 @@ impl Sim {
     /// Separation push each unit received on the most recent [`Sim::step`], as
     /// `(id, from_allies, from_enemies)` in world units.
     ///
-    /// A pure diagnostic for the quality harness: it is the shove separation
-    /// asked for, before the per-tick displacement cap, summed as magnitudes so
-    /// opposing shoves add rather than cancel. Empty before the first step.
+    /// A pure diagnostic: the shove separation asked for, before the per-tick
+    /// cap, summed as magnitudes so opposing shoves add rather than cancel.
+    /// Empty before the first step.
     pub fn last_push(&self) -> impl Iterator<Item = (UnitId, f32, f32)> + '_ {
         let s = &self.step_scratch;
         s.ids
@@ -1157,7 +1151,6 @@ impl Sim {
     /// channel per unit so the flock spreads across corridor width instead of
     /// single-filing the inside corner. A unit whose first leg into the channel
     /// fails line-of-sight (straggler / no useful channel) paths individually.
-    /// See `group_pathing_plan.md`.
     fn start_move(&mut self, units: &[UnitId], goal: Vector2) {
         // Live selected units, slot order (stable, deterministic). A fresh
         // move interrupts any combat engagement, same as it clears a path.
@@ -1634,8 +1627,8 @@ impl Sim {
         self.grid.rebuild(&s.positions, max_diameter.max(r_coh));
         let cdt = self.nav.navmesh();
         let separation_relax = SEPARATION_RELAX.get();
-        // Diagnostic only; sized here rather than pushed per unit above so the
-        // default path does no per-unit work at all.
+        // Sized here, not pushed per unit above, so the default path does no
+        // per-unit work.
         let track_push = PUSH_TRACKING.load(std::sync::atomic::Ordering::Relaxed);
         if track_push {
             s.push_ally.resize(s.ids.len(), 0.0);
@@ -4050,10 +4043,9 @@ mod tests {
 
     #[test]
     fn test_crowd_never_squeezes_through_subdiameter_gap() {
-        // narrow_gap_clearance_findings.md repro: a 6px slot, too tight for
-        // radius-5 (diameter-10) units. A single unit stalls at the entrance;
-        // sustained crowd pressure must not squeeze the front units through
-        // it either.
+        // A 6px slot, too tight for radius-5 (diameter-10) units. A single
+        // unit stalls at the entrance; sustained crowd pressure must not
+        // squeeze the front units through it either.
         let (points, constraints) = thin_wall_map(6.0);
         let walls = wall_segments(&points, &constraints);
         let mut sim = Sim::new(points, &constraints, 7);
@@ -4100,20 +4092,14 @@ mod tests {
 
     #[test]
     fn test_sealed_goal_is_refused_without_a_spin() {
-        // A goal inside a closed room can never be reached. The unit must
-        // notice once and stop, not acquire a partial path, walk at the wall,
-        // repath, and repeat. Re-clicking (the way a player who can see the
-        // goal does) must not change that.
+        // A goal in a closed room must be noticed once and dropped, not
+        // repathed at forever, even when the order is re-issued.
         //
-        // Distinct from `test_unreachable_goal_idles`, which puts the goal
-        // *off the mesh* so `locate_face` refuses it outright. Here the goal
-        // sits on a perfectly good face in a different component, which is the
-        // other refusal path, and this one adds the parts a single idle unit
-        // cannot show: a crowd, and an order re-issued for 900 ticks.
-        //
-        // Every quantity here is a flat must-be-zero, which is why it is a
-        // test and not a quality-harness scenario: there is no "slightly
-        // better" version of spinning.
+        // Unlike `test_unreachable_goal_idles`, the goal here sits on a good
+        // face in a different component (the other refusal path), with a crowd
+        // and 900 ticks of re-clicking that a single idle unit cannot show.
+        // Every quantity is a flat must-be-zero, which is why this is a test
+        // and not a scenario: there is no "slightly better" spinning.
         let mut b = vec![
             v(0.0, 0.0),
             v(400.0, 0.0),
@@ -4172,9 +4158,8 @@ mod tests {
 
     #[test]
     fn test_dense_crowd_through_a_doorway_never_crosses_a_wall() {
-        // `test_movement_never_crosses_walls` covers six units strolling. This
-        // is the same guarantee under funnel pressure: sixty bodies converging
-        // on one 30-wide door, which is where the clamp has to hold hardest.
+        // `test_movement_never_crosses_walls` under funnel pressure: sixty
+        // bodies on one 30-wide door, where the clamp holds hardest.
         let (points, constraints) = rooms_map(2, 2);
         let walls = wall_segments(&points, &constraints);
         let mut sim = Sim::new(points, &constraints, 0xD00B);
@@ -5152,10 +5137,8 @@ mod tests {
 
     #[test]
     fn test_counterflow_groups_pass_through_corridor() {
-        // Two flocks ordered through the same two doorways in opposite
-        // directions. They meet head-on in a 30px door, so they must work
-        // past each other and both arrive; a jam that never resolves is the
-        // failure this catches.
+        // Two flocks meeting head-on in a 30px door: both must work past and
+        // arrive. A jam that never resolves is the failure this catches.
         let (points, constraints) = rooms_map(3, 1);
         let walls = wall_segments(&points, &constraints);
         let mut sim = Sim::new(points, &constraints, 3);
@@ -5179,8 +5162,7 @@ mod tests {
             units: westbound.clone(),
             goal: west,
         }]);
-        // ~240px at 1px/tick, so 2000 ticks is many times over the travel time:
-        // anything still short of its goal here is stuck, not slow.
+        // ~240px at 1px/tick, so at 2000 ticks anything short is stuck.
         for _ in 0..2000 {
             sim.step(&[]);
             assert_no_wall_crossing(&sim, &walls);
@@ -5204,8 +5186,7 @@ mod tests {
     #[test]
     fn test_flock_repaths_when_obstacle_seals_its_door() {
         // A building dropped across the doorway a moving flock is headed for.
-        // The upper row of rooms still connects start to goal, so the whole
-        // flock must re-route and arrive rather than pile up at the seal.
+        // The upper rooms still connect, so it must re-route, not pile up.
         crate::report::install_collector();
         let (points, constraints) = rooms_map(3, 2);
         let walls = wall_segments(&points, &constraints);
@@ -5226,9 +5207,8 @@ mod tests {
         for &id in &ids {
             assert!(unit(&sim, id).pos.x < 190.0, "flock reached the door early");
         }
-        // Seal the bottom-row door at x=200 (gap y 35..65): a slab sitting
-        // flush against the wall plane, spanning past both jambs. Flush, not
-        // crossing — a crossing obstacle is rejected outright.
+        // Seal the bottom-row door at x=200 (gap y 35..65) with a slab flush
+        // against the wall plane. Flush, not crossing: crossing is rejected.
         sim.step(&[Command::AddObstacle {
             points: vec![
                 v(200.0, 30.0),
@@ -5258,9 +5238,8 @@ mod tests {
 
     #[test]
     fn test_mixed_radius_clump_separates_without_overlap() {
-        // `test_separation_disperses_clump_without_overlap` with two body
-        // sizes: separation must clear a big/small pair by the *sum* of their
-        // radii, not by some shared size.
+        // `test_separation_disperses_clump_without_overlap` with two sizes:
+        // a pair must clear by the *sum* of their radii, not a shared one.
         let (points, constraints) = rooms_map(3, 3);
         let mut sim = Sim::new(points, &constraints, 17);
         // Stacked in the middle room's interior, big and small interleaved.
@@ -5947,12 +5926,11 @@ mod tests {
         );
     }
 
-    // ── Combat positioning (combat_positioning_plan.md) ──────────────────
+    // ── Combat positioning ───────────────────────────────────────────────
     //
     // Thresholds below are absolute, with the pre-change baseline quoted in a
     // comment beside each — never a comparison against a recorded run, which
-    // would drift with every tuning change. Baselines come from the same
-    // scenarios measured on the commit before this one.
+    // would drift with every tuning change.
 
     /// Open box arena: encircling a defender needs room that a 100×100
     /// `rooms_map` cell doesn't have.
@@ -5964,10 +5942,10 @@ mod tests {
     const DEF: Vector2 = Vector2::new(350.0, 300.0);
 
     /// `n` melee attackers (radius 5, reach 2, one damage per tick) converging
-    /// from the left on one immobile, effectively indestructible defender —
-    /// the scenario every number in `combat_positioning_plan.md` was measured
-    /// on. `group` picks `AttackMove` (one flock, so cohesion is in play, the
-    /// worse case) over a direct `Attack`.
+    /// from the left on one immobile, effectively indestructible defender: the
+    /// scenario every threshold in this section was measured on. `group` picks
+    /// `AttackMove` (one flock, so cohesion is in play, the worse case) over a
+    /// direct `Attack`.
     fn blob_fight(n: usize, group: bool) -> (Sim, Vec<UnitId>, UnitId) {
         let mut sim = arena_sim(600.0, 600.0, 7);
         let defender = spawn_stats(&mut sim, DEF, 5.0, 0.0, 1, 1.0e6, 0.0, 0.0, 1);

@@ -1,19 +1,11 @@
-//! One module per scenario.
+//! One module per scenario: a seeded fixture plus the metrics it is *about*.
+//! Nothing scores everything.
 //!
-//! A scenario is a seeded fixture plus the list of metrics it is *about*.
-//! Nothing scores everything: `door_funnel` has no combat metrics, and
-//! `impassable_gap` weights phantoms and clearance far above how quickly
-//! anyone gets anywhere.
-//!
-//! Every scenario here has to have a *gradient*. The scorecard quantifies how
-//! the simulation should feel, which means each metric needs a meaningful
-//! "somewhat better" between its anchors. A quantity that is either right or
-//! broken has no such middle, and belongs in a `#[cfg(test)]` module next to
-//! the code, where it fails the build instead of scoring 100 forever. Two
-//! things moved out of this directory on exactly that reasoning:
-//! `unreachable_goal` (now `sim::tests::test_sealed_goal_is_refused_without_a_spin`)
-//! and the wall-penetration counts (`test_crowd_never_squeezes_through_*` and
-//! `test_dense_crowd_through_a_doorway_never_crosses_a_wall`).
+//! Every metric here needs a *gradient*, a meaningful "somewhat better"
+//! between its anchors. A quantity that is either right or broken belongs in a
+//! `#[cfg(test)]` module instead, where it fails the build rather than scoring
+//! 100 forever; `unreachable_goal` and the wall-penetration counts moved out
+//! of this directory on exactly that reasoning.
 
 use godot::prelude::Vector2;
 use rts_lib::sim::Command;
@@ -44,16 +36,11 @@ pub const ALL: &[ScenarioSpec] = &[
     stutter_step::SPEC,
 ];
 
-/// How much crowding a fixture *forces*, which is what the overlap zero point
-/// is scaled to.
-///
-/// Overlap is scored in every scenario where units can crowd, but "how much is
-/// too much" is not one number across all of them: eight units on a ring with
-/// room to spare and forty converging on a single melee target are physically
-/// different problems, and a single anchor pair would either excuse the march
-/// scenarios or condemn the crush ones for geometry they cannot avoid. The
-/// price is that the overlap columns are comparable *within* a scenario across
-/// runs, which is what a scorecard is for, and not *between* scenarios.
+/// How much crowding a fixture *forces*, which the overlap zero point scales
+/// to. Eight units on a roomy ring and forty converging on one melee target
+/// are different problems, and one anchor pair would either excuse the former
+/// or condemn the latter for geometry it cannot avoid. The price: overlap
+/// columns compare *within* a scenario across runs, not *between* scenarios.
 pub enum Crowding {
     /// Units have somewhere else to be. Any sustained overlap is a choice the
     /// flocking made, so the bar is high.
@@ -69,13 +56,10 @@ pub enum Crowding {
 impl Crowding {
     /// `(good, bad)` anchors for `(mean, p95, max, frac)`.
     ///
-    /// `mean` and `p95` are scaled to the tier, since what counts as too deep
-    /// depends on how much crowding the fixture forces. `max` and `frac` are
-    /// not: their zero points are the *physics*, 2.0 radii being two coincident
-    /// centres and 1.0 being every unit overlapping on every tick. Nothing can
-    /// be worse than either, so those two columns stay comparable across
-    /// scenarios and a scenario sitting at the cap is reporting a real cap and
-    /// not a badly chosen anchor.
+    /// `mean` and `p95` scale to the tier. `max` and `frac` do not: their zero
+    /// points are the *physics* (2.0 radii is coincident centres, 1.0 is every
+    /// unit overlapping every tick), so they stay comparable across scenarios
+    /// and a scenario at the cap is reporting a real cap, not a bad anchor.
     fn anchors(&self) -> [(f64, f64); 4] {
         match self {
             //                    mean          p95           max           frac
@@ -86,13 +70,10 @@ impl Crowding {
     }
 }
 
-/// The overlap block: four readings at a combined weight of 6, which lands
-/// overlap at roughly a third of a scenario's score.
-///
-/// All four, because each hides something the others show. `mean` is diluted
-/// by every tick nothing is touching; `p95` says how bad it is when it is bad;
-/// `max` catches the one moment two bodies nearly coincided; `frac` says how
-/// much of the run was spent overlapping at all rather than how deeply.
+/// The overlap block: four readings at a combined weight of 6, roughly a third
+/// of a scenario's score. All four because each hides what the others show:
+/// `mean` is diluted by quiet ticks, `p95` says how bad it gets, `max` catches
+/// the single worst moment, `frac` says how much of the run overlapped at all.
 pub fn overlap_readings(crowding: Crowding, s: &Stats) -> Vec<Reading> {
     let [mean, p95, max, frac] = crowding.anchors();
     vec![
@@ -103,12 +84,9 @@ pub fn overlap_readings(crowding: Crowding, s: &Stats) -> Vec<Reading> {
     ]
 }
 
-/// Reference raster pitch for a query radius.
-///
-/// Finer than a quarter-radius buys nothing (the sampling slack is already
-/// half a cell) and costs quadratically; coarser than 2 units starts blurring
-/// a doorway. Clamped at both ends so a huge map with small units doesn't turn
-/// one Dijkstra into a coffee break.
+/// Reference raster pitch for a query radius. Finer than a quarter-radius
+/// buys nothing and costs quadratically; coarser than 2 units blurs a doorway.
+/// Clamped so a huge map with small units stays quick.
 pub fn ref_cell(radius: f32) -> f32 {
     (radius / 4.0).clamp(0.5, 2.0)
 }

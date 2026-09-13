@@ -1,10 +1,9 @@
 //! Scorecard types, scoring, JSON, and the table / diff / sweep renderers.
 //!
-//! The harness never asserts and never fails a build (see `quality_bench_plan.md`,
-//! "Decision: scoring only, no gates"). Invariants belong in the crate's own
-//! `#[cfg(test)]` modules; here the same quantities are counts feeding a score,
-//! so a number that is already zero keeps being watched while the behaviour
-//! around it moves.
+//! The harness never asserts and never fails a build.
+//! Invariants belong in the crate's `#[cfg(test)]` modules; here the same
+//! quantities are counts feeding a score, so one already at zero keeps being
+//! watched while the behaviour around it moves.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -12,10 +11,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// One scored quantity: what it is, and the two values that pin its scale.
-///
-/// Direction is read off the anchors rather than stored beside them: `good`
-/// is by definition the 100-point end, so `good < bad` *is* "lower is better"
-/// and a separate field could only ever contradict them.
+/// Direction is read off the anchors rather than stored: `good` is the
+/// 100-point end, so `good < bad` *is* "lower is better".
 #[derive(Clone, Copy, Debug)]
 pub struct Metric {
     pub name: &'static str,
@@ -29,10 +26,8 @@ pub struct Metric {
 }
 
 /// Declare a metric: `good` scores 100, `bad` scores 0, and `weight` is its
-/// share of the scenario score (0 reports it without scoring it).
-///
-/// Scenarios import this as `m` so an anchor table stays one aligned line per
-/// metric. The anchors are the reviewable part, and they read best in a column.
+/// share of the scenario score (0 reports it without scoring it). Scenarios
+/// import this as `m` to keep the anchor table one aligned line per metric.
 pub const fn metric(
     name: &'static str,
     unit: &'static str,
@@ -60,8 +55,7 @@ impl Metric {
             return if value == self.good { 100.0 } else { 0.0 };
         }
         let t = ((value - self.bad) / span).clamp(0.0, 1.0);
-        // Explicit zero: `(bad - bad) / (good - bad)` is negative zero, which
-        // renders as "-0" in the points column.
+        // Explicit zero: `(bad - bad) / (good - bad)` renders as "-0".
         if t <= 0.0 { 0.0 } else { t * 100.0 }
     }
 
@@ -74,8 +68,8 @@ impl Metric {
     }
 
     /// This metric read at `value`, or pinned to the zero-point anchor when
-    /// the probe could not produce one. "No unit arrived, so there is no
-    /// detour to average" is a bad outcome, not a missing measurement.
+    /// the probe produced none: "no unit arrived, so no detour to average" is
+    /// a bad outcome, not a missing measurement.
     pub fn or_bad(self, value: Option<f64>) -> Reading {
         self.at(value.unwrap_or(self.bad))
     }
@@ -168,15 +162,15 @@ pub struct Scorecard {
     pub format: u32,
     pub git_sha: String,
     pub git_dirty: bool,
-    /// Digest over every anchor and weight in this card. Two cards with
-    /// different digests were scored on different scales.
+    /// Digest over every anchor and weight; differing digests mean the two
+    /// cards were scored on different scales.
     pub anchors: String,
     /// Tunables overridden for this run (`--sweep`); empty for a plain run.
     #[serde(default)]
     pub tuning: BTreeMap<String, f64>,
     pub scenarios: Vec<ScenarioResult>,
-    /// Unweighted mean of the scenario scores, so a scenario cannot dominate
-    /// by declaring more metrics than the rest.
+    /// Unweighted mean over scenarios, so one cannot dominate by declaring
+    /// more metrics.
     pub total: f64,
 }
 
@@ -277,12 +271,9 @@ fn fmt_delta(d: f64) -> String {
 }
 
 /// The run table: one block per scenario, its score and delta on the header
-/// row and its raw metric columns underneath.
-///
-/// The composite answers "did this change help overall"; the raw columns
-/// answer "what did it trade away", and these metrics genuinely trade against
-/// each other: tighter separation costs throughput, more cohesion costs
-/// arrival time. Read the score first, then the row.
+/// row and its raw metric columns underneath. The composite answers "did this
+/// help overall", the columns "what did it trade away" — and these do trade:
+/// tighter separation costs throughput, cohesion costs arrival time.
 pub fn render(card: &Scorecard, base: Option<&Scorecard>) -> String {
     let mut out = String::new();
     let mut mismatched: Vec<String> = Vec::new();
@@ -331,10 +322,9 @@ pub fn render(card: &Scorecard, base: Option<&Scorecard>) -> String {
             } else {
                 format!("  {}", m.name)
             };
-            // A metric that declared no scale (good == bad) is a raw reading,
-            // not a score; printing a points figure for it would be a lie. The
-            // `·` in the delta columns means "no change", so it cannot double
-            // as "no points" here.
+            // No scale declared (good == bad) means a raw reading, not a
+            // score. `·` already means "no change" in the delta columns, so it
+            // cannot double as "no points" here.
             let pts = if m.good == m.bad {
                 "n/a".to_string()
             } else {
@@ -354,9 +344,8 @@ pub fn render(card: &Scorecard, base: Option<&Scorecard>) -> String {
     }
 
     out.push_str(&format!("{}\n", "─".repeat(NAME_W + 40)));
-    // Only against the same scenario set. The total is a mean over scenarios,
-    // so diffing a `--only` run against a full baseline would report the
-    // scenarios that were skipped as a regression.
+    // Same scenario set only: the total is a mean over scenarios, so a
+    // `--only` run against a full baseline reports the skips as a regression.
     let same_set = base.is_some_and(|b| {
         b.scenarios.len() == card.scenarios.len()
             && card.scenarios.iter().all(|s| b.scenario(&s.name).is_some())
@@ -373,9 +362,8 @@ pub fn render(card: &Scorecard, base: Option<&Scorecard>) -> String {
         w = NAME_W
     ));
 
-    // The digest covers the scenarios in *this* card, so a filtered run has a
-    // different one by construction; the per-metric check above is what
-    // actually decides comparability.
+    // The digest covers only this card's scenarios, so a filtered run differs
+    // by construction; the per-metric check above decides comparability.
     out.push_str(&format!(
         "\n{} {}anchors {}\n",
         card.git_sha,
@@ -611,8 +599,8 @@ mod tests {
             ],
             BTreeMap::new(),
         );
-        // `a` alone totals 100 against a baseline of 50: a fifty-point
-        // "improvement" that is really just the other scenario not running.
+        // `a` alone totals 100 against a baseline of 50: an "improvement"
+        // that is only the other scenario not running.
         let only_a = ScenarioResult::new("a", vec![metric("m", "", 1.0, 0.0, 1.0).at(1.0)]);
         let filtered = Scorecard::new(vec![only_a], BTreeMap::new());
         let out = render(&filtered, Some(&base));
@@ -635,10 +623,9 @@ mod tests {
 
     #[test]
     fn test_scorecard_json_round_trips_bit_for_bit() {
-        // Full-mantissa values, not tidy ones: `serde_json`'s default float
-        // parser is not correctly rounded, which silently turned every metric
-        // into a phantom delta of ~1e-13 against the baseline. The crate pulls
-        // in the `float_roundtrip` feature to fix it; this is the guard.
+        // Full-mantissa, not tidy: `serde_json`'s default float parser is not
+        // correctly rounded, which turned every metric into a ~1e-13 phantom
+        // delta. `float_roundtrip` fixes it; this is the guard.
         let card = card_of("s", 1.0, 1.0 / 3.0);
         let text = serde_json::to_string_pretty(&card).unwrap();
         let back: Scorecard = serde_json::from_str(&text).unwrap();
@@ -651,9 +638,9 @@ mod tests {
 
     #[test]
     fn test_a_rerun_against_its_own_card_shows_no_deltas() {
-        // The whole premise of the scorecard: the sim is deterministic, so an
-        // unchanged run must diff to nothing at all. Any float that survives
-        // scoring but not the JSON would show up here as a stray delta.
+        // The scorecard's premise: the sim is deterministic, so an unchanged
+        // run must diff to nothing. A float that survives scoring but not the
+        // JSON shows up here as a stray delta.
         let card = card_of("s", 1.0, 1.0 / 3.0);
         let text = serde_json::to_string_pretty(&card).unwrap();
         let reloaded: Scorecard = serde_json::from_str(&text).unwrap();

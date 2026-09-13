@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "git_sha": "bee4eaf",
+  "git_sha": "94c01fd",
   "git_dirty": true,
   "anchors": "863c29633f935661",
   "tuning": {},
@@ -637,7 +637,7 @@
     },
     {
       "name": "combat_blob",
-      "score": 75.26105187633256,
+      "score": 64.665496320777,
       "metrics": [
         {
           "name": "in_range",
@@ -651,8 +651,8 @@
         {
           "name": "first_shot_p95",
           "unit": "ticks",
-          "value": 804.0,
-          "points": 79.46666666666667,
+          "value": 1400.0,
+          "points": 0.0,
           "weight": 2.0,
           "good": 650.0,
           "bad": 1400.0
@@ -873,5 +873,5 @@
       ]
     }
   ],
-  "total": 68.66518615217905
+  "total": 67.3407417077346
 }

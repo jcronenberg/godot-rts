@@ -1,12 +1,8 @@
-//! Scenario geometry.
+//! Scenario geometry, returning the crate's `(points, constraints)` map pair.
 //!
-//! Everything here returns the crate's `(points, constraints)` map pair, which
-//! is what `Sim::new`, `CDT` and the reference grid all take.
-//!
-//! The `test_maps/*.json` loader is a local copy of `test_utils::load_raw`,
-//! which is `#[cfg(test)] pub(crate)`. Reaching the real one would mean moving
-//! `serde` into `[dependencies]` and compiling it into the shipped `cdylib`,
-//! which is a poor trade for fifteen lines.
+//! The `test_maps/*.json` loader is a local copy of `test_utils::load_raw`
+//! (`#[cfg(test)] pub(crate)`). Reaching the real one would put `serde` in
+//! `[dependencies]` and into the shipped `cdylib`, a poor trade for 15 lines.
 
 use std::collections::BTreeMap;
 
@@ -62,9 +58,8 @@ pub fn box_map(w: f32, h: f32) -> (Vec<Vector2>, Vec<(u32, u32)>) {
     b.finish()
 }
 
-/// Two rooms of `600 x 400` joined by a single `door`-wide doorway at
-/// mid-height. The funnel scenario's whole point is that everything has to go
-/// through it.
+/// Two rooms of `600 x 400` joined by one `door`-wide doorway at mid-height,
+/// which everything has to go through.
 pub fn two_rooms(door: f32) -> (Vec<Vector2>, Vec<(u32, u32)>) {
     let (w, h) = (600.0, 400.0);
     let (lo, hi) = (h * 0.5 - door * 0.5, h * 0.5 + door * 0.5);
@@ -76,8 +71,7 @@ pub fn two_rooms(door: f32) -> (Vec<Vector2>, Vec<(u32, u32)>) {
 }
 
 /// Two rooms joined by a `200 x width` corridor, wide enough for several
-/// abreast, so two groups meeting inside have to resolve it rather than
-/// simply queue.
+/// abreast, so two groups meeting inside must resolve rather than queue.
 pub fn corridor(width: f32) -> (Vec<Vector2>, Vec<(u32, u32)>) {
     let (w, h) = (700.0, 300.0);
     let (lo, hi) = (h * 0.5 - width * 0.5, h * 0.5 + width * 0.5);
@@ -92,8 +86,8 @@ pub fn corridor(width: f32) -> (Vec<Vector2>, Vec<(u32, u32)>) {
     b.finish()
 }
 
-/// The `narrow_gap_clearance_findings.md` repro, verbatim: a 200x200 box with
-/// a 3px-thick wall leaving a `gap`-wide slot to the bottom boundary.
+/// A 200x200 box with a 3px-thick wall leaving a `gap`-wide slot to the
+/// bottom boundary.
 pub fn thin_wall(gap: f32) -> (Vec<Vector2>, Vec<(u32, u32)>) {
     let points = vec![
         v(0.0, 0.0),

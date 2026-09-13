@@ -1,20 +1,16 @@
-//! The control: one unit, one long route, nothing in its way.
+//! The control: one unit, one long route, nothing in its way. Every other
+//! scenario adds a crowd, a wall or a fight on top. If this row moves, the
+//! change touched pathing itself rather than how units negotiate each other.
 //!
-//! Every other scenario adds a crowd, a wall or a fight on top of this. If
-//! `solo_march` moves, the change touched pathing itself, not how units
-//! negotiate each other, which is worth knowing before reading any other row.
-//!
-//! It also happens to be the one scenario where `suboptimality` has real room
-//! in it today. `rooms_map` centres every door, which makes a door-to-door
-//! staircase across the grid *exactly* as long as the straight diagonal
-//! (`19 * 2 * sqrt(50^2 + 50^2)` = `1900 * sqrt(2)`), and that is what the
-//! reference finds. `find_path` instead runs down one column of aligned doors
-//! and along one row, for about 39% more: the bounded-refinement limit its
-//! own docs warn about on large meshes, now with a number on it.
+//! It is also where `suboptimality` has real room today. `rooms_map` centres
+//! every door, making a door-to-door staircase *exactly* as long as the
+//! straight diagonal (`1900 * sqrt(2)`), which is what the reference finds.
+//! `find_path` runs down one column of doors and along one row instead, for
+//! ~39% more: the bounded-refinement limit its own docs warn about, with a
+//! number on it.
 //!
 //! `detour` sitting on top of `suboptimality` is the tell that the unit walks
-//! what it is given faithfully: the cost is in the plan, not in the walking.
-//! The two coming apart would mean the opposite.
+//! its plan faithfully; the two coming apart would mean the opposite.
 
 use godot::prelude::Vector2;
 use rts_lib::astar::AStarScratch;

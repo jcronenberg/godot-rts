@@ -5,18 +5,15 @@ extends Node2D
 ##     cd rust && cargo run --release --example quality -- --trace door_funnel_200
 ##
 ## which writes `rust/target/quality/trace_<scenario>.json`. Set [member
-## trace_path] to it and run the scene. When a score drops we want to *watch*
-## the run, not read the number, and because the sim is headless and
-## deterministic, this is the exact run that produced the number, not a
-## re-enactment of it.
+## trace_path] to it and run the scene. The sim is deterministic, so this is
+## the exact run that produced the score, not a re-enactment.
 ##
 ## Space plays/pauses, left/right step a tick (held: scrub), up/down change
 ## speed, Home rewinds, P toggles paths.
 ##
-## Traces are one JSON object per tick per unit, so they scale with
-## `units * ticks`: `concave_trap` is 3 MB, `door_funnel_200` is 67 MB and takes
-## a while to parse. The default is a small one on purpose; point [member
-## trace_path] at a bigger scenario once you know the scene works.
+## Traces are one JSON object per tick per unit, scaling with `units * ticks`:
+## `solo_march` loads instantly, `door_funnel_200` is 67 MB. The default is a
+## small one on purpose.
 
 ## Per-team unit color, indexed by team id (wraps via modulo). Matches
 ## `sim_test.gd` so a trace looks like the live view.
@@ -27,10 +24,9 @@ const TEAM_COLORS: Array[Color] = [
 	Color(0.9, 0.8, 0.3),
 ]
 
-## Ring drawn around a unit for the first flag that applies, in this order
-## (GDScript dictionaries iterate in insertion order, so the order is the
-## priority). Stuck states outrank settled ones: a unit that is both parked and
-## stalling is interesting for the stall.
+## Ring drawn for the first flag that applies; insertion order is the
+## priority. Stuck states outrank settled ones, since a unit that is both
+## parked and stalling is interesting for the stall.
 const FLAG_COLORS := {
 	"stall": Color(1.0, 0.2, 0.2),
 	"ally_stall": Color(1.0, 0.6, 0.1),
@@ -42,7 +38,7 @@ const FLAG_COLORS := {
 ## `_flag_color` result for a unit with nothing worth ringing.
 const NO_FLAG := Color(0, 0, 0, 0)
 
-@export_file("*.json") var trace_path: String = "res://rust/target/quality/trace_concave_trap.json"
+@export_file("*.json") var trace_path: String = "res://rust/target/quality/trace_solo_march.json"
 ## Trace ticks replayed per second at speed 1. The harness runs the sim at 30 Hz.
 @export var tick_rate: float = 30.0
 @export var show_paths: bool = true
@@ -84,8 +80,7 @@ func _load(path: String) -> void:
 	_ticks = data.get("ticks", [])
 	if _wall_events.is_empty():
 		# Drop the frames too: `_draw` indexes `_wall_events[0]`, so a
-		# half-loaded trace would crash on the first redraw rather than
-		# showing the "no trace loaded" label.
+		# half-loaded trace crashes instead of showing the empty label.
 		_ticks = []
 		push_error("quality_replay: %s has no wall_events (regenerate it with --trace)" % path)
 		return
@@ -93,9 +88,8 @@ func _load(path: String) -> void:
 	_frame_camera()
 
 
-## Fit the whole map on screen, so a trace from any scenario opens usable
-## without touching the camera first. Framed over every wall the run ever has,
-## not just the opening set, so a dropped building cannot land off-screen.
+## Fit the whole map on screen. Framed over every wall the run ever has, not
+## just the opening set, so a dropped building cannot land off-screen.
 func _frame_camera() -> void:
 	var first: Array = _wall_events[0]["segments"]
 	if first.is_empty():
@@ -163,8 +157,8 @@ func _update_label() -> void:
 	]
 
 
-## The wall set in force at `tick`. Events are few (one, plus one per obstacle
-## change) and in order, so a scan costs nothing.
+## The wall set in force at `tick`. Events are few and ordered, so a linear
+## scan costs nothing.
 func _walls_at(tick: int) -> Array:
 	var segs: Array = _wall_events[0]["segments"]
 	for ev in _wall_events:
@@ -201,7 +195,7 @@ func _draw() -> void:
 
 
 ## First flag that applies, or [constant NO_FLAG]. The trace carries booleans
-## for latched states and tick counters for the stuck ones; both read as "on".
+## for latched states and counters for stuck ones; both read as "on".
 func _flag_color(unit: Dictionary) -> Color:
 	for key in FLAG_COLORS:
 		var v: Variant = unit.get(key)

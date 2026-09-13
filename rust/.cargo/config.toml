@@ -7,8 +7,10 @@
 #   cargo +nightly build -Zbuild-std --target wasm32-unknown-emscripten --release
 #
 # Build with an emscripten matching the one your Godot web export templates
-# were built with (EM_VERSION 4.0.11 on the Godot 4.7 branch). A mismatch
-# shows up as link errors or missing dynCall_* symbols at page load.
+# were built with. A mismatch shows up as link errors or missing dynCall_*
+# symbols at page load. The version is deliberately not repeated here: see
+# docs/web_export.md, which names the running game's own console banner as the
+# authority over the numbers in Godot's branch and CI files.
 #
 # No -pthread / +atomics here on purpose: this is the nothreads build, paired
 # with `experimental-wasm-nothreads` and Thread Support OFF in the preset.

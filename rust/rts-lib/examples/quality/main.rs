@@ -1,9 +1,8 @@
 //! Movement quality scorecard.
 //!
-//! A second benchmark family alongside `benches/{astar,delaunay,sim}.rs`.
-//! Instead of timing a tick, it scores *how well units path*, so a movement
-//! change can be compared against the previous state of the tree with numbers
-//! rather than by watching the Godot view. See `quality_bench_plan.md`.
+//! A second benchmark family alongside `benches/{astar,delaunay,sim}.rs`:
+//! instead of timing a tick, it scores *how well units path*, so a movement
+//! change can be judged by numbers rather than by watching the Godot view.
 //!
 //! ```text
 //! cargo run --release --example quality                   # run, diff vs baseline
@@ -16,27 +15,23 @@
 //! cargo run --release --example quality -- --sweep cohesion_gain=0.02:0.10:0.02
 //! ```
 //!
-//! `--trace` writes `target/quality/trace_<scenario>.json`, which the Godot
-//! scene `src/game/quality_replay.tscn` plays back. Traces are large and
-//! derived, so they stay under `target/` and are never committed. Walls are
-//! recorded as timed events read from the live navmesh, so a scenario that
-//! adds or removes an obstacle mid-run replays with the geometry it actually
-//! had at each tick. A trace is
-//! one JSON object per unit per tick, so its size scales with `units * ticks`:
-//! `--trace all` is well over a hundred megabytes across the suite, and each
-//! file's size is printed as it is written.
+//! `--trace` writes `target/quality/trace_<scenario>.json`, played back by the
+//! Godot scene `src/game/quality_replay.tscn`. Walls are timed events from the
+//! live navmesh, so mid-run obstacle edits replay correctly. One JSON object
+//! per unit per tick, so size scales with `units * ticks`: `--trace all` is
+//! well over a hundred megabytes, and each file's size is printed. Derived and
+//! large, so traces stay under `target/` and are never committed.
 //!
-//! Always `--release`. The sim behaves identically in debug, but the scenarios
-//! step tens of thousands of ticks and a debug build makes that a coffee break.
+//! Always `--release`: identical behaviour in debug, but tens of thousands of
+//! ticks make it a coffee break.
 //!
-//! Nothing here reports wall-clock time. That is deliberate, so a slow-but-better
+//! Nothing here reports wall-clock time, deliberately, so a slow-but-better
 //! change scores as better. Timing is what `benches/` is for.
 //!
-//! The sim is deterministic (fixed tick, seeded `Pcg32`, slot-order iteration,
-//! no wall clock in state), so every number below is bit-identical run to run
-//! on the same binary. There is no sampling and no noise floor: **any nonzero
-//! delta is a real behaviour change**. That also means scorecards compare
-//! across commits on one machine, not across machines.
+//! The sim is deterministic, so every number is bit-identical run to run on the
+//! same binary. No sampling, no noise floor: **any nonzero delta is a real
+//! behaviour change**. Scorecards therefore compare across commits on one
+//! machine, not across machines.
 
 mod harness;
 mod maps;
@@ -79,9 +74,8 @@ fn main() {
     }
 }
 
-/// Repo root: where the committed baseline lives, and the parent of
-/// `target/`. Canonicalised so the paths this prints are the ones a reader
-/// would type, not `.../rts-lib/../quality_baseline.json`.
+/// Repo root: the committed baseline's home and `target/`'s parent.
+/// Canonicalised so printed paths are the ones a reader would type.
 fn root() -> PathBuf {
     let raw = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
     raw.canonicalize().unwrap_or(raw)
@@ -178,8 +172,7 @@ impl Cli {
             }
             i += 1;
         }
-        // Every scenario named by `--only` or `--trace` has to exist; a typo
-        // that silently traced nothing would look exactly like success.
+        // A typo that silently traced nothing would look like success.
         let unknown = cli
             .only
             .iter()
@@ -258,9 +251,8 @@ impl Cli {
         Scorecard::new(results, tuning)
     }
 
-    /// One column of scores per tunable value. Sweeps write no baseline and
-    /// touch no committed file. They answer "which constant", not "did this
-    /// commit help".
+    /// One column of scores per tunable value. Answers "which constant", not
+    /// "did this commit help", and touches no committed file.
     fn run_sweep(&self, sweep: &Sweep) {
         let Some(original) = rts_lib::sim::get_tuning(&sweep.name) else {
             eprintln!("unknown tunable `{}`", sweep.name);

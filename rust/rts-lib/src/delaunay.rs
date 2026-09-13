@@ -3083,8 +3083,7 @@ mod tests {
 
     #[test]
     fn test_narrow_gap_under_obstacle_reports_true_clearance() {
-        // Repro from narrow_gap_clearance_findings.md: a 3px-thick wall leaves
-        // a 6px slot to the map boundary. The diagonal portal spanning that
+        // A 3px-thick wall leaving a 6px slot to the map boundary. The diagonal portal spanning that
         // slot must report a radius close to the true ~3 (half the 6px gap),
         // not the ~23.6 the boundary-wall attribution bug produced by missing
         // the bottom-boundary wall at vertex 1 = (200,0).
