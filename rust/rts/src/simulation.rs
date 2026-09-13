@@ -50,6 +50,18 @@ impl Simulation {
         constraints: PackedInt32Array,
         seed: i64,
     ) {
+        // `Sim::new` -> `CDT::from_points` asserts on <3 points. Reject it here
+        // instead: an empty map is a caller mistake, not an invariant break, and
+        // on the web (panic=abort) that assert takes the whole instance down
+        // rather than being caught and reported. Mirrors the same guard in
+        // `DelaunayTriangulator::triangulate`.
+        if points.len() < 3 {
+            godot_error!(
+                "Simulation: load_map needs at least 3 points, got {}",
+                points.len()
+            );
+            return;
+        }
         let constraints: Vec<(u32, u32)> = constraints
             .as_slice()
             .chunks_exact(2)
@@ -64,7 +76,9 @@ impl Simulation {
     fn enqueue(&self, cmd: Command) {
         match &self.handle {
             Some(h) => h.enqueue(cmd),
-            None => godot_warn!("Simulation: no map loaded; call load_map() first"),
+            None => {
+                godot_warn!("Simulation: no map loaded; call load_map() first");
+            }
         }
     }
 
@@ -250,9 +264,11 @@ impl Simulation {
     /// seconds. Returns the interpolation alpha for `get_positions`.
     #[func]
     pub fn poll(&mut self, delta: f64) -> f32 {
-        let Some(handle) = &self.handle else {
+        let Some(handle) = &mut self.handle else {
             return 0.0;
         };
+        // No-op off the web; on the web this is the sim's pacing (no sim thread).
+        handle.pump(delta);
         // godot_error! only works on the main thread; drain sim-thread errors here.
         for error in handle.take_errors() {
             godot_error!("sim: {error}");
@@ -416,13 +432,13 @@ impl Simulation {
             return out;
         };
         out.set("version", dump.version as i64);
-        out.set("points", PackedVector2Array::from(dump.points.as_slice()));
+        out.set("points", &PackedVector2Array::from(dump.points.as_slice()));
         out.set(
             "edges",
-            PackedVector2Array::from(dump.constrained_edges.as_slice()),
+            &PackedVector2Array::from(dump.constrained_edges.as_slice()),
         );
         let indices: PackedInt32Array = dump.indices.iter().map(|&i| i as i32).collect();
-        out.set("indices", indices);
+        out.set("indices", &indices);
         out
     }
 }

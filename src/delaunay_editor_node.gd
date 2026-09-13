@@ -31,8 +31,11 @@ var _mesh_vertices: PackedVector2Array = []  # Unique vertices, including insert
 var _triangulator: DelaunayTriangulator = DelaunayTriangulator.new()
 var _pending_constraint_start: int = -1  # User adding constraint tracking
 var _mouse_pos: Vector2 = Vector2.ZERO
-var _save_dialog: EditorFileDialog = null
-var _load_dialog: EditorFileDialog = null
+# Untyped on purpose: these hold EditorFileDialogs, a class that does not
+# exist outside the editor. A static type here is a parse error in an
+# exported build (web included), even though nothing constructs them there.
+var _save_dialog = null
+var _load_dialog = null
 var _top_layer: TopLayer = null
 
 
@@ -68,8 +71,13 @@ func _exit_tree() -> void:
 		_load_dialog = null
 
 
+## Editor-only: mouse position in this node's local space. Returns ZERO at
+## runtime, where there is no editor viewport to ask.
 func vp_to_local() -> Vector2:
-	var vp_pos := EditorInterface.get_editor_viewport_2d().get_mouse_position()
+	if not Engine.is_editor_hint():
+		return Vector2.ZERO
+	var editor_interface: Object = Engine.get_singleton(&"EditorInterface")
+	var vp_pos: Vector2 = editor_interface.get_editor_viewport_2d().get_mouse_position()
 	return get_global_transform().affine_inverse() * vp_pos
 
 
@@ -215,25 +223,33 @@ func clear_all() -> void:
 
 
 func _save_to_json() -> void:
+	if not Engine.is_editor_hint():
+		return
 	if _save_dialog == null:
-		_save_dialog = EditorFileDialog.new()
-		_save_dialog.file_mode = EditorFileDialog.FILE_MODE_SAVE_FILE
-		_save_dialog.access = EditorFileDialog.ACCESS_FILESYSTEM
-		_save_dialog.add_filter("*.json", "JSON Map Files")
-		_save_dialog.file_selected.connect(_on_save_file_selected)
-		EditorInterface.get_base_control().add_child(_save_dialog)
+		_save_dialog = _make_file_dialog("FILE_MODE_SAVE_FILE", _on_save_file_selected)
 	_save_dialog.popup_centered_ratio(0.5)
 
 
 func _load_from_json() -> void:
+	if not Engine.is_editor_hint():
+		return
 	if _load_dialog == null:
-		_load_dialog = EditorFileDialog.new()
-		_load_dialog.file_mode = EditorFileDialog.FILE_MODE_OPEN_FILE
-		_load_dialog.access = EditorFileDialog.ACCESS_FILESYSTEM
-		_load_dialog.add_filter("*.json", "JSON Map Files")
-		_load_dialog.file_selected.connect(_on_load_file_selected)
-		EditorInterface.get_base_control().add_child(_load_dialog)
+		_load_dialog = _make_file_dialog("FILE_MODE_OPEN_FILE", _on_load_file_selected)
 	_load_dialog.popup_centered_ratio(0.5)
+
+
+## Build an EditorFileDialog without naming the class at parse time. `mode` is
+## the EditorFileDialog.FileMode constant name; its value is looked up rather
+## than hardcoded, so it cannot drift from the engine.
+func _make_file_dialog(mode: String, on_selected: Callable) -> Object:
+	var dialog: Object = ClassDB.instantiate(&"EditorFileDialog")
+	dialog.file_mode = ClassDB.class_get_integer_constant(&"EditorFileDialog", mode)
+	dialog.access = ClassDB.class_get_integer_constant(&"EditorFileDialog", &"ACCESS_FILESYSTEM")
+	dialog.add_filter("*.json", "JSON Map Files")
+	dialog.file_selected.connect(on_selected)
+	var editor_interface: Object = Engine.get_singleton(&"EditorInterface")
+	editor_interface.get_base_control().add_child(dialog)
+	return dialog
 
 
 func _on_save_file_selected(path: String) -> void:

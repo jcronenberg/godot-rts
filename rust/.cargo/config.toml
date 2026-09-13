@@ -1,0 +1,38 @@
+# Web (wasm32-unknown-emscripten) build flags for the GDExtension.
+#
+# The extension is loaded by Godot's already-linked wasm runtime, so it builds
+# as an emscripten SIDE_MODULE rather than a standalone program. The -Z flags
+# are why the web build needs nightly:
+#
+#   cargo +nightly build -Zbuild-std --target wasm32-unknown-emscripten --release
+#
+# Build with an emscripten matching the one your Godot web export templates
+# were built with (EM_VERSION 4.0.11 on the Godot 4.7 branch). A mismatch
+# shows up as link errors or missing dynCall_* symbols at page load.
+#
+# No -pthread / +atomics here on purpose: this is the nothreads build, paired
+# with `experimental-wasm-nothreads` and Thread Support OFF in the preset.
+#
+# The godot-rust book also lists `-Z emscripten-wasm-eh=false` and
+# `-C llvm-args=-enable-emscripten-cxx-exceptions=0`. Both selected the old
+# JS-based exception lowering, which rustc removed in 1.98 (rust-lang/rust
+# #156928) when wasm EH became unconditional on emscripten. On a current
+# nightly the first is a hard "unknown unstable option" error and the second
+# is dead weight, so neither is here.
+#
+# `panic=abort` replaces them. Rust lowers panics to C++ exceptions, so with
+# wasm EH the side module imports a `WebAssembly.Tag` named `__cpp_exception`.
+# Godot's 4.7 template predates wasm EH and exports that name as a non-Tag,
+# which fails at load with:
+#   LinkError: import object field '__cpp_exception' is not a Tag
+# An extension that never unwinds never imports the tag. Scoped to this target,
+# so native builds keep unwinding panics. Requires the matching build flag:
+#   cargo +nightly build -Zbuild-std=std,panic_abort \
+#     --target wasm32-unknown-emscripten --release
+[target.wasm32-unknown-emscripten]
+rustflags = [
+    "-C", "link-args=-sSIDE_MODULE=2",
+    "-C", "panic=abort",
+    "-Z", "default-visibility=hidden",
+    "-Z", "link-native-libraries=no",
+]

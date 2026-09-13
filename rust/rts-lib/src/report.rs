@@ -40,7 +40,9 @@ pub fn drain() -> Vec<String> {
 pub fn error_fmt(args: fmt::Arguments) {
     COLLECTOR.with(|c| match &mut *c.borrow_mut() {
         Some(queue) => queue.push(args.to_string()),
-        None => godot::global::godot_error!("{args}"),
+        None => {
+            godot::global::godot_error!("{args}");
+        }
     });
 }
 

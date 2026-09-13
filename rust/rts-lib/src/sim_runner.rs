@@ -1,12 +1,21 @@
-//! Sim thread runner: deadline loop around [`Sim::step`], command queue in,
+//! Sim runner: deadline loop around [`Sim::step`], command queue in,
 //! `Arc`-swapped snapshots out. Pacing lives here, never in the sim core —
 //! tests/benches/replays call `step` directly. No Godot dependencies.
+//!
+//! Two pacing strategies behind one [`SimHandle`] API. Off the web the sim
+//! owns a thread and paces itself against the wall clock. On the web there
+//! are no threads to pace with, so the view drives [`SimHandle::pump`] once
+//! per frame and the ticks run inline. Both funnel into [`tick_once`], which
+//! holds the actual tick body and no pacing at all.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(not(target_family = "wasm"))]
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+#[cfg(not(target_family = "wasm"))]
+use std::time::Duration;
+use std::time::Instant;
 
 use godot::prelude::Vector2;
 
@@ -260,11 +269,31 @@ struct Shared {
 }
 
 /// Handle owned by the view side; dropping it (or calling [`SimHandle::shutdown`])
-/// stops and joins the sim thread.
+/// stops and joins the sim thread (off the web) or drops the sim (on it).
 pub struct SimHandle {
     shared: Arc<Shared>,
+    #[cfg(not(target_family = "wasm"))]
     thread: Option<JoinHandle<()>>,
+    #[cfg(target_family = "wasm")]
+    inline: Inline,
 }
+
+/// Inline stepping state. Without threads the sim lives in the handle itself
+/// and [`SimHandle::pump`] advances it from the view's frame delta.
+#[cfg(target_family = "wasm")]
+struct Inline {
+    sim: Sim,
+    /// Whole ticks owed to the sim, accumulated from frame deltas.
+    debt: f64,
+    /// Reused command buffer, swapped with the shared queue each tick.
+    commands: Vec<Command>,
+}
+
+/// Ticks one [`SimHandle::pump`] will run before it gives up and drops the
+/// rest of the debt. Mirrors the threaded loop's overrun rule: fall far
+/// enough behind and the lost ticks are dropped, never replayed in a burst.
+#[cfg(target_family = "wasm")]
+const MAX_CATCHUP_STEPS: u32 = 2;
 
 impl SimHandle {
     /// Take ownership of `sim` and start stepping it at [`crate::sim::TICK_RATE`].
@@ -281,16 +310,71 @@ impl SimHandle {
             errors: Mutex::new(Vec::new()),
             next_obstacle_id: AtomicU64::new(sim.next_obstacle_id()),
         });
-        let thread = {
-            let shared = Arc::clone(&shared);
-            std::thread::Builder::new()
-                .name("sim".into())
-                .spawn(move || run_loop(sim, &shared))
-                .expect("spawn sim thread")
-        };
-        SimHandle {
-            shared,
-            thread: Some(thread),
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let thread = {
+                let shared = Arc::clone(&shared);
+                std::thread::Builder::new()
+                    .name("sim".into())
+                    .spawn(move || run_loop(sim, &shared))
+                    .expect("spawn sim thread")
+            };
+            SimHandle {
+                shared,
+                thread: Some(thread),
+            }
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            SimHandle {
+                shared,
+                inline: Inline {
+                    sim,
+                    debt: 0.0,
+                    commands: Vec::new(),
+                },
+            }
+        }
+    }
+
+    /// Advance the sim by `delta` seconds of frame time. Call once per frame
+    /// from the view, before reading [`SimHandle::snapshot`].
+    ///
+    /// No-op off the web, where the sim thread paces itself against the wall
+    /// clock and this only exists so the view needs no `cfg` of its own.
+    #[cfg(not(target_family = "wasm"))]
+    #[inline]
+    pub fn pump(&mut self, _delta: f64) {}
+
+    /// Advance the sim by `delta` seconds of frame time. Call once per frame
+    /// from the view, before reading [`SimHandle::snapshot`].
+    ///
+    /// This is the whole pacing loop on the web: accumulate frame time as
+    /// tick debt and run up to [`MAX_CATCHUP_STEPS`] ticks to pay it off.
+    /// Steps run on the calling (main) thread, so a tick that overruns the
+    /// frame budget costs a dropped frame rather than sim lag.
+    #[cfg(target_family = "wasm")]
+    pub fn pump(&mut self, delta: f64) {
+        if self.shared.paused.load(Ordering::Relaxed) {
+            // Drop the debt rather than bank it, or unpausing bursts.
+            self.inline.debt = 0.0;
+            return;
+        }
+        let speed = f32::from_bits(self.shared.speed_bits.load(Ordering::Relaxed));
+        self.inline.debt += delta * speed as f64 * crate::sim::TICK_RATE as f64;
+
+        let mut steps = 0;
+        while self.inline.debt >= 1.0 && steps < MAX_CATCHUP_STEPS {
+            tick_once(
+                &mut self.inline.sim,
+                &self.shared,
+                &mut self.inline.commands,
+            );
+            self.inline.debt -= 1.0;
+            steps += 1;
+        }
+        if self.inline.debt >= 1.0 {
+            self.inline.debt = 0.0; // >MAX_CATCHUP_STEPS behind: drop the lost ticks
         }
     }
 
@@ -351,13 +435,14 @@ impl SimHandle {
         std::mem::take(&mut self.shared.errors.lock().unwrap())
     }
 
-    /// Stop and join the sim thread.
+    /// Stop the sim: joins the sim thread, or drops the inline sim on the web.
     pub fn shutdown(mut self) {
         self.join();
     }
 
     fn join(&mut self) {
         self.shared.quit.store(true, Ordering::Relaxed);
+        #[cfg(not(target_family = "wasm"))]
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -370,10 +455,11 @@ impl Drop for SimHandle {
     }
 }
 
-/// Deadline loop: sleep to the next tick deadline, drain the queue, step,
-/// publish. On overrun the loop catches up by at most one extra tick; once
-/// it falls more than one period behind wall clock the deadline resets and
-/// the lost ticks are dropped instead of replayed.
+/// Deadline loop: sleep to the next tick deadline, then [`tick_once`]. On
+/// overrun the loop catches up by at most one extra tick; once it falls more
+/// than one period behind wall clock the deadline resets and the lost ticks
+/// are dropped instead of replayed.
+#[cfg(not(target_family = "wasm"))]
 fn run_loop(mut sim: Sim, shared: &Shared) {
     // Queue report_error! messages instead of engine-printing (main-thread only).
     crate::report::install_collector();
@@ -393,43 +479,53 @@ fn run_loop(mut sim: Sim, shared: &Shared) {
             continue;
         }
 
-        {
-            let mut queue = shared.commands.lock().unwrap();
-            std::mem::swap(&mut commands, &mut *queue);
-        }
-        let step_start = Instant::now();
-        sim.step(&commands);
-        let step_ms = step_start.elapsed().as_secs_f32() * 1000.0;
-        commands.clear();
+        tick_once(&mut sim, shared, &mut commands);
+    }
+}
 
-        let errors = crate::report::drain();
-        if !errors.is_empty() {
-            shared.errors.lock().unwrap().extend(errors);
-        }
+/// One tick: drain the command queue, step, publish a snapshot, and fill a
+/// requested mesh dump. No pacing and no blocking — the caller decides when
+/// a tick is due, which is what lets the threaded loop and the inline pump
+/// share it.
+fn tick_once(sim: &mut Sim, shared: &Shared, commands: &mut Vec<Command>) {
+    {
+        let mut queue = shared.commands.lock().unwrap();
+        std::mem::swap(commands, &mut *queue);
+    }
+    let step_start = Instant::now();
+    sim.step(commands);
+    let step_ms = step_start.elapsed().as_secs_f32() * 1000.0;
+    commands.clear();
 
-        let debug = shared.debug_overlay.load(Ordering::Relaxed);
-        let mut snap = Snapshot::capture(&sim, debug);
-        snap.step_ms = step_ms;
-        *shared.snapshot.lock().unwrap() = Arc::new(snap);
+    // Empty unless a collector is installed (threaded path); without one
+    // `report_error!` has already printed engine-side from the main thread.
+    let errors = crate::report::drain();
+    if !errors.is_empty() {
+        shared.errors.lock().unwrap().extend(errors);
+    }
 
-        if shared.mesh_dump_requested.swap(false, Ordering::Relaxed) {
-            let cdt = sim.navmesh();
-            let mut indices = Vec::with_capacity(cdt.num_faces() as usize * 3);
-            for f in 0..cdt.num_faces() {
-                indices.extend(cdt.face_vertices(f));
-            }
-            let mut edges = Vec::new();
-            cdt.for_each_constrained_edge(|a, b| {
-                edges.push(a);
-                edges.push(b);
-            });
-            *shared.mesh_dump.lock().unwrap() = Some(MeshDump {
-                version: cdt.version(),
-                points: cdt.points().to_vec(),
-                constrained_edges: edges,
-                indices,
-            });
+    let debug = shared.debug_overlay.load(Ordering::Relaxed);
+    let mut snap = Snapshot::capture(sim, debug);
+    snap.step_ms = step_ms;
+    *shared.snapshot.lock().unwrap() = Arc::new(snap);
+
+    if shared.mesh_dump_requested.swap(false, Ordering::Relaxed) {
+        let cdt = sim.navmesh();
+        let mut indices = Vec::with_capacity(cdt.num_faces() as usize * 3);
+        for f in 0..cdt.num_faces() {
+            indices.extend(cdt.face_vertices(f));
         }
+        let mut edges = Vec::new();
+        cdt.for_each_constrained_edge(|a, b| {
+            edges.push(a);
+            edges.push(b);
+        });
+        *shared.mesh_dump.lock().unwrap() = Some(MeshDump {
+            version: cdt.version(),
+            points: cdt.points().to_vec(),
+            constrained_edges: edges,
+            indices,
+        });
     }
 }
 

@@ -7,5 +7,24 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-godot = "0.4.5"
+godot = "0.5.5"
 rts-lib = { path = "../rts-lib/" }
+
+# Web build. `experimental-wasm` is the web support itself; the `-nothreads`
+# variant matches our inline sim pacing (see sim_runner) and must agree with
+# "Thread Support" being OFF in the Godot web export preset. Cargo unifies
+# features across the graph, so rts-lib's `godot` gets these too.
+# `lazy-function-tables` avoids the big eagerly-built fptr tables, which the
+# wasm side module is much happier with.
+#
+# No `api-custom` here. Up to gdext 0.4.x the web build needed it, because the
+# prebuilt `gdextension_interface.rs` was generated for 64-bit pointers and its
+# size assertions all fail on wasm32. gdext 0.5.0 fixed that ("Wasm without
+# api-custom, no more LLVM/bindgen"), so the web build no longer drags in
+# bindgen, libclang, or GODOT4_BIN.
+[target.'cfg(target_family = "wasm")'.dependencies]
+godot = { version = "0.5.5", features = [
+    "experimental-wasm",
+    "experimental-wasm-nothreads",
+    "lazy-function-tables",
+] }
