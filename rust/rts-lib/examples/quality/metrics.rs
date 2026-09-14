@@ -496,7 +496,12 @@ impl Run {
                 groups.entry(u.group).or_default().push((u.pos, u.radius));
             }
         }
-        if let Some(g) = mean(&groups.values().filter_map(|m| gyration(m)).collect::<Vec<f64>>()) {
+        if let Some(g) = mean(
+            &groups
+                .values()
+                .filter_map(|m| gyration(m))
+                .collect::<Vec<f64>>(),
+        ) {
             self.gyration_sum += g;
             self.gyration_samples += 1;
             self.last_gyration = Some(g);
@@ -519,7 +524,12 @@ impl Run {
                 .or_default()
                 .push((u.pos, u.radius));
         }
-        if let Some(s) = mean(&crowds.values().filter_map(|m| gyration(m)).collect::<Vec<f64>>()) {
+        if let Some(s) = mean(
+            &crowds
+                .values()
+                .filter_map(|m| gyration(m))
+                .collect::<Vec<f64>>(),
+        ) {
             self.spread_samples.push(s);
         }
 
@@ -615,10 +625,7 @@ fn gyration(members: &[(Vector2, f32)]) -> Option<f64> {
 /// Pairwise overlap via a uniform grid sized to the largest diameter, so a
 /// crush of hundreds stays linear. Depth is in *radii* of the smaller of the
 /// pair, so the numbers mean the same whatever size the units are.
-fn for_each_overlapping_pair(
-    units: &[(Vector2, f32)],
-    mut f: impl FnMut(usize, usize, f32),
-) {
+fn for_each_overlapping_pair(units: &[(Vector2, f32)], mut f: impl FnMut(usize, usize, f32)) {
     if units.len() < 2 {
         return;
     }
@@ -844,9 +851,11 @@ impl Stats {
                 continue;
             };
             let g = field.goal();
-            let e = by_goal
-                .entry((g.x.to_bits(), g.y.to_bits()))
-                .or_insert((Vector2::ZERO, 0, t.radius));
+            let e = by_goal.entry((g.x.to_bits(), g.y.to_bits())).or_insert((
+                Vector2::ZERO,
+                0,
+                t.radius,
+            ));
             e.0 += u.pos;
             e.1 += 1;
         }
@@ -1181,13 +1190,33 @@ mod tests {
 
     #[test]
     fn test_segments_cross_is_proper_intersection_only() {
-        assert!(segments_cross(v(0.0, 0.0), v(10.0, 10.0), v(0.0, 10.0), v(10.0, 0.0)));
-        assert!(!segments_cross(v(0.0, 0.0), v(1.0, 1.0), v(5.0, 5.0), v(6.0, 6.0)));
+        assert!(segments_cross(
+            v(0.0, 0.0),
+            v(10.0, 10.0),
+            v(0.0, 10.0),
+            v(10.0, 0.0)
+        ));
+        assert!(!segments_cross(
+            v(0.0, 0.0),
+            v(1.0, 1.0),
+            v(5.0, 5.0),
+            v(6.0, 6.0)
+        ));
         // Touching at an endpoint is not a crossing: a unit sliding along a
         // wall must not read as having gone through it.
-        assert!(!segments_cross(v(0.0, 0.0), v(5.0, 0.0), v(5.0, 0.0), v(5.0, 5.0)));
+        assert!(!segments_cross(
+            v(0.0, 0.0),
+            v(5.0, 0.0),
+            v(5.0, 0.0),
+            v(5.0, 5.0)
+        ));
         // Collinear overlap is not a crossing either.
-        assert!(!segments_cross(v(0.0, 0.0), v(10.0, 0.0), v(5.0, 0.0), v(15.0, 0.0)));
+        assert!(!segments_cross(
+            v(0.0, 0.0),
+            v(10.0, 0.0),
+            v(5.0, 0.0),
+            v(15.0, 0.0)
+        ));
     }
 
     #[test]
@@ -1244,10 +1273,7 @@ mod tests {
     #[test]
     fn test_overlap_stats_describe_one_distribution() {
         let (points, constraints) = crate::maps::box_map(200.0, 200.0);
-        let mut run = Run::new(
-            Sim::new(points, &constraints, 1),
-            Cfg::default(),
-        );
+        let mut run = Run::new(Sim::new(points, &constraints, 1), Cfg::default());
         // Spawned almost coincident: deep overlap, then separation resolves
         // it, so the run spans both regimes.
         run.sim.step(&[
@@ -1263,7 +1289,10 @@ mod tests {
         }
         let s = run.stats();
         assert!(s.overlap_max > 1.0, "spawned coincident: {}", s.overlap_max);
-        assert!(s.overlap_max <= 2.0, "2.0 radii is coincident centres, the cap");
+        assert!(
+            s.overlap_max <= 2.0,
+            "2.0 radii is coincident centres, the cap"
+        );
         for (name, v) in [
             ("mean", s.overlap_mean),
             ("p95", s.overlap_p95),
@@ -1389,11 +1418,7 @@ mod tests {
     fn test_overlapping_pairs_counted_once_across_grid_cells() {
         // Three mutually overlapping units spanning >1 grid cell: three pairs,
         // each reported once.
-        let units = [
-            (v(0.0, 0.0), 5.0),
-            (v(6.0, 0.0), 5.0),
-            (v(12.0, 0.0), 5.0),
-        ];
+        let units = [(v(0.0, 0.0), 5.0), (v(6.0, 0.0), 5.0), (v(12.0, 0.0), 5.0)];
         let mut pairs = Vec::new();
         for_each_overlapping_pair(&units, |i, j, _| pairs.push((i, j)));
         pairs.sort();

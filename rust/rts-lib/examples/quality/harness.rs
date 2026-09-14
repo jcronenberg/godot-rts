@@ -571,7 +571,10 @@ mod tests {
             card_of("s", 1.2, 1.5).anchors,
             "a moved anchor must be visible in the digest"
         );
-        assert_ne!(card_of("s", 1.0, 1.5).anchors, card_of("t", 1.0, 1.5).anchors);
+        assert_ne!(
+            card_of("s", 1.0, 1.5).anchors,
+            card_of("t", 1.0, 1.5).anchors
+        );
     }
 
     #[test]

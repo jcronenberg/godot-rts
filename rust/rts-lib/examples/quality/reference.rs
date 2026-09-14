@@ -397,7 +397,9 @@ mod tests {
         let mut walls = rect(0.0, 0.0, 400.0, 400.0);
         walls.push((v(200.0, 0.0), v(200.0, 340.0)));
         let f = field_of(&walls, 5.0, v(350.0, 200.0));
-        let got = f.optimal_len(v(50.0, 200.0)).expect("reachable under the wall");
+        let got = f
+            .optimal_len(v(50.0, 200.0))
+            .expect("reachable under the wall");
         assert!(got > 400.0, "must route round the wall, got {got}");
     }
 
@@ -419,11 +421,15 @@ mod tests {
         walls.extend(rect(150.0, 6.0, 153.0, 200.0));
         let goal = v(175.0, 100.0);
         assert!(
-            field_of(&walls, 2.0, goal).optimal_len(v(120.0, 20.0)).is_some(),
+            field_of(&walls, 2.0, goal)
+                .optimal_len(v(120.0, 20.0))
+                .is_some(),
             "diameter 4 fits a 6-unit slot"
         );
         assert!(
-            field_of(&walls, 3.0, goal).optimal_len(v(120.0, 20.0)).is_some(),
+            field_of(&walls, 3.0, goal)
+                .optimal_len(v(120.0, 20.0))
+                .is_some(),
             "diameter 6 is the exact fit and must not read as sealed"
         );
         assert_eq!(

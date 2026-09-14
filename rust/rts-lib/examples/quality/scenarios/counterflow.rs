@@ -5,7 +5,7 @@
 use godot::prelude::Vector2;
 use rts_lib::sim::{Command, Sim};
 
-use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
+use crate::harness::{Ctx, Reading, ScenarioSpec, metric as m};
 use crate::maps::{corridor, v};
 use crate::metrics::{Cfg, Route, Run, unit_ids, wall_segments};
 
@@ -59,10 +59,7 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
             goal: RIGHT_GOAL,
         },
     ]);
-    for (group, goal, field) in [
-        (left, LEFT_GOAL, &to_right),
-        (right, RIGHT_GOAL, &to_left),
-    ] {
+    for (group, goal, field) in [(left, LEFT_GOAL, &to_right), (right, RIGHT_GOAL, &to_left)] {
         for &id in group {
             let start = run.sim.units().get(id).map(|u| u.pos).unwrap_or(goal);
             run.track(id, Route::to(field, start));
@@ -81,21 +78,21 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
 
     //                          name             unit        good    bad  weight
     vec![
-        m("arrival",           "frac",      1.00,  0.00, 3.0).at(s.arrival),
-        m("residual",          "radii",     5.50, 50.00, 2.0).or_bad(s.residual),
-        m("residual_p95",      "radii",     8.00, 70.00, 1.0).or_bad(s.residual_p95),
-        m("centroid_offset",   "radii",     0.00, 16.00, 2.0).or_bad(s.centroid_offset),
-        m("settle_p95",        "frac run",  0.20,   1.00, 1.0).or_bad(s.settle_p95),
-        m("lateness_p50",      "ratio",     1.05,  3.00, 1.0).or_bad(s.lateness_p50),
-        m("lateness_p95",      "ratio",     1.20,  6.00, 2.0).or_bad(s.lateness_p95),
-        m("detour",            "ratio",     1.05,  1.80, 2.0).or_bad(s.detour),
-        m("stall_trips",       "per unit",  0.00, 10.00, 2.0).at(s.stall_trips),
-        m("ally_stall_trips",  "per unit",  0.00, 10.00, 1.0).at(s.ally_stall_trips),
-        m("repaths",           "per unit",  1.00, 20.00, 1.0).at(s.repaths),
-        m("jitter",            "rad/tick",  0.05,  0.60, 1.0).at(s.jitter),
-        m("cohesion",          "radii",     0.00,  0.00, 0.0).or_bad(s.cohesion),
-        m("spread_at_end",     "radii",     0.00,  0.00, 0.0).or_bad(s.cohesion_final),
-        m("push_ally",    "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
+        m("arrival", "frac", 1.00, 0.00, 3.0).at(s.arrival),
+        m("residual", "radii", 5.50, 50.00, 2.0).or_bad(s.residual),
+        m("residual_p95", "radii", 8.00, 70.00, 1.0).or_bad(s.residual_p95),
+        m("centroid_offset", "radii", 0.00, 16.00, 2.0).or_bad(s.centroid_offset),
+        m("settle_p95", "frac run", 0.20, 1.00, 1.0).or_bad(s.settle_p95),
+        m("lateness_p50", "ratio", 1.05, 3.00, 1.0).or_bad(s.lateness_p50),
+        m("lateness_p95", "ratio", 1.20, 6.00, 2.0).or_bad(s.lateness_p95),
+        m("detour", "ratio", 1.05, 1.80, 2.0).or_bad(s.detour),
+        m("stall_trips", "per unit", 0.00, 10.00, 2.0).at(s.stall_trips),
+        m("ally_stall_trips", "per unit", 0.00, 10.00, 1.0).at(s.ally_stall_trips),
+        m("repaths", "per unit", 1.00, 20.00, 1.0).at(s.repaths),
+        m("jitter", "rad/tick", 0.05, 0.60, 1.0).at(s.jitter),
+        m("cohesion", "radii", 0.00, 0.00, 0.0).or_bad(s.cohesion),
+        m("spread_at_end", "radii", 0.00, 0.00, 0.0).or_bad(s.cohesion_final),
+        m("push_ally", "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
     ]
     .into_iter()
     .chain(super::overlap_readings(super::Crowding::Open, &s))

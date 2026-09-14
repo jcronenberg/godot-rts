@@ -8,7 +8,7 @@
 use godot::prelude::Vector2;
 use rts_lib::astar::AStarScratch;
 
-use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
+use crate::harness::{Ctx, Reading, ScenarioSpec, metric as m};
 use crate::maps::load_test_map;
 use crate::metrics::{PathProbe, Query, build_cdt, wall_segments};
 
@@ -66,13 +66,13 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
     }
     //                               name                 unit      good    bad  weight
     vec![
-        m("suboptimality",       "ratio", 1.02,   1.40, 3.0).or_bad(probe.suboptimality()),
-        m("refusals",            "count", 0.00,   8.00, 3.0).at(probe.refusals()),
-        m("phantoms",            "count", 0.00,   8.00, 3.0).at(probe.phantoms()),
-        m("min_clearance",       "radii", 0.60,   0.20, 2.0).or_bad(probe.min_clearance()),
-        m("clearance_p5",        "radii", 0.60,   0.20, 1.0).or_bad(probe.clearance_p5()),
-        m("abstraction_penalty", "ratio", 1.00,   1.30, 1.0).or_bad(probe.abstraction_penalty()),
-        m("waypoints",           "count", 2.00, 100.00, 0.0).or_bad(probe.waypoints()),
-        m("turn_per_100",        "rad",   0.00,   3.00, 0.0).or_bad(probe.turn_per_len()),
+        m("suboptimality", "ratio", 1.02, 1.40, 3.0).or_bad(probe.suboptimality()),
+        m("refusals", "count", 0.00, 8.00, 3.0).at(probe.refusals()),
+        m("phantoms", "count", 0.00, 8.00, 3.0).at(probe.phantoms()),
+        m("min_clearance", "radii", 0.60, 0.20, 2.0).or_bad(probe.min_clearance()),
+        m("clearance_p5", "radii", 0.60, 0.20, 1.0).or_bad(probe.clearance_p5()),
+        m("abstraction_penalty", "ratio", 1.00, 1.30, 1.0).or_bad(probe.abstraction_penalty()),
+        m("waypoints", "count", 2.00, 100.00, 0.0).or_bad(probe.waypoints()),
+        m("turn_per_100", "rad", 0.00, 3.00, 0.0).or_bad(probe.turn_per_len()),
     ]
 }

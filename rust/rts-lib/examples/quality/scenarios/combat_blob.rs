@@ -20,7 +20,7 @@
 use godot::prelude::Vector2;
 use rts_lib::sim::{Command, Sim};
 
-use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
+use crate::harness::{Ctx, Reading, ScenarioSpec, metric as m};
 use crate::maps::{box_map, v};
 use crate::metrics::{Cfg, Route, Run, unit_ids};
 
@@ -43,10 +43,7 @@ const PITCH: f32 = 12.0;
 fn run(ctx: &Ctx) -> Vec<Reading> {
     let (points, constraints) = box_map(400.0, 400.0);
 
-    let mut run = Run::new(
-        Sim::new(points, &constraints, 0xB1_0B),
-        Cfg::default(),
-    );
+    let mut run = Run::new(Sim::new(points, &constraints, 0xB1_0B), Cfg::default());
     // Defender first (slot 0), then the attacker block. Both sides carry
     // effectively infinite health, so the fight never decays into an idle.
     let mut spawns = vec![Command::Spawn {
@@ -97,14 +94,14 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
 
     //                          name              unit         good    bad  weight
     vec![
-        m("in_range",       "frac",      0.115,    0.03, 3.0).or_bad(s.in_range),
-        m("first_shot_p95", "ticks",   650.00, 1400.00, 2.0).or_bad(s.first_shot_p95),
-        m("chase_gap",      "reaches",   0.00,    0.00, 0.0).or_bad(s.chase_gap),
-        m("slot_churn",     "per unit",  0.00,   20.00, 2.0).at(s.slot_churn),
-        m("hold_trips",     "per unit",  0.00,  10.00, 1.0).at(s.hold_trips),
-        m("jitter",         "rad/tick",  0.10,   1.20, 1.0).at(s.jitter),
-        m("push_ally",    "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
-        m("push_enemy",   "radii/tick", 0.00, 0.00, 0.0).at(s.push_enemy),
+        m("in_range", "frac", 0.115, 0.03, 3.0).or_bad(s.in_range),
+        m("first_shot_p95", "ticks", 650.00, 1400.00, 2.0).or_bad(s.first_shot_p95),
+        m("chase_gap", "reaches", 0.00, 0.00, 0.0).or_bad(s.chase_gap),
+        m("slot_churn", "per unit", 0.00, 20.00, 2.0).at(s.slot_churn),
+        m("hold_trips", "per unit", 0.00, 10.00, 1.0).at(s.hold_trips),
+        m("jitter", "rad/tick", 0.10, 1.20, 1.0).at(s.jitter),
+        m("push_ally", "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
+        m("push_enemy", "radii/tick", 0.00, 0.00, 0.0).at(s.push_enemy),
     ]
     .into_iter()
     .chain(super::overlap_readings(super::Crowding::Crush, &s))

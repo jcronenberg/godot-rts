@@ -17,7 +17,7 @@ use rts_lib::astar::AStarScratch;
 use rts_lib::mapgen::rooms_map;
 use rts_lib::sim::{Command, Sim};
 
-use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
+use crate::harness::{Ctx, Reading, ScenarioSpec, metric as m};
 use crate::metrics::{self, Cfg, PathProbe, Query, Route, Run, build_cdt, wall_segments};
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
@@ -60,8 +60,7 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
             ..Cfg::default()
         },
     );
-    run.sim
-        .step(&[metrics::spawn_cmd(START, RADIUS, SPEED)]);
+    run.sim.step(&[metrics::spawn_cmd(START, RADIUS, SPEED)]);
     let id = metrics::unit_ids(&run.sim)[0];
     run.sim.step(&[Command::Move {
         units: vec![id],
@@ -87,16 +86,16 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
 
     //                     name                unit        good   bad  weight
     vec![
-        m("suboptimality",       "ratio",    1.02,   2.00, 2.0).or_bad(probe.suboptimality()),
-        m("min_clearance",       "radii",    0.60,   0.20, 1.0).or_bad(probe.min_clearance()),
-        m("abstraction_penalty", "ratio",    1.00,   1.30, 1.0).or_bad(probe.abstraction_penalty()),
-        m("waypoints",           "count",    2.00, 200.00, 0.0).or_bad(probe.waypoints()),
-        m("turn_per_100",        "rad",      0.00,   3.00, 0.0).or_bad(probe.turn_per_len()),
-        m("arrival",             "frac",     1.00,   0.00, 2.0).at(s.arrival),
-        m("residual",            "radii",    0.00,  20.00, 2.0).or_bad(s.residual),
-        m("detour",              "ratio",    1.05,   2.00, 2.0).or_bad(s.detour),
-        m("lateness_p50",        "ratio",    1.10,   2.50, 1.0).or_bad(s.lateness_p50),
-        m("stall_trips",         "per unit", 0.00,  20.00, 1.0).at(s.stall_trips),
-        m("jitter",              "rad/tick", 0.01,   0.40, 1.0).at(s.jitter),
+        m("suboptimality", "ratio", 1.02, 2.00, 2.0).or_bad(probe.suboptimality()),
+        m("min_clearance", "radii", 0.60, 0.20, 1.0).or_bad(probe.min_clearance()),
+        m("abstraction_penalty", "ratio", 1.00, 1.30, 1.0).or_bad(probe.abstraction_penalty()),
+        m("waypoints", "count", 2.00, 200.00, 0.0).or_bad(probe.waypoints()),
+        m("turn_per_100", "rad", 0.00, 3.00, 0.0).or_bad(probe.turn_per_len()),
+        m("arrival", "frac", 1.00, 0.00, 2.0).at(s.arrival),
+        m("residual", "radii", 0.00, 20.00, 2.0).or_bad(s.residual),
+        m("detour", "ratio", 1.05, 2.00, 2.0).or_bad(s.detour),
+        m("lateness_p50", "ratio", 1.10, 2.50, 1.0).or_bad(s.lateness_p50),
+        m("stall_trips", "per unit", 0.00, 20.00, 1.0).at(s.stall_trips),
+        m("jitter", "rad/tick", 0.01, 0.40, 1.0).at(s.jitter),
     ]
 }

@@ -8,7 +8,7 @@
 use godot::prelude::Vector2;
 use rts_lib::sim::{Command, Sim};
 
-use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
+use crate::harness::{Ctx, Reading, ScenarioSpec, metric as m};
 use crate::maps::{box_map, polygon_walls, rect_obstacle, v};
 use crate::metrics::{Cfg, Route, Run, unit_ids, wall_segments};
 
@@ -38,8 +38,14 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
             ..Cfg::default()
         },
     );
-    run.sim
-        .step(&super::spawn_block(v(40.0, 130.0), 5, 14.0, UNITS, RADIUS, SPEED));
+    run.sim.step(&super::spawn_block(
+        v(40.0, 130.0),
+        5,
+        14.0,
+        UNITS,
+        RADIUS,
+        SPEED,
+    ));
     let ids = unit_ids(&run.sim);
     run.sim.step(&[Command::Move {
         units: ids.clone(),
@@ -68,20 +74,20 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
 
     //                     name             unit        good    bad  weight
     vec![
-        m("detour",       "ratio",     1.05,  1.80, 3.0).or_bad(s.detour),
-        m("arrival",      "frac",      1.00,  0.00, 2.0).at(s.arrival),
-        m("residual",     "radii",     4.00, 60.00, 2.0).or_bad(s.residual),
-        m("residual_p95", "radii",     6.00, 80.00, 1.0).or_bad(s.residual_p95),
-        m("centroid_offset", "radii",   0.00, 12.00, 2.0).or_bad(s.centroid_offset),
-        m("settle_p95",   "frac run",  0.20,  1.00, 1.0).or_bad(s.settle_p95),
-        m("lateness_p95", "ratio",     1.30,  6.00, 1.0).or_bad(s.lateness_p95),
-        m("stall_trips",  "per unit",  0.00, 10.00, 2.0).at(s.stall_trips),
+        m("detour", "ratio", 1.05, 1.80, 3.0).or_bad(s.detour),
+        m("arrival", "frac", 1.00, 0.00, 2.0).at(s.arrival),
+        m("residual", "radii", 4.00, 60.00, 2.0).or_bad(s.residual),
+        m("residual_p95", "radii", 6.00, 80.00, 1.0).or_bad(s.residual_p95),
+        m("centroid_offset", "radii", 0.00, 12.00, 2.0).or_bad(s.centroid_offset),
+        m("settle_p95", "frac run", 0.20, 1.00, 1.0).or_bad(s.settle_p95),
+        m("lateness_p95", "ratio", 1.30, 6.00, 1.0).or_bad(s.lateness_p95),
+        m("stall_trips", "per unit", 0.00, 10.00, 2.0).at(s.stall_trips),
         // One is the floor (the drop's rebuild); the march order is issued
         // before tracking starts.
-        m("repaths",      "per unit",  2.00, 20.00, 2.0).at(s.repaths),
-        m("jitter",       "rad/tick",  0.05,  0.50, 1.0).at(s.jitter),
-        m("spread_at_end","radii",     0.00,  0.00, 0.0).or_bad(s.cohesion_final),
-        m("push_ally",    "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
+        m("repaths", "per unit", 2.00, 20.00, 2.0).at(s.repaths),
+        m("jitter", "rad/tick", 0.05, 0.50, 1.0).at(s.jitter),
+        m("spread_at_end", "radii", 0.00, 0.00, 0.0).or_bad(s.cohesion_final),
+        m("push_ally", "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
     ]
     .into_iter()
     .chain(super::overlap_readings(super::Crowding::Open, &s))

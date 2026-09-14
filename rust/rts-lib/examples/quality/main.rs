@@ -42,7 +42,7 @@ mod scenarios;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use harness::{Ctx, Scorecard, ScenarioResult};
+use harness::{Ctx, ScenarioResult, Scorecard};
 
 const USAGE: &str = "\
 quality: movement quality scorecard
@@ -223,7 +223,10 @@ impl Cli {
         let base = harness::read_json(&baseline).ok();
         print!("{}", harness::render(&card, base.as_ref()));
         if base.is_none() {
-            println!("\nno baseline at {}; `--bless` to write one", baseline.display());
+            println!(
+                "\nno baseline at {}; `--bless` to write one",
+                baseline.display()
+            );
         }
 
         if let Some(out) = &self.out {
@@ -271,7 +274,10 @@ impl Cli {
         print!("{}", harness::render_sweep(&cards));
         println!("\n{} restored to {original}", sweep.name);
         if let Some(out) = &self.out {
-            eprintln!("--out is ignored for sweeps ({} would be ambiguous)", out.display());
+            eprintln!(
+                "--out is ignored for sweeps ({} would be ambiguous)",
+                out.display()
+            );
         }
     }
 }

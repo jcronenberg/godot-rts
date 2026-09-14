@@ -8,7 +8,7 @@
 use godot::prelude::Vector2;
 use rts_lib::sim::{Command, Sim};
 
-use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
+use crate::harness::{Ctx, Reading, ScenarioSpec, metric as m};
 use crate::maps::{two_rooms, v};
 use crate::metrics::{Cfg, Route, Run, unit_ids, wall_segments};
 
@@ -38,8 +38,14 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
             choke: Some((v(300.0, 215.0), v(300.0, 185.0))),
         },
     );
-    run.sim
-        .step(&super::spawn_block(v(30.0, 30.0), 10, 13.0, UNITS, RADIUS, SPEED));
+    run.sim.step(&super::spawn_block(
+        v(30.0, 30.0),
+        10,
+        13.0,
+        UNITS,
+        RADIUS,
+        SPEED,
+    ));
     let ids = unit_ids(&run.sim);
     // One command, so the whole crowd is one cohesion group.
     run.sim.step(&[Command::Move {
@@ -66,19 +72,19 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         // Over the window the door is in use, so it reads the door's rate and
         // not the tick budget's. High only *looks* free: a compressed crowd
         // beats the 3-abreast geometry and pays for it in the overlap rows.
-        m("throughput",   "units/s",  36.00,  6.00, 3.0).at(s.throughput),
-        m("arrival",      "frac",      1.00,  0.00, 2.0).at(s.arrival),
-        m("residual",     "radii",    10.00, 70.00, 2.0).or_bad(s.residual),
-        m("residual_p95", "radii",    15.00, 90.00, 1.0).or_bad(s.residual_p95),
-        m("centroid_offset", "radii",   0.00, 30.00, 2.0).or_bad(s.centroid_offset),
-        m("settle_p95",   "frac run",  0.20,  1.00, 1.0).or_bad(s.settle_p95),
-        m("lateness_p95", "ratio",     2.00, 12.00, 1.0).or_bad(s.lateness_p95),
-        m("detour",       "ratio",     1.05,  1.80, 1.0).or_bad(s.detour),
-        m("jitter",       "rad/tick",  0.05,  0.60, 2.0).at(s.jitter),
-        m("stall_trips",  "per unit",  0.00, 20.00, 1.0).at(s.stall_trips),
-        m("cohesion",     "radii",     0.00,  0.00, 0.0).or_bad(s.cohesion),
-        m("spread_at_end","radii",     0.00,  0.00, 0.0).or_bad(s.cohesion_final),
-        m("push_ally",    "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
+        m("throughput", "units/s", 36.00, 6.00, 3.0).at(s.throughput),
+        m("arrival", "frac", 1.00, 0.00, 2.0).at(s.arrival),
+        m("residual", "radii", 10.00, 70.00, 2.0).or_bad(s.residual),
+        m("residual_p95", "radii", 15.00, 90.00, 1.0).or_bad(s.residual_p95),
+        m("centroid_offset", "radii", 0.00, 30.00, 2.0).or_bad(s.centroid_offset),
+        m("settle_p95", "frac run", 0.20, 1.00, 1.0).or_bad(s.settle_p95),
+        m("lateness_p95", "ratio", 2.00, 12.00, 1.0).or_bad(s.lateness_p95),
+        m("detour", "ratio", 1.05, 1.80, 1.0).or_bad(s.detour),
+        m("jitter", "rad/tick", 0.05, 0.60, 2.0).at(s.jitter),
+        m("stall_trips", "per unit", 0.00, 20.00, 1.0).at(s.stall_trips),
+        m("cohesion", "radii", 0.00, 0.00, 0.0).or_bad(s.cohesion),
+        m("spread_at_end", "radii", 0.00, 0.00, 0.0).or_bad(s.cohesion_final),
+        m("push_ally", "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
     ]
     .into_iter()
     .chain(super::overlap_readings(super::Crowding::Funnel, &s))

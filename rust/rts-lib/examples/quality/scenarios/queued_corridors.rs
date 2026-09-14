@@ -21,7 +21,7 @@
 use godot::prelude::Vector2;
 use rts_lib::sim::{Command, Order, Sim};
 
-use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
+use crate::harness::{Ctx, Reading, ScenarioSpec, metric as m};
 use crate::maps::{serpentine, v};
 use crate::metrics::{Cfg, Route, Run, unit_ids, wall_segments};
 
@@ -45,10 +45,10 @@ const H: f32 = 400.0;
 /// the geometry of a bend. The last is a crowd's half-length short of the far
 /// wall, leaving room to settle *around* it rather than against it.
 const LEGS: [Vector2; 4] = [
-    Vector2::new(W - LANE * 0.5, (H + LANE) * 0.25),      // down the right link
-    Vector2::new(W * 0.5, H * 0.5),                       // back along the middle lane
-    Vector2::new(LANE * 0.5, (3.0 * H - LANE) * 0.25),    // down the left link
-    Vector2::new(W - 100.0, H - LANE * 0.5),              // out along the bottom lane
+    Vector2::new(W - LANE * 0.5, (H + LANE) * 0.25), // down the right link
+    Vector2::new(W * 0.5, H * 0.5),                  // back along the middle lane
+    Vector2::new(LANE * 0.5, (3.0 * H - LANE) * 0.25), // down the left link
+    Vector2::new(W - 100.0, H - LANE * 0.5),         // out along the bottom lane
 ];
 
 fn run(ctx: &Ctx) -> Vec<Reading> {
@@ -77,8 +77,14 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
     );
     // Four abreast, all a 60-wide lane takes, and fifteen ranks deep: the
     // crowd starts as a column and has to stay one.
-    run.sim
-        .step(&super::spawn_block(v(20.0, 10.0), 15, 12.0, UNITS, RADIUS, SPEED));
+    run.sim.step(&super::spawn_block(
+        v(20.0, 10.0),
+        15,
+        12.0,
+        UNITS,
+        RADIUS,
+        SPEED,
+    ));
     let ids = unit_ids(&run.sim);
     // The whole route before the first step of it: a `Move` and three
     // shift-clicks, so the sim advances the queue itself.
@@ -113,34 +119,34 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         // road at three units of sixty, which is a ladder of 100/67/33/0 and
         // not a cliff; `arrival` adds the same units back at a tenth of the
         // slope, and picks up merely-late ones that `stranded` forgives.
-        m("stranded",        "frac",      0.00,  0.05, 4.0).at(s.stranded),
-        m("arrival",         "frac",      1.00,  0.90, 3.0).at(s.arrival),
+        m("stranded", "frac", 0.00, 0.05, 4.0).at(s.stranded),
+        m("arrival", "frac", 1.00, 0.90, 3.0).at(s.arrival),
         // Both anchored at the reference optimum itself, so 100 means the
         // queue cost the crowd nothing. What lies between the anchors is a
         // march that waits out every straggler at every waypoint.
-        m("lateness_p50",    "ratio",     1.00,  2.00, 2.0).or_bad(s.lateness_p50),
-        m("lateness_p95",    "ratio",     1.00,  4.00, 2.0).or_bad(s.lateness_p95),
-        m("throughput",      "units/s",  20.00,  3.00, 1.0).at(s.throughput),
-        m("settle_p95",      "frac run",  0.20,  1.00, 1.0).or_bad(s.settle_p95),
+        m("lateness_p50", "ratio", 1.00, 2.00, 2.0).or_bad(s.lateness_p50),
+        m("lateness_p95", "ratio", 1.00, 4.00, 2.0).or_bad(s.lateness_p95),
+        m("throughput", "units/s", 20.00, 3.00, 1.0).at(s.throughput),
+        m("settle_p95", "frac run", 0.20, 1.00, 1.0).or_bad(s.settle_p95),
         // 0.71 is a packed disc and ~0.97 is the tightest a crowd this size
         // can be in a lane this wide, so 1.0 is "as good as the corridor
         // allows" and 3.0 is a column strung out over a third of the map.
-        m("spread",          "radii",     1.00,  3.00, 3.0).or_bad(s.spread),
-        m("spread_p95",      "radii",     1.20,  4.00, 2.0).or_bad(s.spread_p95),
-        m("centroid_offset", "radii",     0.00, 12.00, 3.0).or_bad(s.centroid_offset),
-        m("residual",        "radii",     6.00, 50.00, 2.0).or_bad(s.residual),
-        m("residual_p95",    "radii",     9.00, 60.00, 1.0).or_bad(s.residual_p95),
-        m("detour",          "ratio",     1.05,  1.80, 1.0).or_bad(s.detour),
-        m("stall_trips",     "per unit",  0.00, 10.00, 1.0).at(s.stall_trips),
-        m("jitter",          "rad/tick",  0.05,  0.60, 1.0).at(s.jitter),
+        m("spread", "radii", 1.00, 3.00, 3.0).or_bad(s.spread),
+        m("spread_p95", "radii", 1.20, 4.00, 2.0).or_bad(s.spread_p95),
+        m("centroid_offset", "radii", 0.00, 12.00, 3.0).or_bad(s.centroid_offset),
+        m("residual", "radii", 6.00, 50.00, 2.0).or_bad(s.residual),
+        m("residual_p95", "radii", 9.00, 60.00, 1.0).or_bad(s.residual_p95),
+        m("detour", "ratio", 1.05, 1.80, 1.0).or_bad(s.detour),
+        m("stall_trips", "per unit", 0.00, 10.00, 1.0).at(s.stall_trips),
+        m("jitter", "rad/tick", 0.05, 0.60, 1.0).at(s.jitter),
         // The same shape as `spread`, but per `Unit::group`: reading tighter
         // than `spread` is the tell that the crowd came apart and the sim
         // relabelled the pieces. `repaths` counts the queue itself, three
         // fresh paths before anything has gone wrong.
-        m("cohesion",        "radii",     0.00,  0.00, 0.0).or_bad(s.cohesion),
-        m("cohesion_at_end", "radii",     0.00,  0.00, 0.0).or_bad(s.cohesion_final),
-        m("repaths",         "per unit",  0.00,  0.00, 0.0).at(s.repaths),
-        m("push_ally",       "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
+        m("cohesion", "radii", 0.00, 0.00, 0.0).or_bad(s.cohesion),
+        m("cohesion_at_end", "radii", 0.00, 0.00, 0.0).or_bad(s.cohesion_final),
+        m("repaths", "per unit", 0.00, 0.00, 0.0).at(s.repaths),
+        m("push_ally", "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
     ]
     .into_iter()
     .chain(super::overlap_readings(super::Crowding::Funnel, &s))

@@ -212,8 +212,7 @@ pub static TARGET_SPREAD_PENALTY: TunableF32 = TunableF32::new(1.0);
 /// Not a `set_tuning` knob, since it changes no behaviour. Off by default
 /// because accumulating it costs the separation pass ~3% at 2000 units (~7% at
 /// 100) and only `examples/quality` reads it.
-pub static PUSH_TRACKING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static PUSH_TRACKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Max `wall_clamp` passes per unit per tick before giving up as unresolved.
 /// Internal convergence detail, not a gameplay knob — plain const rather than
@@ -1800,8 +1799,8 @@ impl Sim {
                             // by units, not walls" precondition. The same test
                             // buckets the diagnostic push, so the split costs
                             // no extra relation lookup.
-                            let ally = relation_of(&self.relations, t_i, s.teams[j])
-                                == Relation::Ally;
+                            let ally =
+                                relation_of(&self.relations, t_i, s.teams[j]) == Relation::Ally;
                             if ally {
                                 s.ally_contact[i] = true;
                                 s.ally_contact[j] = true;

@@ -16,7 +16,7 @@
 use godot::prelude::Vector2;
 use rts_lib::sim::{Command, Sim};
 
-use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
+use crate::harness::{Ctx, Reading, ScenarioSpec, metric as m};
 use crate::maps::{box_map, v};
 use crate::metrics::{Cfg, Route, Run, unit_ids};
 
@@ -120,15 +120,15 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
 
     //                          name              unit         good     bad  weight
     vec![
-        m("fire_efficiency", "frac",      0.45,    0.05, 3.0).or_bad(s.fire_efficiency),
-        m("in_range",        "frac",      0.70,    0.10, 3.0).or_bad(s.in_range),
-        m("chase_gap",       "reaches",   0.70,    2.00, 2.0).or_bad(s.chase_gap),
-        m("slot_churn",      "per unit",  2.00,   40.00, 2.0).at(s.slot_churn),
-        m("jitter",          "rad/tick",  0.10,    1.20, 2.0).at(s.jitter),
-        m("hold_trips",      "per unit",  0.00,   20.00, 1.0).at(s.hold_trips),
-        m("repaths",         "per unit",  0.00,    0.00, 0.0).at(s.repaths),
-        m("push_ally",       "radii/tick", 0.00,   0.00, 0.0).at(s.push_ally),
-        m("push_enemy",      "radii/tick", 0.00,   0.00, 0.0).at(s.push_enemy),
+        m("fire_efficiency", "frac", 0.45, 0.05, 3.0).or_bad(s.fire_efficiency),
+        m("in_range", "frac", 0.70, 0.10, 3.0).or_bad(s.in_range),
+        m("chase_gap", "reaches", 0.70, 2.00, 2.0).or_bad(s.chase_gap),
+        m("slot_churn", "per unit", 2.00, 40.00, 2.0).at(s.slot_churn),
+        m("jitter", "rad/tick", 0.10, 1.20, 2.0).at(s.jitter),
+        m("hold_trips", "per unit", 0.00, 20.00, 1.0).at(s.hold_trips),
+        m("repaths", "per unit", 0.00, 0.00, 0.0).at(s.repaths),
+        m("push_ally", "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
+        m("push_enemy", "radii/tick", 0.00, 0.00, 0.0).at(s.push_enemy),
     ]
     .into_iter()
     .chain(super::overlap_readings(super::Crowding::Open, &s))

@@ -23,7 +23,7 @@ use godot::prelude::Vector2;
 use rts_lib::astar::AStarScratch;
 use rts_lib::sim::{Command, Sim};
 
-use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
+use crate::harness::{Ctx, Reading, ScenarioSpec, metric as m};
 use crate::maps::{thin_wall, v};
 use crate::metrics::{Cfg, PathProbe, Query, Route, Run, build_cdt, unit_ids, wall_segments};
 
@@ -66,10 +66,7 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         }
     }
 
-    let mut run = Run::new(
-        Sim::new(points, &constraints, 7),
-        Cfg::default(),
-    );
+    let mut run = Run::new(Sim::new(points, &constraints, 7), Cfg::default());
     // All 40 in one step, or the early ones settle before the pressure starts.
     run.sim.step(
         &(0..UNITS)
@@ -108,14 +105,14 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
 
     //                          name              unit         good    bad  weight
     vec![
-        m("phantoms",        "count",      0.00,   2.00, 3.0).at(probe.phantoms()),
-        m("refusals",        "count",      0.00,   2.00, 1.0).at(probe.refusals()),
+        m("phantoms", "count", 0.00, 2.00, 3.0).at(probe.phantoms()),
+        m("refusals", "count", 0.00, 2.00, 1.0).at(probe.refusals()),
         // No `clearance_p5`: six queries make it the minimum by construction,
         // and two columns of one measurement read as corroboration.
-        m("min_clearance",   "radii",      0.50,   0.05, 2.0).or_bad(probe.min_clearance()),
-        m("stall_trips",     "per unit",   0.00,   0.00, 0.0).at(s.stall_trips),
-        m("travel",          "radii",      0.00,   0.00, 0.0).at(s.travelled / RADIUS as f64),
-        m("push_ally",    "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
+        m("min_clearance", "radii", 0.50, 0.05, 2.0).or_bad(probe.min_clearance()),
+        m("stall_trips", "per unit", 0.00, 0.00, 0.0).at(s.stall_trips),
+        m("travel", "radii", 0.00, 0.00, 0.0).at(s.travelled / RADIUS as f64),
+        m("push_ally", "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
     ]
     .into_iter()
     .chain(super::overlap_readings(super::Crowding::Funnel, &s))

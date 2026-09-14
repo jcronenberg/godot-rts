@@ -26,10 +26,13 @@ impl MapBuilder {
     }
 
     fn id(&mut self, p: Vector2) -> u32 {
-        *self.index.entry((p.x.to_bits(), p.y.to_bits())).or_insert_with(|| {
-            self.points.push(p);
-            (self.points.len() - 1) as u32
-        })
+        *self
+            .index
+            .entry((p.x.to_bits(), p.y.to_bits()))
+            .or_insert_with(|| {
+                self.points.push(p);
+                (self.points.len() - 1) as u32
+            })
     }
 
     pub fn seg(&mut self, a: Vector2, b: Vector2) -> &mut Self {
@@ -171,8 +174,7 @@ struct MapData {
 /// Load `test_maps/<name>.json`, the same fixtures the crate's own tests use.
 pub fn load_test_map(name: &str) -> (Vec<Vector2>, Vec<(u32, u32)>) {
     let path = format!("{}/../test_maps/{name}.json", env!("CARGO_MANIFEST_DIR"));
-    let text =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
     let data: MapData =
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("cannot parse {path}: {e}"));
     let points = data.points.iter().map(|&[x, y]| v(x, y)).collect();
