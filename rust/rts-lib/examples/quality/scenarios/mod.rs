@@ -22,6 +22,7 @@ mod counterflow;
 mod door_funnel;
 mod impassable_gap;
 mod obstacle_drop;
+mod queued_corridors;
 mod solo_march;
 mod stutter_step;
 
@@ -31,6 +32,7 @@ pub const ALL: &[ScenarioSpec] = &[
     solo_march::SPEC,
     door_funnel::SPEC,
     counterflow::SPEC,
+    queued_corridors::SPEC,
     obstacle_drop::SPEC,
     impassable_gap::SPEC,
     corridor_sizes::SPEC,

@@ -38,6 +38,14 @@ impl MapBuilder {
         self
     }
 
+    /// Closed polyline: a wall loop through `pts` and back to the first.
+    pub fn poly(&mut self, pts: &[Vector2]) -> &mut Self {
+        for i in 0..pts.len() {
+            self.seg(pts[i], pts[(i + 1) % pts.len()]);
+        }
+        self
+    }
+
     /// Closed axis-aligned rectangle.
     pub fn rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) -> &mut Self {
         self.seg(v(x0, y0), v(x1, y0))
@@ -83,6 +91,36 @@ pub fn corridor(width: f32) -> (Vec<Vector2>, Vec<(u32, u32)>) {
         .seg(v(450.0, hi), v(450.0, h))
         .seg(v(250.0, lo), v(450.0, lo))
         .seg(v(250.0, hi), v(450.0, hi));
+    b.finish()
+}
+
+/// Three `lane`-wide corridors across a `600 x 400` box, joined end to end
+/// into one S: top lane, down the right side, middle lane, down the left
+/// side, bottom lane. A route with four legs and three blind turns, so a
+/// crowd walking it has to keep re-forming rather than march in one line.
+///
+/// One closed polygon, traced around the free space itself, so no two walls
+/// overlap collinearly. Spelling the same shape as a box minus two blocks
+/// would double up the left and right sides.
+pub fn serpentine(lane: f32) -> (Vec<Vector2>, Vec<(u32, u32)>) {
+    let (w, h) = (600.0, 400.0);
+    // The middle lane, and the two notches the S is cut around.
+    let (mid0, mid1) = (h * 0.5 - lane * 0.5, h * 0.5 + lane * 0.5);
+    let mut b = MapBuilder::new();
+    b.poly(&[
+        v(0.0, 0.0),
+        v(w, 0.0),
+        v(w, mid1),
+        v(lane, mid1),
+        v(lane, h - lane),
+        v(w, h - lane),
+        v(w, h),
+        v(0.0, h),
+        v(0.0, mid0),
+        v(w - lane, mid0),
+        v(w - lane, lane),
+        v(0.0, lane),
+    ]);
     b.finish()
 }
 

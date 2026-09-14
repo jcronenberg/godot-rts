@@ -101,6 +101,23 @@ impl Route {
         }
     }
 
+    /// Route through an ordered chain of goals, one field per leg, as a
+    /// queued march walks it: the optimum is the sum of the legs, and the
+    /// field is the last one's, since that is what is still owed at the end.
+    /// A leg the reference cannot price leaves the whole route unpriced.
+    pub fn via(fields: &[Rc<Field>], start: Vector2) -> Route {
+        let mut from = start;
+        let mut optimal = Some(0.0);
+        for f in fields {
+            optimal = optimal.zip(f.optimal_len(from)).map(|(sum, leg)| sum + leg);
+            from = f.goal();
+        }
+        Route {
+            optimal: fields.last().and(optimal),
+            field: fields.last().cloned(),
+        }
+    }
+
     /// No ground truth for this unit.
     pub fn none() -> Route {
         Route::default()
@@ -212,6 +229,8 @@ pub struct Run {
     gyration_sum: f64,
     gyration_samples: u64,
     last_gyration: Option<f64>,
+    /// Per-tick spread of the tracked crowd, one entry per tick.
+    spread_samples: Vec<f64>,
     trace: Option<Trace>,
 }
 
@@ -237,6 +256,7 @@ impl Run {
             gyration_sum: 0.0,
             gyration_samples: 0,
             last_gyration: None,
+            spread_samples: Vec::new(),
             trace: None,
         }
     }
@@ -342,7 +362,11 @@ impl Run {
                 t.last_move_tick = tick;
             }
 
-            if u.parked && t.arrived_tick.is_none() {
+            // Parked with nothing queued: the end of the march, not a
+            // waypoint on the way. `advance_orders` starts the next order on
+            // the same tick a unit parks, so a leg's end is not observable
+            // from out here anyway, but arrival is defined on the whole chain.
+            if u.parked && u.orders.is_empty() && t.arrived_tick.is_none() {
                 t.arrived_tick = Some(tick);
             }
 
@@ -472,29 +496,31 @@ impl Run {
                 groups.entry(u.group).or_default().push((u.pos, u.radius));
             }
         }
-        let mut sum = 0.0;
-        let mut count = 0u64;
-        for members in groups.values() {
-            if members.len() < 2 {
-                continue;
-            }
-            let n = members.len() as f32;
-            let mut c = Vector2::ZERO;
-            for (p, _) in members {
-                c += *p;
-            }
-            c /= n;
-            let var: f32 = members.iter().map(|(p, _)| (*p - c).length_squared()).sum();
-            let gyr = (var / n).sqrt();
-            let r = members[0].1;
-            sum += (gyr / (r * n.sqrt())) as f64;
-            count += 1;
-        }
-        if count > 0 {
-            let g = sum / count as f64;
+        if let Some(g) = mean(&groups.values().filter_map(|m| gyration(m)).collect::<Vec<f64>>()) {
             self.gyration_sum += g;
             self.gyration_samples += 1;
             self.last_gyration = Some(g);
+        }
+
+        // Spread: the same gyration, over the *tracked* units bound for one
+        // goal rather than per `Unit::group`. A queued march re-stamps a group
+        // id at every waypoint, and a batch that finishes a leg late gets one
+        // of its own, so group-keyed cohesion can read a crowd that split in a
+        // corridor as two tidy flocks. Keyed by the goal the scenario itself
+        // declared, it cannot.
+        let mut crowds: BTreeMap<(u32, u32), Vec<(Vector2, f32)>> = BTreeMap::new();
+        for t in &self.tracked {
+            let (Some(field), Some(u)) = (t.field.as_ref(), self.sim.units().get(t.id)) else {
+                continue;
+            };
+            let g = field.goal();
+            crowds
+                .entry((g.x.to_bits(), g.y.to_bits()))
+                .or_default()
+                .push((u.pos, u.radius));
+        }
+        if let Some(s) = mean(&crowds.values().filter_map(|m| gyration(m)).collect::<Vec<f64>>()) {
+            self.spread_samples.push(s);
         }
 
         if let Some(tr) = self.trace.as_mut() {
@@ -567,6 +593,25 @@ impl Run {
 /// every parked blob would read as 100% overlapping.
 const CONTACT_EPS_FRAC: f32 = 0.02;
 
+/// Radius of gyration of a crowd, normalised by the radius a packed disc of
+/// the same count would have, so group size cancels: ~0.71 for a packed blob,
+/// higher the more strung out it is. `None` for fewer than two bodies, which
+/// have no spread to speak of.
+fn gyration(members: &[(Vector2, f32)]) -> Option<f64> {
+    if members.len() < 2 {
+        return None;
+    }
+    let n = members.len() as f32;
+    let mut c = Vector2::ZERO;
+    for (p, _) in members {
+        c += *p;
+    }
+    c /= n;
+    let var: f32 = members.iter().map(|(p, _)| (*p - c).length_squared()).sum();
+    let r = members[0].1;
+    Some(((var / n).sqrt() / (r * n.sqrt())) as f64)
+}
+
 /// Pairwise overlap via a uniform grid sized to the largest diameter, so a
 /// crush of hundreds stays linear. Depth is in *radii* of the smaller of the
 /// pair, so the numbers mean the same whatever size the units are.
@@ -624,6 +669,12 @@ fn for_each_overlapping_pair(
 pub struct Stats {
     /// Fraction of tracked units parked at their goal within the deadline.
     pub arrival: f64,
+    /// Fraction of tracked units that never parked at all, deadline or no.
+    /// The severe half of what `arrival` folds together: a unit that took five
+    /// times as long as it should have and one wedged against a wall for the
+    /// rest of the run are the same miss to `arrival`, and only this one says
+    /// the crowd is short a body for good.
+    pub stranded: f64,
     /// Distance walked over the reference optimum, averaged over units that
     /// arrived. `None` when none did: one that stopped early would score a
     /// flattering ratio below 1.
@@ -692,6 +743,16 @@ pub struct Stats {
     pub cohesion: Option<f64>,
     /// The same at the final tick.
     pub cohesion_final: Option<f64>,
+    /// Mean radius of gyration of the tracked crowd sent to one goal, in
+    /// packed-blob radii, meaned over goals and over ticks. `cohesion` read
+    /// off the scenario's own crowd instead of off `Unit::group`, so a march
+    /// that leaves half its units a corridor behind reads as spread out
+    /// however the sim has since relabelled the flocks. ~0.71 is a packed
+    /// blob; a column filling a corridor is a few times that.
+    pub spread: Option<f64>,
+    /// The same at the 95th percentile over ticks: the worst the crowd was
+    /// ever strung out, which a long settled tail buries in the mean.
+    pub spread_p95: Option<f64>,
     /// Net units per second across the declared line, over the window it was
     /// in use (first crossing to last), not over the whole tick budget.
     pub throughput: f64,
@@ -827,6 +888,13 @@ impl Stats {
 
         Stats {
             arrival: fdiv(arrival, n),
+            stranded: fdiv(
+                run.tracked
+                    .iter()
+                    .filter(|t| t.arrived_tick.is_none())
+                    .count() as f64,
+                n,
+            ),
             detour: mean(&detours),
             lateness_p50: percentile(&mut lateness, 0.50),
             lateness_p95: percentile(&mut lateness, 0.95),
@@ -875,6 +943,8 @@ impl Stats {
             cohesion: (run.gyration_samples > 0)
                 .then(|| run.gyration_sum / run.gyration_samples as f64),
             cohesion_final: run.last_gyration,
+            spread: mean(&run.spread_samples),
+            spread_p95: percentile(&mut run.spread_samples.clone(), 0.95),
             throughput: if seconds > 0.0 {
                 run.net_crossings as f64 / seconds
             } else {
