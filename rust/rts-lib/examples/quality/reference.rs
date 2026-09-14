@@ -38,7 +38,7 @@ const SAMPLE_SLACK_CELLS: f32 = 0.5;
 const SNAP_CELLS: i32 = 2;
 
 const MAGIC: &[u8; 4] = b"QREF";
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 /// Free-space raster at one radius, plus the cost-to-goal field over it.
 pub struct Field {
@@ -46,11 +46,17 @@ pub struct Field {
     cell: f32,
     cols: i32,
     rows: i32,
+    goal: Vector2,
     /// Cost from each cell to the goal; `INFINITY` for blocked or cut off.
     dist: Vec<f32>,
 }
 
 impl Field {
+    /// The point every cost here is measured to.
+    pub fn goal(&self) -> Vector2 {
+        self.goal
+    }
+
     /// Cost of the optimal route from `start` to the field's goal, or `None`
     /// when no route exists for a disc of this radius.
     pub fn optimal_len(&self, start: Vector2) -> Option<f32> {
@@ -215,6 +221,7 @@ fn compute(walls: &[(Vector2, Vector2)], radius: f32, cell: f32, goal: Vector2) 
         cell,
         cols,
         rows,
+        goal,
         dist: vec![f32::INFINITY; n],
     };
 
@@ -288,8 +295,9 @@ fn cache_key(walls: &[(Vector2, Vector2)], radius: f32, cell: f32, goal: Vector2
 fn load(path: &PathBuf) -> Option<Field> {
     let mut buf = Vec::new();
     std::fs::File::open(path).ok()?.read_to_end(&mut buf).ok()?;
-    // 28 = MAGIC + FORMAT + origin + cell + cols + rows; short means truncated.
-    if buf.len() < 28 || &buf[..4] != MAGIC {
+    // 36 = MAGIC + FORMAT + origin + cell + cols + rows + goal; short means
+    // truncated.
+    if buf.len() < 36 || &buf[..4] != MAGIC {
         return None;
     }
     let u32_at = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
@@ -300,11 +308,12 @@ fn load(path: &PathBuf) -> Option<Field> {
     let cell = f32::from_bits(u32_at(16));
     let cols = u32_at(20) as i32;
     let rows = u32_at(24) as i32;
+    let goal = Vector2::new(f32::from_bits(u32_at(28)), f32::from_bits(u32_at(32)));
     let n = (cols as usize).checked_mul(rows as usize)?;
-    if buf.len() != 28 + n * 4 {
+    if buf.len() != 36 + n * 4 {
         return None;
     }
-    let dist = buf[28..]
+    let dist = buf[36..]
         .as_chunks::<4>()
         .0
         .iter()
@@ -315,12 +324,13 @@ fn load(path: &PathBuf) -> Option<Field> {
         cell,
         cols,
         rows,
+        goal,
         dist,
     })
 }
 
 fn store(path: &PathBuf, f: &Field) -> std::io::Result<()> {
-    let mut out = Vec::with_capacity(28 + f.dist.len() * 4);
+    let mut out = Vec::with_capacity(36 + f.dist.len() * 4);
     out.extend_from_slice(MAGIC);
     for v in [
         FORMAT,
@@ -329,6 +339,8 @@ fn store(path: &PathBuf, f: &Field) -> std::io::Result<()> {
         f.cell.to_bits(),
         f.cols as u32,
         f.rows as u32,
+        f.goal.x.to_bits(),
+        f.goal.y.to_bits(),
     ] {
         out.extend_from_slice(&v.to_le_bytes());
     }
@@ -441,6 +453,7 @@ mod tests {
         let loaded = field(&walls, 5.0, 1.25, goal, &dir);
         assert_eq!(fresh.dist, loaded.dist, "a cached field must be identical");
         assert_eq!((fresh.cols, fresh.rows), (loaded.cols, loaded.rows));
+        assert_eq!(fresh.goal, loaded.goal);
         // A different radius is a different key, not a cache hit.
         let other = field(&walls, 9.0, 2.25, goal, &dir);
         assert_ne!(other.dist.len(), 0);

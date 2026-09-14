@@ -18,7 +18,7 @@ use rts_lib::mapgen::rooms_map;
 use rts_lib::sim::{Command, Sim};
 
 use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
-use crate::metrics::{self, Cfg, PathProbe, Query, Run, build_cdt, wall_segments};
+use crate::metrics::{self, Cfg, PathProbe, Query, Route, Run, build_cdt, wall_segments};
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "solo_march",
@@ -67,7 +67,7 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         units: vec![id],
         goal: GOAL,
     }]);
-    run.track(id, optimal);
+    run.track(id, Route::to(&field, START));
     if ctx.trace {
         run.record_trace(SPEC.name);
     }
@@ -93,6 +93,7 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         m("waypoints",           "count",    2.00, 200.00, 0.0).or_bad(probe.waypoints()),
         m("turn_per_100",        "rad",      0.00,   3.00, 0.0).or_bad(probe.turn_per_len()),
         m("arrival",             "frac",     1.00,   0.00, 2.0).at(s.arrival),
+        m("residual",            "radii",    0.00,  20.00, 2.0).or_bad(s.residual),
         m("detour",              "ratio",    1.05,   2.00, 2.0).or_bad(s.detour),
         m("lateness_p50",        "ratio",    1.10,   2.50, 1.0).or_bad(s.lateness_p50),
         m("stall_trips",         "per unit", 0.00,  20.00, 1.0).at(s.stall_trips),

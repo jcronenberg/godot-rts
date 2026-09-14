@@ -18,7 +18,7 @@ use rts_lib::sim::{Command, Sim};
 
 use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
 use crate::maps::{box_map, v};
-use crate::metrics::{Cfg, Run, unit_ids};
+use crate::metrics::{Cfg, Route, Run, unit_ids};
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "stutter_step",
@@ -81,7 +81,7 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
     let ids = unit_ids(&run.sim);
     let (prey, attackers) = (ids[0], ids[1..].to_vec());
     for &id in &attackers {
-        run.track(id, None);
+        run.track(id, Route::none());
     }
     // One order, never re-issued: the defender simply walks its line.
     run.sim.step(&[Command::Move {

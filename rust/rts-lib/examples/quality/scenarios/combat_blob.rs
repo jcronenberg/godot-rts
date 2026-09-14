@@ -22,7 +22,7 @@ use rts_lib::sim::{Command, Sim};
 
 use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
 use crate::maps::{box_map, v};
-use crate::metrics::{Cfg, Run, unit_ids};
+use crate::metrics::{Cfg, Route, Run, unit_ids};
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "combat_blob",
@@ -82,7 +82,7 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
     }]);
     // Only the attackers are scored: the defender is scenery.
     for &id in attackers {
-        run.track(id, None);
+        run.track(id, Route::none());
     }
     if ctx.trace {
         run.record_trace(SPEC.name);

@@ -25,7 +25,7 @@ use rts_lib::sim::{Command, Sim};
 
 use crate::harness::{Ctx, metric as m, Reading, ScenarioSpec};
 use crate::maps::{thin_wall, v};
-use crate::metrics::{Cfg, PathProbe, Query, Run, build_cdt, unit_ids, wall_segments};
+use crate::metrics::{Cfg, PathProbe, Query, Route, Run, build_cdt, unit_ids, wall_segments};
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "impassable_gap_40",
@@ -84,7 +84,7 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
     );
     let ids = unit_ids(&run.sim);
     for &id in &ids {
-        run.track(id, None); // unreachable at this radius: no optimum to price
+        run.track(id, Route::none()); // unreachable at this radius: nothing to price
     }
     if ctx.trace {
         run.record_trace(SPEC.name);

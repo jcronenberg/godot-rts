@@ -7,6 +7,8 @@
 //! 100 forever; `unreachable_goal` and the wall-penetration counts moved out
 //! of this directory on exactly that reasoning.
 
+use std::rc::Rc;
+
 use godot::prelude::Vector2;
 use rts_lib::sim::Command;
 
@@ -92,13 +94,21 @@ pub fn ref_cell(radius: f32) -> f32 {
 }
 
 /// Cost-to-goal field over `walls` at `radius`, cached under `ctx.cache_dir`.
+/// Shared, because a tracked unit holds on to the field that prices its route
+/// (see [`crate::metrics::Route`]).
 pub fn field(
     ctx: &crate::harness::Ctx,
     walls: &[(Vector2, Vector2)],
     radius: f32,
     goal: Vector2,
-) -> reference::Field {
-    reference::field(walls, radius, ref_cell(radius), goal, &ctx.cache_dir)
+) -> Rc<reference::Field> {
+    Rc::new(reference::field(
+        walls,
+        radius,
+        ref_cell(radius),
+        goal,
+        &ctx.cache_dir,
+    ))
 }
 
 /// `count` unarmed units in a `cols`-wide grid at `pitch` spacing, anchored at

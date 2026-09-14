@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use godot::prelude::Vector2;
 use rts_lib::astar::{AStarScratch, find_path, find_path_abstract, path_min_clearance};
@@ -12,6 +13,8 @@ use rts_lib::delaunay::CDT;
 use rts_lib::sim::{
     BLOCK_TICKS, Command, DETOUR_TICKS, DT, NO_SLOT, STALL_REPATH_TICKS, Sim, UnitId,
 };
+
+use crate::reference::Field;
 
 // ── Geometry helpers ─────────────────────────────────────────────────────────
 
@@ -78,11 +81,40 @@ pub fn mean(values: &[f64]) -> Option<f64> {
 
 // ── Agent-level probe ────────────────────────────────────────────────────────
 
+/// Ground truth for one tracked unit's route: what the optimal route cost
+/// from where the unit started, and the field that prices what is still owed
+/// from wherever it ends up. [`Route::none`] for a unit the scenario has no
+/// ground truth for (an unreachable goal, a combat approach); it then scores
+/// neither `detour` nor `residual`.
+#[derive(Clone, Default)]
+pub struct Route {
+    optimal: Option<f32>,
+    field: Option<Rc<Field>>,
+}
+
+impl Route {
+    /// Route from `start` to `field`'s goal.
+    pub fn to(field: &Rc<Field>, start: Vector2) -> Route {
+        Route {
+            optimal: field.optimal_len(start),
+            field: Some(field.clone()),
+        }
+    }
+
+    /// No ground truth for this unit.
+    pub fn none() -> Route {
+        Route::default()
+    }
+}
+
 struct Tracked {
     id: UnitId,
     /// Reference optimum for this unit's route; `None` when the scenario has
     /// no ground truth for it (an unreachable goal, a combat approach).
     optimal: Option<f32>,
+    /// Prices the route still owed from a position. Same `None` as `optimal`.
+    field: Option<Rc<Field>>,
+    radius: f32,
     /// Ticks a perfect unit would need: `optimal / (max_speed * DT)`.
     ideal_ticks: f64,
     deadline_ticks: f64,
@@ -101,6 +133,8 @@ struct Tracked {
     // separation push received, summed over the run, in radii
     push_ally: f64,
     push_enemy: f64,
+    /// Last tick this unit moved more than [`SETTLE_EPS`] in one step.
+    last_move_tick: u64,
     // jitter
     prev_dir: Option<Vector2>,
     turn_sum: f64,
@@ -127,6 +161,11 @@ struct Tracked {
     gap_sum: f64,
     gap_ticks: u64,
 }
+
+/// Per-tick movement, in radii, below which a unit counts as settled rather
+/// than still walking. Well under a tenth of a step at the speeds here, so
+/// only the jostle of a packed blob falls below it.
+const SETTLE_EPS: f32 = 0.02;
 
 /// Scenario knobs the probe needs but cannot infer.
 pub struct Cfg {
@@ -216,14 +255,15 @@ impl Run {
         });
     }
 
-    /// Watch `id` on its way to its current goal. `optimal` is the reference
-    /// cost of that route; `None` when there is no ground truth for it (an
-    /// unreachable goal, a combat approach). The goal itself is not passed in:
-    /// `Unit::parked` already means "settled at the goal".
-    pub fn track(&mut self, id: UnitId, optimal: Option<f32>) {
+    /// Watch `id` on its way to its current goal. `route` is the ground truth
+    /// for that journey (see [`Route`]). The goal point itself is not passed
+    /// in: `Unit::parked` already means "settled at the goal", and the
+    /// reference field measures the distance still owed.
+    pub fn track(&mut self, id: UnitId, route: Route) {
         let Some(u) = self.sim.units().get(id) else {
             return;
         };
+        let optimal = route.optimal;
         let ideal_ticks = optimal
             .map(|o| (o / (u.max_speed * DT)) as f64)
             .unwrap_or(0.0);
@@ -240,6 +280,8 @@ impl Run {
         self.tracked.push(Tracked {
             id,
             optimal,
+            field: route.field,
+            radius: u.radius,
             ideal_ticks,
             deadline_ticks: ideal_ticks * self.cfg.deadline_mult,
             travelled: 0.0,
@@ -254,6 +296,7 @@ impl Run {
             repaths: 0,
             push_ally: 0.0,
             push_enemy: 0.0,
+            last_move_tick: 0,
             prev_dir: None,
             turn_sum: 0.0,
             moving_ticks: 0,
@@ -293,7 +336,11 @@ impl Run {
             let Some(u) = self.sim.units().get(t.id) else {
                 continue;
             };
-            t.travelled += (u.pos - u.prev_pos).length() as f64;
+            let step = (u.pos - u.prev_pos).length();
+            t.travelled += step as f64;
+            if step > SETTLE_EPS * u.radius {
+                t.last_move_tick = tick;
+            }
 
             if u.parked && t.arrived_tick.is_none() {
                 t.arrived_tick = Some(tick);
@@ -587,6 +634,33 @@ pub struct Stats {
     /// slightly below 1.0. The bias is constant per scenario.
     pub lateness_p50: Option<f64>,
     pub lateness_p95: Option<f64>,
+    /// Distance still owed to the goal at the tick `stats()` is taken, in
+    /// radii, averaged over the units with ground truth for it. The continuous form of
+    /// `arrival`, which a deadline hides: a crowd that ends one body short of
+    /// the goal and one still in the start room both score 0 arrival.
+    ///
+    /// Measured along the reference field, not as the crow flies, so a unit
+    /// stuck behind a wall is charged the way round it rather than through it.
+    ///
+    /// A settled crowd parks *around* the goal, so a large group reads a few
+    /// radii above zero however well it did; the bias is constant per
+    /// scenario, like the one on `lateness_*`.
+    pub residual: Option<f64>,
+    /// The same at the 95th percentile: the straggler, not the crowd.
+    pub residual_p95: Option<f64>,
+    /// p95 over tracked units of the last tick they were still moving, as a
+    /// fraction of the run. The guard on the other two: a crowd can always be
+    /// centred by shuffling into place for the rest of the budget, and that
+    /// costs nothing in `arrival` or `lateness_*`, which stop counting the
+    /// moment a unit parks.
+    pub settle_p95: Option<f64>,
+    /// Distance from the settled crowd's *centroid* to the goal it was sent
+    /// to, in radii, meaned over goals. What `residual` cannot separate: a
+    /// blob that stops short and a blob that straddles the goal read the same
+    /// mean distance, and only this one says which. Zero is a crowd centred on
+    /// the point it was ordered to, whatever its spread, so it has no packing
+    /// floor: `cohesion_final` is the spread half of the same picture.
+    pub centroid_offset: Option<f64>,
     /// Mean distance walked per tracked unit.
     pub travelled: f64,
     pub stall_trips: f64,
@@ -678,6 +752,52 @@ impl Stats {
             })
             .collect();
 
+        let mut residuals: Vec<f64> = run
+            .tracked
+            .iter()
+            .filter_map(|t| {
+                let field = t.field.as_ref()?;
+                let u = run.sim.units().get(t.id)?;
+                // A unit the reference cannot price at all (walled in, or cut
+                // off from the goal) falls back to the straight line, which
+                // under-reports it. Deliberately: the alternative is an
+                // infinity that swallows the whole scenario's mean.
+                let owed = field
+                    .optimal_len(u.pos)
+                    .unwrap_or_else(|| (field.goal() - u.pos).length());
+                Some(owed as f64 / t.radius.max(1e-3) as f64)
+            })
+            .collect();
+
+        let mut settles: Vec<f64> = run
+            .tracked
+            .iter()
+            .map(|t| t.last_move_tick as f64 / run.ticks.max(1) as f64)
+            .collect();
+
+        // Per goal, not per `Unit::group`: the tracked units sent to one point
+        // are exactly the crowd whose centring is being scored.
+        let mut by_goal: BTreeMap<(u32, u32), (Vector2, usize, f32)> = BTreeMap::new();
+        for t in &run.tracked {
+            let (Some(field), Some(u)) = (t.field.as_ref(), run.sim.units().get(t.id)) else {
+                continue;
+            };
+            let g = field.goal();
+            let e = by_goal
+                .entry((g.x.to_bits(), g.y.to_bits()))
+                .or_insert((Vector2::ZERO, 0, t.radius));
+            e.0 += u.pos;
+            e.1 += 1;
+        }
+        let offsets: Vec<f64> = by_goal
+            .iter()
+            .map(|(&(gx, gy), &(sum, n, r))| {
+                let goal = Vector2::new(f32::from_bits(gx), f32::from_bits(gy));
+                let centroid = sum / n as f32;
+                ((centroid - goal).length() / r.max(1e-3)) as f64
+            })
+            .collect();
+
         let mut first_shots: Vec<f64> = run
             .tracked
             .iter()
@@ -710,6 +830,10 @@ impl Stats {
             detour: mean(&detours),
             lateness_p50: percentile(&mut lateness, 0.50),
             lateness_p95: percentile(&mut lateness, 0.95),
+            residual: mean(&residuals),
+            residual_p95: percentile(&mut residuals, 0.95),
+            settle_p95: percentile(&mut settles, 0.95),
+            centroid_offset: mean(&offsets),
             travelled: fdiv(run.tracked.iter().map(|t| t.travelled).sum(), n),
             // Per unit-tick, so it doesn't scale with run length.
             push_ally: fdiv(
@@ -1062,7 +1186,7 @@ mod tests {
             spawn_cmd(Vector2::new(100.0, 100.5), 5.0, 20.0),
         ]);
         for id in unit_ids(&run.sim) {
-            run.track(id, None);
+            run.track(id, Route::none());
         }
         for _ in 0..120 {
             run.step(&[]);
@@ -1090,6 +1214,105 @@ mod tests {
             s.overlap_mean,
             s.overlap_max
         );
+    }
+
+    /// What the arrival deadline hides: a unit that walked to its goal owes
+    /// nothing, one that never set off owes the whole route.
+    #[test]
+    fn test_residual_prices_the_distance_still_owed() {
+        let dir = std::env::temp_dir().join("quality_residual_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (points, constraints) = crate::maps::box_map(400.0, 200.0);
+        let walls = wall_segments(&points, &constraints);
+        let goal = v(350.0, 100.0);
+        let field = Rc::new(crate::reference::field(&walls, 5.0, 1.25, goal, &dir));
+
+        let mut run = Run::new(Sim::new(points, &constraints, 3), Cfg::default());
+        let starts = [v(50.0, 100.0), v(50.0, 50.0)];
+        run.sim.step(
+            &starts
+                .iter()
+                .map(|&p| spawn_cmd(p, 5.0, 40.0))
+                .collect::<Vec<_>>(),
+        );
+        let ids = unit_ids(&run.sim);
+        // Both are tracked to the same goal; only the first is ordered there.
+        run.sim.step(&[Command::Move {
+            units: vec![ids[0]],
+            goal,
+        }]);
+        for (&id, &start) in ids.iter().zip(&starts) {
+            run.track(id, Route::to(&field, start));
+        }
+        for _ in 0..400 {
+            run.step(&[]);
+        }
+        let s = run.stats();
+
+        // p95 of two readings is the worse one: the unit that never moved,
+        // 304 units from the goal, which is 60.8 radii.
+        let idle = s.residual_p95.expect("both units have ground truth");
+        assert!((idle - 60.8).abs() < 2.0, "{idle} radii");
+        // The marcher parked on the goal, so the pair averages half of that.
+        let both = s.residual.expect("both units have ground truth");
+        assert!((both - idle / 2.0).abs() < 2.0, "{both} vs {idle}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `centroid_offset` is not `residual` with the units renamed: a pair
+    /// straddling the goal is ten radii from it each and perfectly centred on
+    /// it, which is the whole distinction the crowd scenarios need.
+    #[test]
+    fn test_centroid_offset_separates_centring_from_distance() {
+        let dir = std::env::temp_dir().join("quality_centroid_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (points, constraints) = crate::maps::box_map(400.0, 200.0);
+        let walls = wall_segments(&points, &constraints);
+        let goal = v(300.0, 100.0);
+        let field = Rc::new(crate::reference::field(&walls, 5.0, 1.25, goal, &dir));
+
+        let mut run = Run::new(Sim::new(points, &constraints, 5), Cfg::default());
+        let starts = [v(250.0, 100.0), v(350.0, 100.0)];
+        run.sim.step(
+            &starts
+                .iter()
+                .map(|&p| spawn_cmd(p, 5.0, 40.0))
+                .collect::<Vec<_>>(),
+        );
+        // Tracked but never ordered: they sit where they are.
+        for (&id, &start) in unit_ids(&run.sim).iter().zip(&starts) {
+            run.track(id, Route::to(&field, start));
+        }
+        run.step(&[]);
+        let s = run.stats();
+
+        assert!(
+            s.centroid_offset.expect("both have a goal") < 0.5,
+            "straddling the goal is centred on it: {:?}",
+            s.centroid_offset
+        );
+        let each = s.residual.expect("both have a goal");
+        assert!((each - 10.0).abs() < 1.0, "50 units is 10 radii: {each}");
+        // Neither moved, so nothing is still settling.
+        assert_eq!(s.settle_p95, Some(0.0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No ground truth, no reading: a scenario that cannot say where the goal
+    /// is must not have a zero averaged in on its behalf.
+    #[test]
+    fn test_residual_is_absent_without_a_route() {
+        let (points, constraints) = crate::maps::box_map(200.0, 200.0);
+        let mut run = Run::new(Sim::new(points, &constraints, 1), Cfg::default());
+        run.sim
+            .step(&[spawn_cmd(Vector2::new(100.0, 100.0), 5.0, 20.0)]);
+        for id in unit_ids(&run.sim) {
+            run.track(id, Route::none());
+        }
+        run.step(&[]);
+        assert!(run.stats().residual.is_none());
     }
 
     #[test]

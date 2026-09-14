@@ -1,13 +1,13 @@
 {
   "format": 1,
-  "git_sha": "94c01fd",
+  "git_sha": "ad66284",
   "git_dirty": true,
-  "anchors": "863c29633f935661",
+  "anchors": "fd00898a99436e62",
   "tuning": {},
   "scenarios": [
     {
       "name": "solo_march",
-      "score": 84.86156114867573,
+      "score": 87.19055174118715,
       "metrics": [
         {
           "name": "suboptimality",
@@ -64,6 +64,15 @@
           "bad": 0.0
         },
         {
+          "name": "residual",
+          "unit": "radii",
+          "value": 0.0,
+          "points": 100.0,
+          "weight": 2.0,
+          "good": 0.0,
+          "bad": 20.0
+        },
+        {
           "name": "detour",
           "unit": "ratio",
           "value": 1.387263178060378,
@@ -103,7 +112,7 @@
     },
     {
       "name": "door_funnel_200",
-      "score": 75.91652604601533,
+      "score": 75.90258339175132,
       "metrics": [
         {
           "name": "throughput",
@@ -122,6 +131,42 @@
           "weight": 2.0,
           "good": 1.0,
           "bad": 0.0
+        },
+        {
+          "name": "residual",
+          "unit": "radii",
+          "value": 17.310760353088387,
+          "points": 87.81539941151935,
+          "weight": 2.0,
+          "good": 10.0,
+          "bad": 70.0
+        },
+        {
+          "name": "residual_p95",
+          "unit": "radii",
+          "value": 28.728701782226562,
+          "points": 81.69506429036458,
+          "weight": 1.0,
+          "good": 15.0,
+          "bad": 90.0
+        },
+        {
+          "name": "centroid_offset",
+          "unit": "radii",
+          "value": 14.900016784667969,
+          "points": 50.3332773844401,
+          "weight": 2.0,
+          "good": 0.0,
+          "bad": 30.0
+        },
+        {
+          "name": "settle_p95",
+          "unit": "frac run",
+          "value": 0.2224,
+          "points": 97.2,
+          "weight": 1.0,
+          "good": 0.2,
+          "bad": 1.0
         },
         {
           "name": "lateness_p95",
@@ -226,7 +271,7 @@
     },
     {
       "name": "counterflow_2x60",
-      "score": 83.68259145958055,
+      "score": 82.53974318478082,
       "metrics": [
         {
           "name": "arrival",
@@ -236,6 +281,42 @@
           "weight": 3.0,
           "good": 1.0,
           "bad": 0.0
+        },
+        {
+          "name": "residual",
+          "unit": "radii",
+          "value": 9.245081623395285,
+          "points": 91.58408623956116,
+          "weight": 2.0,
+          "good": 5.5,
+          "bad": 50.0
+        },
+        {
+          "name": "residual_p95",
+          "unit": "radii",
+          "value": 15.30901641845703,
+          "points": 88.21126384119833,
+          "weight": 1.0,
+          "good": 8.0,
+          "bad": 70.0
+        },
+        {
+          "name": "centroid_offset",
+          "unit": "radii",
+          "value": 7.798407554626465,
+          "points": 51.259952783584595,
+          "weight": 2.0,
+          "good": 0.0,
+          "bad": 16.0
+        },
+        {
+          "name": "settle_p95",
+          "unit": "frac run",
+          "value": 0.203,
+          "points": 99.62499999999999,
+          "weight": 1.0,
+          "good": 0.2,
+          "bad": 1.0
         },
         {
           "name": "lateness_p50",
@@ -310,6 +391,15 @@
           "bad": 0.0
         },
         {
+          "name": "spread_at_end",
+          "unit": "radii",
+          "value": 0.8151984214782715,
+          "points": 0.0,
+          "weight": 0.0,
+          "good": 0.0,
+          "bad": 0.0
+        },
+        {
           "name": "push_ally",
           "unit": "radii/tick",
           "value": 0.04282935234755989,
@@ -358,7 +448,7 @@
     },
     {
       "name": "obstacle_drop",
-      "score": 77.91686521627737,
+      "score": 78.4925240031931,
       "metrics": [
         {
           "name": "detour",
@@ -377,6 +467,42 @@
           "weight": 2.0,
           "good": 1.0,
           "bad": 0.0
+        },
+        {
+          "name": "residual",
+          "unit": "radii",
+          "value": 7.001101207733155,
+          "points": 94.6408907004765,
+          "weight": 2.0,
+          "good": 4.0,
+          "bad": 60.0
+        },
+        {
+          "name": "residual_p95",
+          "unit": "radii",
+          "value": 10.812307739257813,
+          "points": 93.49688143343539,
+          "weight": 1.0,
+          "good": 6.0,
+          "bad": 80.0
+        },
+        {
+          "name": "centroid_offset",
+          "unit": "radii",
+          "value": 5.516239166259766,
+          "points": 54.03134028116862,
+          "weight": 2.0,
+          "good": 0.0,
+          "bad": 12.0
+        },
+        {
+          "name": "settle_p95",
+          "unit": "frac run",
+          "value": 0.2808,
+          "points": 89.9,
+          "weight": 1.0,
+          "good": 0.2,
+          "bad": 1.0
         },
         {
           "name": "lateness_p95",
@@ -413,6 +539,15 @@
           "weight": 1.0,
           "good": 0.05,
           "bad": 0.5
+        },
+        {
+          "name": "spread_at_end",
+          "unit": "radii",
+          "value": 0.8842059969902039,
+          "points": 0.0,
+          "weight": 0.0,
+          "good": 0.0,
+          "bad": 0.0
         },
         {
           "name": "push_ally",
@@ -873,5 +1008,5 @@
       ]
     }
   ],
-  "total": 67.3407417077346
+  "total": 67.55922401403001
 }
