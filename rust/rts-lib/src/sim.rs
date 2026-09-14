@@ -47,16 +47,39 @@ pub static COHESION_GAIN: TunableF32 = TunableF32::new(0.05);
 /// bias and never pulls group-mates back into overlap.
 pub static COHESION_MAX_FRAC: TunableF32 = TunableF32::new(0.15);
 /// A moving unit joins a parked group-mate's cluster (and stops) when within
-/// this multiple of touching distance of it — *and* within its arrival radius
-/// of the goal (below). So a group settles into a blob around its goal instead
-/// of every unit driving to the exact goal point and crushing inward.
+/// this multiple of touching distance of it — *and* within
+/// [`BLOB_ARRIVAL_RADII`] of its own place in the blob (below). So a group
+/// settles into its blob as a body, rather than each unit grinding through
+/// the crowd for the last body-width to the exact place it was given.
 pub static ARRIVAL_TOUCH_FRAC: TunableF32 = TunableF32::new(1.15);
-/// Arrival radius = `r * max(ARRIVAL_MIN_RADII, FACTOR*sqrt(N))`; a unit only
-/// crowd-stops inside it. `sqrt(N)` ~ packed-disk radius of N circles; FACTOR>1
-/// pads it so units stop at the blob's edge, not the core; MIN keeps small
-/// groups (followers sit ~2r out) stoppable at all.
+/// How close to a *shared* destination counts as arrived, in radii of the
+/// unit: `max(MIN_RADII, FACTOR*sqrt(N))`. Group-sized because only a couple
+/// of bodies can stand on a point, so the rest of a flock converging on one —
+/// an attack-move, which lays out no blob — has to be able to stop around it.
+/// `sqrt(N)` ~ packed-disk radius of N circles; FACTOR > 1 puts the edge of
+/// the crowd, not its core, at the goal; MIN keeps small groups (followers sit
+/// ~2r out) stoppable at all.
 pub static ARRIVAL_RADIUS_FACTOR: TunableF32 = TunableF32::new(1.5);
 pub static ARRIVAL_MIN_RADII: TunableF32 = TunableF32::new(3.0);
+/// Spacing between the places of a settled blob, in touching distances (`2r`):
+/// 1.0 lays them out shoulder to shoulder. Also what sets the blob's radius
+/// (see [`blob_radius`]), and so how far the crowd spreads around its goal.
+///
+/// Tight on purpose. What the crowd actually settles into is looser — units
+/// stop a touch short of their places and separation holds the slack open —
+/// so a layout padded for that slack spreads the crowd twice over, and every
+/// unit's distance from the goal is paid for in the arrival measurements.
+pub static BLOB_SPACING: TunableF32 = TunableF32::new(1.0);
+/// The same, for a unit with its own place in a blob: how near that place
+/// counts as arrived, in radii. The give in the formation — a unit stopped a
+/// body's width short of where it was headed settles there rather than
+/// grinding on through bodies for the last step.
+///
+/// Far tighter than the shared-destination radius above, because the blob has
+/// already spread the destination out: this is the distance to *one place*,
+/// not to a whole crowd. Measured, widening it past a place's spacing is what
+/// starts to skew the settled blob back toward the side it arrived from.
+pub static BLOB_ARRIVAL_RADII: TunableF32 = TunableF32::new(2.0);
 /// Fraction of a flock's lateral spread applied as corner-fan offset. Below 1.0
 /// so outer units round a touch tighter and their separation doesn't shove them
 /// onto the corridor edge.
@@ -196,6 +219,18 @@ pub static PUSH_TRACKING: std::sync::atomic::AtomicBool =
 /// Internal convergence detail, not a gameplay knob — plain const rather than
 /// a `Tunable`.
 const WALL_CLAMP_PASSES: u32 = 8;
+/// Fraction of a radius by which [`assign_blob`] pushes each end of its
+/// reachability walk off the ray. Small enough to stay within the faces the
+/// ray really passes through, large enough to survive f32 rounding at map
+/// coordinates.
+const LOS_NUDGE_FRAC: f32 = 0.01;
+/// Hex-packing row step over slot spacing (`sin 60°`), for [`assign_blob`].
+const SQRT_3_OVER_2: f32 = 0.866_025_4;
+/// Radius of a hex packing of `n` places, over `spacing * sqrt(n)`: one place
+/// covers `spacing^2 sin 60°`, so `n` of them fill a disc of
+/// `spacing sqrt(n sin 60° / pi)`. See [`blob_radius`].
+#[cfg(test)]
+const HEX_DISC_FRAC: f32 = 0.524_65;
 /// Clearance slack (fraction of radius) below which a clamped position still
 /// counts as overlapping a wall. Just enough for f32 noise in an exact-fit
 /// (`gap == 2r`) corridor; more would let genuinely-too-tight gaps pass.
@@ -245,6 +280,8 @@ pub fn set_tuning(name: &str, value: f32) -> bool {
         "arrival_touch_frac" => ARRIVAL_TOUCH_FRAC.set(value),
         "arrival_radius_factor" => ARRIVAL_RADIUS_FACTOR.set(value),
         "arrival_min_radii" => ARRIVAL_MIN_RADII.set(value),
+        "blob_spacing" => BLOB_SPACING.set(value),
+        "blob_arrival_radii" => BLOB_ARRIVAL_RADII.set(value),
         "fan_frac" => FAN_FRAC.set(value),
         "straight_fan_frac" => STRAIGHT_FAN_FRAC.set(value),
         "stall_repath_ticks" => STALL_REPATH_TICKS.set(value.round().clamp(0.0, 255.0) as u8),
@@ -284,6 +321,8 @@ pub fn get_tuning(name: &str) -> Option<f32> {
         "arrival_touch_frac" => ARRIVAL_TOUCH_FRAC.get(),
         "arrival_radius_factor" => ARRIVAL_RADIUS_FACTOR.get(),
         "arrival_min_radii" => ARRIVAL_MIN_RADII.get(),
+        "blob_spacing" => BLOB_SPACING.get(),
+        "blob_arrival_radii" => BLOB_ARRIVAL_RADII.get(),
         "fan_frac" => FAN_FRAC.get(),
         "straight_fan_frac" => STRAIGHT_FAN_FRAC.get(),
         "stall_repath_ticks" => STALL_REPATH_TICKS.get() as f32,
@@ -395,9 +434,17 @@ pub struct Unit {
     /// goal arrival from a unit that merely idles (e.g. unreachable goal), so
     /// only true arrivals seed the cluster others stop against.
     pub parked: bool,
-    /// Distance from the goal within which this unit may crowd-stop — sized to
-    /// the group so the settled blob centres on the goal. Stamped per `Move`.
+    /// How near the end of its path this unit counts as arrived: near enough
+    /// to stop against the crowd there, and near enough that a hold-up is the
+    /// crowd's doing rather than a wall's. Its own place in a blob
+    /// ([`BLOB_ARRIVAL_RADII`]) or a point shared with the whole flock
+    /// ([`ARRIVAL_RADIUS_FACTOR`]). Stamped per `Move`; 0 = never.
     pub arrival_r: f32,
+    /// The commanded goal. Not where this unit is walking — that is its place
+    /// in the blob, the end of `path` — but what it was *ordered* to, which is
+    /// what tells two flocks they were sent to the same point. Stamped per
+    /// `Move`.
+    pub arrival_at: Vector2,
     /// Ticks wall-clamped without beating [`Unit::min_remaining`]. A group
     /// shove can push a unit off its cleared path so its line to the next
     /// waypoint cuts a corner; once this trips it repaths from where it
@@ -849,17 +896,25 @@ struct StepScratch {
     /// part of [`Sim::state_hash`]. Empty unless [`PUSH_TRACKING`] is on.
     push_ally: Vec<f32>,
     push_enemy: Vec<f32>,
-    /// Whether a moving unit is within its arrival radius of its goal (so it
-    /// may crowd-stop); false for idle/parked units.
+    /// Whether a unit has arrived at the end of its path — near enough to
+    /// crowd-stop there, and near enough that neither the wall-clamp repath
+    /// nor the ally detour should fire. False for units with no path.
     within_arrival: Vec<bool>,
+    /// Where each unit is walking — its place in the blob, or its own position
+    /// when it has no path.
+    places: Vec<Vector2>,
     /// Crowd-arrival marks: set when a moving unit touches a parked group-mate.
     arrive: Vec<bool>,
     /// Sum of same-group moving-neighbour positions, and their count, per unit.
     coh_sum: Vec<Vector2>,
     coh_n: Vec<u32>,
-    /// Goal (last waypoint) per dense unit; junk for non-moving units, only read
-    /// when both sides of a pair are moving (merge detection).
+    /// Commanded goal per dense unit, and whether the unit is executing that
+    /// march rather than a fight; junk for non-moving units. Only read by
+    /// merge detection, which is why it is the *commanded* goal and not the
+    /// path end: flock-mates walk to their own places in the blob, so only
+    /// this says "sent to one point".
     goals: Vec<Vector2>,
+    marching: Vec<bool>,
     /// Group-id pairs to merge this tick, as `(min, max)`; usually empty.
     merge_pairs: Vec<(u32, u32)>,
     /// Wall-clamp face frontier and visited list (tiny per unit).
@@ -1070,6 +1125,7 @@ impl Sim {
                     group: 0,
                     parked: false,
                     arrival_r: 0.0,
+                    arrival_at: Vector2::ZERO,
                     stall: 0,
                     min_remaining: f32::MAX,
                     team: *team,
@@ -1099,7 +1155,7 @@ impl Sim {
             Command::Move { units, goal } => {
                 // Plain move interrupts: drop any queued orders, path now.
                 self.interrupt_orders(units);
-                self.start_move(units, *goal);
+                self.start_move(units, *goal, true);
             }
             Command::Attack { units, target } => {
                 self.interrupt_orders(units);
@@ -1151,7 +1207,12 @@ impl Sim {
     /// channel per unit so the flock spreads across corridor width instead of
     /// single-filing the inside corner. A unit whose first leg into the channel
     /// fails line-of-sight (straggler / no useful channel) paths individually.
-    fn start_move(&mut self, units: &[UnitId], goal: Vector2) {
+    ///
+    /// With `settle`, each flock is also given a blob of places centred on the
+    /// goal ([`assign_blob`]) and every unit routes to its own — the crowd
+    /// settles centred on the point it was sent to rather than piling up on
+    /// the near side of it. Without, the whole flock walks to the goal itself.
+    fn start_move(&mut self, units: &[UnitId], goal: Vector2, settle: bool) {
         // Live selected units, slot order (stable, deterministic). A fresh
         // move interrupts any combat engagement, same as it clears a path.
         let mut sel: Vec<UnitId> = Vec::new();
@@ -1227,10 +1288,12 @@ impl Sim {
             }
         }
 
-        // Reusable per-corner geometry of the seed's funnel path.
+        // Reusable per-corner geometry of the seed's funnel path, and the
+        // blob places the flock settles into.
         let mut corners: Vec<Vector2> = Vec::new();
         let mut outward: Vec<Vector2> = Vec::new();
         let mut lanes: Vec<f32> = Vec::new();
+        let mut blob = BlobScratch::default();
         for (group, members) in &comps {
             let size = members.len();
             // All members share one radius (clustering keys on it), so the flock's
@@ -1238,6 +1301,13 @@ impl Sim {
             let flock_r = rad[members[0]];
             let arrival_mult =
                 (ARRIVAL_RADIUS_FACTOR.get() * (size as f32).sqrt()).max(ARRIVAL_MIN_RADII.get());
+            // A place each, or one point for the whole flock: how near the end
+            // of its path a unit counts as arrived follows from which.
+            let stop_mult = if settle {
+                BLOB_ARRIVAL_RADII.get()
+            } else {
+                arrival_mult
+            };
             // One shortest (funnel) path for the flock, seeded from the member
             // nearest the goal (a real unit position is on the navmesh). Its
             // interior waypoints are the corner apexes every unit would otherwise
@@ -1271,10 +1341,32 @@ impl Sim {
                 for &i in members {
                     let unit = self.units.get_mut(sel[i]).expect("filtered to live");
                     unit.group = *group;
-                    unit.arrival_r = rad[i] * arrival_mult;
+                    unit.arrival_r = rad[i] * stop_mult;
+                    unit.arrival_at = goal;
                     set_path(unit, Vec::new());
                 }
                 continue;
+            }
+
+            // Where each member settles, and the direction the flock arrives
+            // from — the last leg of the seed's path, which is the axis the
+            // blob is filled along.
+            let approach = {
+                let last_leg = norm(goal - seed_path[seed_path.len() - 2]);
+                if last_leg == Vector2::ZERO {
+                    norm(goal - pos[seed]) // degenerate final leg
+                } else {
+                    last_leg
+                }
+            };
+            // A lone unit's place is the goal itself, so there is no blob to
+            // lay out — the common case for a scattered selection, and not
+            // worth a lattice.
+            if settle && size > 1 {
+                assign_blob(cdt, &pos, members, goal, approach, flock_r, &mut blob);
+            } else {
+                blob.out.clear();
+                blob.out.resize(size, goal);
             }
 
             // Corner apexes (drop start and goal) and the outward direction at
@@ -1331,9 +1423,10 @@ impl Sim {
 
             for (k, &i) in members.iter().enumerate() {
                 let radius = rad[i];
-                // The seed already has its shortest path (offset 0, same start);
-                // reuse it (this also covers singleton clusters with no fan).
-                let path = if i == seed {
+                let place = blob.out[k];
+                // A lone unit's place *is* the goal, so the seed's own shortest
+                // path already goes there; reuse it rather than re-deriving it.
+                let path = if i == seed && place == goal {
                     seed_path.clone()
                 } else {
                     let offset = if straight {
@@ -1344,22 +1437,39 @@ impl Sim {
                     } else {
                         0.0
                     };
-                    build_offset_path(cdt, pos[i], &corners, &outward, goal, offset, radius)
+                    build_offset_path(cdt, pos[i], &corners, &outward, place, offset, radius)
                         .unwrap_or_else(|| {
+                            // The seed already has a shortest path to the goal,
+                            // and its place is a hop from there that
+                            // `assign_blob` has checked: re-aim the last leg at
+                            // the place, or failing that finish from the goal.
+                            // Beats a private path across the map for the one
+                            // member that already has the flock's own.
+                            if i == seed {
+                                let mut p = seed_path.clone();
+                                let anchor = p[p.len() - 2];
+                                if clear_los(cdt, anchor, place, radius) {
+                                    *p.last_mut().expect("non-empty") = place;
+                                } else {
+                                    p.push(place);
+                                }
+                                return p;
+                            }
                             route_onto_channel(
                                 cdt,
                                 &self.abstraction,
                                 &mut self.scratch,
                                 pos[i],
                                 &corners,
-                                goal,
+                                place,
                                 radius,
                             )
                         })
                 };
                 let unit = self.units.get_mut(sel[i]).expect("filtered to live");
                 unit.group = *group;
-                unit.arrival_r = radius * arrival_mult;
+                unit.arrival_r = radius * stop_mult;
+                unit.arrival_at = goal;
                 set_path(unit, path);
             }
         }
@@ -1369,7 +1479,7 @@ impl Sim {
     /// execution seam for queued orders — new `Order` variants add an arm here.
     fn begin_order(&mut self, units: &[UnitId], order: &Order) {
         match order {
-            Order::Move { goal } => self.start_move(units, *goal),
+            Order::Move { goal } => self.start_move(units, *goal, true),
             Order::Attack { target } => self.start_attack(units, *target),
             Order::AttackMove { goal } => self.start_attack_move(units, *goal),
         }
@@ -1410,7 +1520,11 @@ impl Sim {
     /// id, channel pathing) — group ids stay per `Move`; acquisition later
     /// breaks a unit out of its march individually rather than re-grouping.
     fn start_attack_move(&mut self, units: &[UnitId], goal: Vector2) {
-        self.start_move(units, goal);
+        // No blob: an attack-move is an advance into contact, so the flock
+        // closes *on* the goal. Settling in a ring around it would leave the
+        // rear ranks parked outside their own acquisition range, watching the
+        // front rank fight.
+        self.start_move(units, goal, false);
         for &id in units {
             if let Some(unit) = self.units.get_mut(id) {
                 unit.attack_move_goal = Some(goal);
@@ -1564,9 +1678,10 @@ impl Sim {
     ///   any heading-opposing component dropped so stragglers rejoin but
     ///   leaders are never braked.
     /// - **Crowd-arrival** (same-group, at [`ARRIVAL_TOUCH_FRAC`] of touching):
-    ///   a moving unit touching a *parked* group-mate parks too, so a group
-    ///   settles into a blob at its goal rather than each unit crushing toward
-    ///   the exact goal point.
+    ///   a moving unit at the end of its path (within `arrival_r`) that
+    ///   touches a *parked* group-mate parks too, so a flock settles as a body
+    ///   instead of each unit grinding through the crowd for the last
+    ///   body-width to its own place.
     ///
     /// The combined displacement is capped at [`SEPARATION_MAX_FRAC`] of the
     /// unit's own step, well below the path advance, so pathing always wins.
@@ -1585,10 +1700,12 @@ impl Sim {
         s.push_ally.clear();
         s.push_enemy.clear();
         s.within_arrival.clear();
+        s.places.clear();
         s.arrive.clear();
         s.coh_sum.clear();
         s.coh_n.clear();
         s.goals.clear();
+        s.marching.clear();
         s.merge_pairs.clear();
         let mut max_radius = 0.0f32;
         for (id, u) in self.units.iter() {
@@ -1603,18 +1720,19 @@ impl Sim {
             s.parked.push(u.parked);
             s.ally_contact.push(false);
             let within = match u.path.last() {
-                Some(&g) if u.arrival_r > 0.0 => {
-                    let (dx, dy) = (u.pos.x - g.x, u.pos.y - g.y);
+                Some(&place) if u.arrival_r > 0.0 => {
+                    let (dx, dy) = (u.pos.x - place.x, u.pos.y - place.y);
                     dx * dx + dy * dy < u.arrival_r * u.arrival_r
                 }
                 _ => false,
             };
             s.within_arrival.push(within);
+            s.places.push(u.path.last().copied().unwrap_or(u.pos));
             s.arrive.push(false);
             s.coh_sum.push(Vector2::ZERO);
             s.coh_n.push(0);
-            s.goals
-                .push(u.path.last().copied().unwrap_or(Vector2::ZERO));
+            s.goals.push(u.arrival_at);
+            s.marching.push(u.target.is_none());
             max_radius = max_radius.max(u.radius);
         }
         if s.ids.len() < 2 || max_radius <= 0.0 {
@@ -1698,11 +1816,12 @@ impl Sim {
                                 }
                             }
                         }
-                        // Merge: adjacent, both-moving, same-goal, same-size units
-                        // from *different* flocks continue as one. R_COH + clear-LoS
-                        // adjacency excludes flocks that are close but wall-separated;
-                        // exact-goal match is the deterministic "commanded together"
-                        // test; same radius keeps differently-routed flocks apart.
+                        // Merge: adjacent, both-marching, same-goal, same-size
+                        // units from *different* flocks continue as one. R_COH +
+                        // clear-LoS adjacency excludes flocks that are close but
+                        // wall-separated; exact-goal match is the deterministic
+                        // "commanded together" test; same radius keeps
+                        // differently-routed flocks apart.
                         // Recorded as (min, max), unioned after the pass (v1).
                         let g_j = s.groups[j];
                         if g_i != 0
@@ -1712,6 +1831,8 @@ impl Sim {
                             && s.moving[j]
                             && r_i == s.radii[j]
                             && d2 < r_coh2
+                            && s.marching[i]
+                            && s.marching[j]
                             && s.goals[i] == s.goals[j]
                             && clear_los(cdt, p, s.positions[j], r_i)
                         {
@@ -1730,16 +1851,29 @@ impl Sim {
                             s.coh_n[i] += 1;
                             s.coh_n[j] += 1;
                         }
-                        // Crowd-arrival: a moving unit within arrival radius that
-                        // touches a parked group-mate parks too (whichever side is
-                        // moving). The radius gate lets units still far out keep
-                        // pushing in, so the blob centres rather than tailing back.
+                        // Crowd-arrival: a moving unit touching a parked
+                        // group-mate parks too (whichever side is moving) once
+                        // it has arrived — or once that mate is standing in the
+                        // place it was walking to, since a blob is handed out
+                        // from where the flock started and a unit that loses
+                        // the race for its place has to settle against whoever
+                        // won it rather than grind for the rest of the run.
+                        //
+                        // Nothing else stops here. A unit merely held up behind
+                        // the crowd keeps pushing in, which is what stops the
+                        // blob growing a tail back down the queue.
                         let touch = min_dist * arrival_touch_frac;
                         if d2 < touch * touch {
-                            if mv_i && s.within_arrival[i] && s.parked[j] {
-                                s.arrive[i] = true;
-                            } else if pk_i && s.moving[j] && s.within_arrival[j] {
-                                s.arrive[j] = true;
+                            // Is `b` standing in the place `a` is walking to?
+                            let taken = |a: usize, b: usize| {
+                                let d = s.positions[b] - s.places[a];
+                                let t = (s.radii[a] + s.radii[b]) * arrival_touch_frac;
+                                d.x * d.x + d.y * d.y < t * t
+                            };
+                            if mv_i && s.parked[j] {
+                                s.arrive[i] = s.within_arrival[i] || taken(i, j);
+                            } else if pk_i && s.moving[j] {
+                                s.arrive[j] = s.within_arrival[j] || taken(j, i);
                             }
                         }
                     }
@@ -2366,7 +2500,7 @@ impl Sim {
     fn leash_home(&mut self) {
         for i in 0..self.step_scratch.leash_home.len() {
             let (id, post) = self.step_scratch.leash_home[i];
-            self.start_move(&[id], post);
+            self.start_move(&[id], post, true);
         }
         self.step_scratch.leash_home.clear();
     }
@@ -2829,6 +2963,7 @@ impl Sim {
             h.write_u64(u.group as u64);
             h.write_u64(u.parked as u64);
             h.write_f32(u.arrival_r);
+            h.write_v2(u.arrival_at);
             h.write_u64(u.stall as u64);
             h.write_f32(u.min_remaining);
             h.write_u64(u.path_i as u64);
@@ -3362,6 +3497,140 @@ fn set_path(unit: &mut Unit, mut path: Vec<Vector2>) {
 /// completes. Shared by [`Sim::integrate`] (ran out of waypoints) and
 /// [`Sim::flock`] (crowd-arrival touched a parked group-mate): both are
 /// "reached the goal", just detected differently.
+/// Radius of the blob `n` bodies of radius `r` settle into: the disc a hex
+/// packing at [`BLOB_SPACING`] fills. The layout is [`assign_blob`]'s; this is
+/// the closed form of its extent, for tests that need to bound a settled
+/// group.
+#[cfg(test)]
+fn blob_radius(n: usize, r: f32) -> f32 {
+    2.0 * r * BLOB_SPACING.get() * (n as f32).sqrt() * HEX_DISC_FRAC
+}
+
+/// Reusable buffers for [`assign_blob`], owned by the caller so a selection
+/// split into many flocks allocates once rather than per flock.
+#[derive(Default)]
+struct BlobScratch {
+    /// Candidate places as `(distance² bits, row, column)`.
+    cand: Vec<(u32, i32, i32)>,
+    /// The chosen places, `(row, column, point)`.
+    places: Vec<(i32, i32, Vector2)>,
+    /// Members, in the order they are handed places.
+    order: Vec<usize>,
+    /// The result: where each member settles, indexed as `members`.
+    out: Vec<Vector2>,
+}
+
+/// Lateral offset of column `k` in row `j` of the blob's lattice. Odd rows sit
+/// half a spacing over: hex packing, not square.
+fn lattice_lat(j: i32, k: i32, spacing: f32) -> f32 {
+    let stagger = if j % 2 == 0 { 0.0 } else { 0.5 };
+    (k as f32 + stagger) * spacing
+}
+
+/// Hands every member of a flock the place it will settle in: a hex-packed
+/// blob of `members.len()` places centred on `goal`, left in `s.out`, where
+/// entry `k` is the place for `members[k]`.
+///
+/// Places are handed out **far side first** — the members already nearest the
+/// goal take the rim beyond it and the rest fill in behind them. That is what
+/// centres the crowd on the point it was sent to instead of leaving it hanging
+/// off the near rim, and it is paid for during the approach: every unit walks
+/// once, to a place that is already the right one, rather than shuffling into
+/// position after the crowd has stopped.
+///
+/// Places are laid out in rows across `approach` and each row is filled in
+/// lateral order, so units keep to their own side of the flock on the way in
+/// rather than crossing through it.
+fn assign_blob(
+    cdt: &CDT,
+    pos: &[Vector2],
+    members: &[usize],
+    goal: Vector2,
+    approach: Vector2,
+    r: f32,
+    s: &mut BlobScratch,
+) {
+    let n = members.len();
+    s.out.clear();
+    // Members with no place left (a blob against a wall can run out of
+    // candidates) fall back to the goal and settle by contact.
+    s.out.resize(n, goal);
+    let spacing = 2.0 * r * BLOB_SPACING.get();
+    let row_step = spacing * SQRT_3_OVER_2;
+    let lateral = Vector2::new(-approach.y, approach.x);
+    let nudge = r * LOS_NUDGE_FRAC;
+    let from = goal - approach * nudge;
+    // Lattice wide enough to still hold `n` places with a good share of them
+    // walled off. Candidates are taken nearest-first, so the spare rings cost
+    // only the sort when nothing is blocked.
+    let span = ((n as f32).sqrt() + 2.0) as i32;
+    s.cand.clear();
+    for j in -span..=span {
+        let along = j as f32 * row_step;
+        for k in -span..=span {
+            let lat = lattice_lat(j, k, spacing);
+            s.cand.push(((along * along + lat * lat).to_bits(), j, k));
+        }
+    }
+    // Nearest first, ties by row then column. The distance key is a
+    // non-negative f32, whose bits order exactly as the float does, so the
+    // whole key is an integer tuple: a total order, and the same layout every
+    // run without paying for a comparator or a stable sort.
+    s.cand.sort_unstable();
+    // Keep the nearest `n` the body can actually walk to from the goal, which
+    // grows a blob against a wall lopsided *away* from it — where the room is
+    // — instead of stranding units against it.
+    //
+    // Both ends of the walk sit a hair off the ray: it counts only *strict*
+    // crossings, so an end exactly on a mesh edge — which a goal on round
+    // coordinates often is, and one against a wall always is — finds no exit
+    // and calls everything past that edge unreachable. The tail end goes back
+    // down the approach, clear ground by construction; the head end just past
+    // the place, which also drops places squeezed hard against a wall.
+    s.places.clear();
+    for idx in 0..s.cand.len() {
+        if s.places.len() == n {
+            break;
+        }
+        let (_, j, k) = s.cand[idx];
+        let p = goal + approach * (j as f32 * row_step) + lateral * lattice_lat(j, k, spacing);
+        let to = p + norm(p - from) * nudge;
+        if clear_los(cdt, from, to, r) {
+            s.places.push((j, k, p));
+        }
+    }
+    // Rows from the far side back, each row across: the order they are handed
+    // out in.
+    s.places
+        .sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+    // Members, furthest along the approach (so nearest the goal) first.
+    s.order.clear();
+    s.order.extend(0..n);
+    let along_of = |k: usize| (pos[members[k]] - goal).dot(approach);
+    let lat_of = |k: usize| (pos[members[k]] - goal).dot(lateral);
+    s.order
+        .sort_by(|&a, &b| along_of(b).partial_cmp(&along_of(a)).expect("finite"));
+
+    let BlobScratch {
+        places, order, out, ..
+    } = s;
+    let mut i = 0;
+    while i < places.len() {
+        let row = places[i].0;
+        let mut end = i;
+        while end < places.len() && places[end].0 == row {
+            end += 1;
+        }
+        let seats = &mut order[i..end];
+        seats.sort_by(|&a, &b| lat_of(a).partial_cmp(&lat_of(b)).expect("finite"));
+        for (seat, &k) in seats.iter().enumerate() {
+            out[k] = places[i + seat].2;
+        }
+        i = end;
+    }
+}
+
 fn arrive_at_goal(unit: &mut Unit) {
     unit.path.clear();
     unit.path_i = 0;
@@ -4290,6 +4559,7 @@ mod tests {
         sim.step(&[Command::Move { units: ids, goal }]);
         step_n(&mut sim, 300);
         let us: Vec<&Unit> = sim.units().iter().map(|(_, u)| u).collect();
+
         assert!(
             us.iter().all(|u| u.parked && !u.is_moving()),
             "whole group must settle"
@@ -4310,8 +4580,9 @@ mod tests {
             at_goal <= 2,
             "units crammed onto the goal centre: {at_goal}"
         );
-        // Blob straddles the goal (not piled up short of it), centroid within
-        // the group's own arrival radius.
+        // Blob straddles the goal (not piled up short of it) and is centred on
+        // it: the goal belongs at the middle of the crowd, not at its near rim,
+        // so the centre of mass lands within a body of the point ordered.
         let axis = (goal - v(12.0, 12.0)).normalized();
         let (mut behind, mut past) = (f32::MAX, f32::MIN);
         for u in &us {
@@ -4323,17 +4594,17 @@ mod tests {
             behind < 0.0 && past > 0.0,
             "blob must straddle the goal, not stop short: behind={behind} past={past}"
         );
-        let r = us[0].radius;
-        let arrival_r = r
-            * (ARRIVAL_RADIUS_FACTOR.get() * (us.len() as f32).sqrt()).max(ARRIVAL_MIN_RADII.get());
+        // The goal belongs in the blob's core, not on its rim: the offset the
+        // whole arrival layout exists to remove (see `crowd_arrival.md`).
+        let core = 0.25 * blob_radius(us.len(), us[0].radius);
         let mut c = Vector2::ZERO;
         for u in &us {
             c += u.pos;
         }
         c *= 1.0 / us.len() as f32;
         assert!(
-            dist(c, goal) < arrival_r,
-            "group centre outside its arrival radius: {} (arrival_r={arrival_r})",
+            dist(c, goal) < core,
+            "group centre {} off the goal, outside the blob's core ({core})",
             dist(c, goal)
         );
     }
@@ -4440,6 +4711,10 @@ mod tests {
         // A fast leader grouped with slow units behind it must arrive about
         // when it would solo: the cohesion pull toward the lagging group is
         // backward, and the heading-opposing component is dropped.
+        //
+        // "About" allows the walk from the goal to its own place in the group's
+        // blob, which the leader — nearest the goal, so given the far rim —
+        // pays in full. That walk is the arrival centring, not braking.
         let goal = v(250.0, 50.0);
         let solo = {
             let mut sim = rooms_sim(3, 1, 3);
@@ -4458,11 +4733,15 @@ mod tests {
                 ids.push(spawn(&mut sim, v(20.0 - 3.0 * i as f32, 50.0), 5.0, 12.0));
             }
             sim.step(&[Command::Move { units: ids, goal }]);
-            arrival_tick(&mut sim, lead, 400)
+            let place = *unit(&sim, lead).path.last().expect("leader has a path");
+            let lead_ticks = (dist(place, goal) / (60.0 * DT)).ceil() as u64;
+            (arrival_tick(&mut sim, lead, 400), lead_ticks)
         };
+        let (grouped, lead_ticks) = grouped;
         assert!(
-            grouped.abs_diff(solo) <= 1,
-            "cohesion braked the leader: solo {solo}, grouped {grouped}"
+            grouped <= solo + lead_ticks + 1 && grouped + 1 >= solo,
+            "cohesion braked the leader: solo {solo}, grouped {grouped} \
+             (walking {lead_ticks} ticks further, to its place in the blob)"
         );
     }
 
@@ -4667,6 +4946,7 @@ mod tests {
             group: 0,
             parked: false,
             arrival_r: 0.0,
+            arrival_at: Vector2::ZERO,
             stall: 0,
             min_remaining: f32::MAX,
             team: 0,
@@ -6502,10 +6782,11 @@ mod tests {
                 travel[k] += dist(u.pos, u.prev_pos);
             }
         }
+        let blob = blob_radius(ids.len(), 5.0) + 2.0 * 5.0;
         for (k, &id) in ids.iter().enumerate() {
             let u = unit(&sim, id);
             assert!(
-                dist(u.pos, goal) < u.arrival_r + 2.0 * u.radius,
+                dist(u.pos, goal) < blob,
                 "unit {k} never made it through the doorway"
             );
             // Straight-line distance is ~130; measured worst travel ~165.

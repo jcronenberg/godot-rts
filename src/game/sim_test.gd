@@ -599,6 +599,8 @@ func _build_tuning_ui(layer: CanvasLayer) -> void:
 		["arrival_touch_frac", 1.0, 2.0, 0.05],
 		["arrival_radius_factor", 0.0, 3.0, 0.1],
 		["arrival_min_radii", 0.0, 10.0, 0.5],
+		["blob_spacing", 1.0, 2.0, 0.05],
+		["blob_arrival_radii", 0.5, 6.0, 0.25],
 		["fan_frac", 0.0, 1.0, 0.02],
 		["straight_fan_frac", 0.0, 1.0, 0.02],
 		["stall_repath_ticks", 0.0, 20.0, 1.0],
