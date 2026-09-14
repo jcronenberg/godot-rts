@@ -76,13 +76,13 @@ pub(crate) mod test_utils {
             .iter()
             .map(|[x, y]| Vector2::new(*x, *y))
             .collect();
-        let chunks = data.constraints.chunks_exact(2);
+        let (chunks, remainder) = data.constraints.as_chunks::<2>();
         assert!(
-            chunks.remainder().is_empty(),
+            remainder.is_empty(),
             "constraints in {path} has odd length {}",
             data.constraints.len()
         );
-        let constraints = chunks.map(|c| (c[0], c[1])).collect();
+        let constraints = chunks.iter().map(|c| (c[0], c[1])).collect();
         (points, constraints)
     }
 

@@ -133,9 +133,9 @@ impl Snapshot {
 
 /// View-side snapshot buffer with a continuous render clock that tracks
 /// estimated *current* sim time, not the newest snapshot. Between snapshots
-/// the clock runs ahead of the newest tick and the view extrapolates (alpha
-/// > 1, capped at one tick), keeping display latency near zero at any sim
-/// speed with mispredictions bounded to one tick of movement. Drift is
+/// the clock runs ahead of the newest tick and the view extrapolates
+/// (alpha > 1, capped at one tick), keeping display latency near zero at any
+/// sim speed with mispredictions bounded to one tick of movement. Drift is
 /// corrected by nudging the playback rate, never by stepping backwards, so
 /// rendered time stays monotonic.
 pub struct Interpolator {

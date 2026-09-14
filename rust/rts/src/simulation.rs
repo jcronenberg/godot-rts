@@ -66,7 +66,9 @@ impl Simulation {
         }
         let constraints: Vec<(u32, u32)> = constraints
             .as_slice()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| (c[0] as u32, c[1] as u32))
             .collect();
         let sim = Sim::new(points.as_slice().to_vec(), &constraints, seed as u64);
@@ -341,12 +343,7 @@ impl Simulation {
     /// Team affiliation per unit; rows align with `get_unit_ids`.
     #[func]
     pub fn get_teams(&self) -> PackedInt32Array {
-        self.interp
-            .cur()
-            .teams
-            .iter()
-            .map(|&t| t as i32)
-            .collect()
+        self.interp.cur().teams.iter().map(|&t| t as i32).collect()
     }
 
     #[func]

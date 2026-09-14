@@ -72,7 +72,9 @@ impl DelaunayTriangulator {
         let constraints: Vec<(u32, u32)> = self
             .constraints
             .as_slice()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| (pair[0] as u32, pair[1] as u32))
             .collect();
 
