@@ -313,6 +313,13 @@ pub fn clear_los(cdt: &CDT, a: Vector2, b: Vector2, radius: f32) -> bool {
     let Some(fa) = cdt.locate_face(a) else {
         return false;
     };
+    clear_los_from(cdt, fa, a, b, radius)
+}
+
+/// [`clear_los`] with the face containing `a` already located. For a caller
+/// testing many segments out of one fixed point, where locating `a` every time
+/// is the bulk of the cost.
+pub fn clear_los_from(cdt: &CDT, fa: u32, a: Vector2, b: Vector2, radius: f32) -> bool {
     let Some(fb) = cdt.locate_face(b) else {
         return false;
     };

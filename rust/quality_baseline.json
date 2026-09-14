@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "git_sha": "5b64529",
+  "git_sha": "97af680",
   "git_dirty": true,
   "anchors": "448e8462c37f6d7e",
   "tuning": {},
@@ -448,13 +448,13 @@
     },
     {
       "name": "queued_corridors_60",
-      "score": 75.74614450864789,
+      "score": 84.45865226399819,
       "metrics": [
         {
           "name": "stranded",
           "unit": "frac",
-          "value": 0.016666666666666666,
-          "points": 66.66666666666667,
+          "value": 0.0,
+          "points": 100.0,
           "weight": 4.0,
           "good": 0.0,
           "bad": 0.05
@@ -462,8 +462,8 @@
         {
           "name": "arrival",
           "unit": "frac",
-          "value": 0.9833333333333333,
-          "points": 83.33333333333329,
+          "value": 1.0,
+          "points": 100.0,
           "weight": 3.0,
           "good": 1.0,
           "bad": 0.9
@@ -471,8 +471,8 @@
         {
           "name": "lateness_p50",
           "unit": "ratio",
-          "value": 1.002685714990164,
-          "points": 99.7314285009836,
+          "value": 1.0037185355263272,
+          "points": 99.62814644736729,
           "weight": 2.0,
           "good": 1.0,
           "bad": 2.0
@@ -480,8 +480,8 @@
         {
           "name": "lateness_p95",
           "unit": "ratio",
-          "value": 1.077222259245914,
-          "points": 97.42592469180286,
+          "value": 1.0908950254122458,
+          "points": 96.9701658195918,
           "weight": 2.0,
           "good": 1.0,
           "bad": 4.0
@@ -489,8 +489,8 @@
         {
           "name": "throughput",
           "unit": "units/s",
-          "value": 10.114285186784636,
-          "points": 41.8487363928508,
+          "value": 10.169490995043443,
+          "points": 42.173476441432015,
           "weight": 1.0,
           "good": 20.0,
           "bad": 3.0
@@ -498,8 +498,8 @@
         {
           "name": "settle_p95",
           "unit": "frac run",
-          "value": 0.412,
-          "points": 73.50000000000001,
+          "value": 0.4134285714285714,
+          "points": 73.32142857142856,
           "weight": 1.0,
           "good": 0.2,
           "bad": 1.0
@@ -507,8 +507,8 @@
         {
           "name": "spread",
           "unit": "radii",
-          "value": 1.3237017299107143,
-          "points": 83.81491350446429,
+          "value": 1.005931886945452,
+          "points": 99.7034056527274,
           "weight": 3.0,
           "good": 1.0,
           "bad": 3.0
@@ -516,8 +516,8 @@
         {
           "name": "spread_p95",
           "unit": "radii",
-          "value": 2.118074655532837,
-          "points": 67.21161944525583,
+          "value": 1.6393933296203613,
+          "points": 84.3073810849871,
           "weight": 2.0,
           "good": 1.2,
           "bad": 4.0
@@ -525,8 +525,8 @@
         {
           "name": "centroid_offset",
           "unit": "radii",
-          "value": 1.5506539344787598,
-          "points": 87.07788387934366,
+          "value": 1.1261284351348877,
+          "points": 90.61559637387595,
           "weight": 3.0,
           "good": 0.0,
           "bad": 12.0
@@ -534,8 +534,8 @@
         {
           "name": "residual",
           "unit": "radii",
-          "value": 9.778423166275024,
-          "points": 91.41267462210222,
+          "value": 6.236902510325111,
+          "points": 99.46158520380656,
           "weight": 2.0,
           "good": 6.0,
           "bad": 50.0
@@ -543,8 +543,8 @@
         {
           "name": "residual_p95",
           "unit": "radii",
-          "value": 11.413118743896485,
-          "points": 95.26839461981082,
+          "value": 10.42705078125,
+          "points": 97.20186121323529,
           "weight": 1.0,
           "good": 9.0,
           "bad": 60.0
@@ -552,7 +552,7 @@
         {
           "name": "detour",
           "unit": "ratio",
-          "value": 1.0128316269557391,
+          "value": 1.014522526051704,
           "points": 100.0,
           "weight": 1.0,
           "good": 1.05,
@@ -570,7 +570,7 @@
         {
           "name": "jitter",
           "unit": "rad/tick",
-          "value": 0.03555030567707665,
+          "value": 0.036107599611252254,
           "points": 100.0,
           "weight": 1.0,
           "good": 0.05,
@@ -579,7 +579,7 @@
         {
           "name": "cohesion",
           "unit": "radii",
-          "value": 0.9733120293674014,
+          "value": 0.9846153559131282,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
@@ -588,7 +588,7 @@
         {
           "name": "cohesion_at_end",
           "unit": "radii",
-          "value": 0.8314657807350159,
+          "value": 0.8461311459541321,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
@@ -597,7 +597,7 @@
         {
           "name": "repaths",
           "unit": "per unit",
-          "value": 3.4,
+          "value": 3.5,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
@@ -606,7 +606,7 @@
         {
           "name": "push_ally",
           "unit": "radii/tick",
-          "value": 0.08144911716740408,
+          "value": 0.08502777686473666,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
@@ -615,8 +615,8 @@
         {
           "name": "overlap_mean",
           "unit": "radii",
-          "value": 0.15554692740033246,
-          "points": 48.15102419988918,
+          "value": 0.16131882983870094,
+          "points": 46.22705672043302,
           "weight": 2.0,
           "good": 0.0,
           "bad": 0.3
@@ -624,8 +624,8 @@
         {
           "name": "overlap_p95",
           "unit": "radii",
-          "value": 0.7158001065254211,
-          "points": 40.34999112288157,
+          "value": 0.7405784726142883,
+          "points": 38.28512728214264,
           "weight": 2.0,
           "good": 0.0,
           "bad": 1.2
@@ -633,8 +633,8 @@
         {
           "name": "overlap_max",
           "unit": "radii",
-          "value": 1.7394012212753296,
-          "points": 14.477709929148356,
+          "value": 1.6622041463851929,
+          "points": 18.766436311933727,
           "weight": 1.0,
           "good": 0.2,
           "bad": 2.0
@@ -642,8 +642,8 @@
         {
           "name": "overlap_frac",
           "unit": "frac",
-          "value": 0.46213333333333334,
-          "points": 56.61754385964913,
+          "value": 0.47791428571428574,
+          "points": 54.95639097744361,
           "weight": 1.0,
           "good": 0.05,
           "bad": 1.0
@@ -1212,5 +1212,5 @@
       ]
     }
   ],
-  "total": 71.07390997824886
+  "total": 72.04196639551
 }

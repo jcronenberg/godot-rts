@@ -11,8 +11,8 @@ use godot::prelude::Vector2;
 
 use crate::abstraction::Abstraction;
 use crate::astar::{
-    AStarScratch, clear_los, clip_ray_to_walls, closest_on_segment, dist_segment_segment,
-    find_path_abstract,
+    AStarScratch, clear_los, clear_los_from, clip_ray_to_walls, closest_on_segment,
+    dist_segment_segment, find_path_abstract,
 };
 use crate::delaunay::{CDT, FNV_OFFSET, FNV_PRIME};
 use crate::navmesh::{DynamicNavmesh, Obstacle, ObstacleId};
@@ -3518,6 +3518,10 @@ struct BlobScratch {
     order: Vec<usize>,
     /// The result: where each member settles, indexed as `members`.
     out: Vec<Vector2>,
+    /// Face-walk buffers for the per-place clearance test.
+    faces: Vec<u32>,
+    visited: Vec<u32>,
+    walls: Vec<u32>,
 }
 
 /// Lateral offset of column `k` in row `j` of the blob's lattice. Odd rows sit
@@ -3525,6 +3529,26 @@ struct BlobScratch {
 fn lattice_lat(j: i32, k: i32, spacing: f32) -> f32 {
     let stagger = if j % 2 == 0 { 0.0 } else { 0.5 };
     (k as f32 + stagger) * spacing
+}
+
+/// Whether a body of radius `r` can actually stand centred on `p`: no wall
+/// within `r` of it.
+///
+/// [`clear_los`] is about the *walk* — it rejects a place the body cannot reach
+/// — and says nothing about the place itself, since a segment ending a hair
+/// inside a wall's clearance crosses only wide portals on the way. A place that
+/// close is one [`Sim::wall_clamp`] holds the body `r` off of forever: it never
+/// closes the last stretch, so it never parks, and the arrival zone suppresses
+/// the stall detector that would otherwise repath it. Dropping the place here
+/// is the only point that sees the problem.
+fn stands_clear(cdt: &CDT, p: Vector2, r: f32, s: &mut BlobScratch) -> bool {
+    s.walls.clear();
+    s.visited.clear();
+    Sim::gather_nearby_walls(cdt, p, r, &mut s.faces, &mut s.visited, &mut s.walls);
+    // The walk seeds `visited` with the face holding `p`, so an empty one means
+    // `p` is off the mesh — where "no wall within `r`" reports nothing because
+    // nothing was searched, not because the place is clear.
+    !s.visited.is_empty() && s.walls.is_empty()
 }
 
 /// Hands every member of a flock the place it will settle in: a hex-packed
@@ -3577,26 +3601,32 @@ fn assign_blob(
     // whole key is an integer tuple: a total order, and the same layout every
     // run without paying for a comparator or a stable sort.
     s.cand.sort_unstable();
-    // Keep the nearest `n` the body can actually walk to from the goal, which
-    // grows a blob against a wall lopsided *away* from it — where the room is
-    // — instead of stranding units against it.
+    // Keep the nearest `n` the body can both walk to from the goal and stand
+    // on once there, which grows a blob against a wall lopsided *away* from it
+    // — where the room is — instead of stranding units against it. The two
+    // tests are separate and both needed: see [`stands_clear`].
     //
     // Both ends of the walk sit a hair off the ray: it counts only *strict*
     // crossings, so an end exactly on a mesh edge — which a goal on round
     // coordinates often is, and one against a wall always is — finds no exit
     // and calls everything past that edge unreachable. The tail end goes back
     // down the approach, clear ground by construction; the head end just past
-    // the place, which also drops places squeezed hard against a wall.
+    // the place.
     s.places.clear();
-    for idx in 0..s.cand.len() {
-        if s.places.len() == n {
-            break;
-        }
-        let (_, j, k) = s.cand[idx];
-        let p = goal + approach * (j as f32 * row_step) + lateral * lattice_lat(j, k, spacing);
-        let to = p + norm(p - from) * nudge;
-        if clear_los(cdt, from, to, r) {
-            s.places.push((j, k, p));
+    // Every candidate is tested out of the same `from`, so locate it once. An
+    // off-mesh `from` leaves no places and the whole flock falls back to `goal`,
+    // which is what a failing LoS on every candidate did anyway.
+    if let Some(from_face) = cdt.locate_face(from) {
+        for idx in 0..s.cand.len() {
+            if s.places.len() == n {
+                break;
+            }
+            let (_, j, k) = s.cand[idx];
+            let p = goal + approach * (j as f32 * row_step) + lateral * lattice_lat(j, k, spacing);
+            let to = p + norm(p - from) * nudge;
+            if clear_los_from(cdt, from_face, from, to, r) && stands_clear(cdt, p, r, s) {
+                s.places.push((j, k, p));
+            }
         }
     }
     // Rows from the far side back, each row across: the order they are handed
@@ -4606,6 +4636,61 @@ mod tests {
             dist(c, goal) < core,
             "group centre {} off the goal, outside the blob's core ({core})",
             dist(c, goal)
+        );
+    }
+
+    #[test]
+    fn test_blob_against_a_wall_strands_nobody() {
+        // A goal set hard against a wall puts part of the blob's lattice
+        // inside that wall's clearance. Those places are unreachable — the
+        // clamp holds a body `radius` off the wall, so a unit sent to one
+        // closes to within a hair and then grinds there forever. It never
+        // parks, so it never starts the order queued behind it, and the
+        // arrival zone suppresses the stall detector that would repath it.
+        // `assign_blob` must not hand such a place out in the first place.
+        let mut sim = rooms_sim(2, 1, 7);
+        let wall_goal = v(150.0, 8.0); // 8 out from the y = 0 wall; radius is 5
+        let back = v(50.0, 50.0);
+        let mut ids = Vec::new();
+        for i in 0..16 {
+            ids.push(spawn(
+                &mut sim,
+                v(12.0 + 4.0 * (i % 4) as f32, 40.0 + 4.0 * (i / 4) as f32),
+                5.0,
+                30.0,
+            ));
+        }
+        sim.step(&[Command::Move {
+            units: ids.clone(),
+            goal: wall_goal,
+        }]);
+        sim.step(&[Command::Queue {
+            units: ids.clone(),
+            order: Order::Move { goal: back },
+        }]);
+        step_n(&mut sim, 900);
+
+        for &id in &ids {
+            let u = unit(&sim, id);
+            assert!(
+                u.parked && !u.is_moving() && u.orders.is_empty(),
+                "unit {id:?} never finished its queue: parked={} moving={} queued={} \
+                 at {:?}, {:.2} from the wall",
+                u.parked,
+                u.is_moving(),
+                u.orders.len(),
+                u.pos,
+                u.pos.y,
+            );
+        }
+        // And it got there by finishing both legs, not by stalling on the first.
+        let centre = ids
+            .iter()
+            .fold(Vector2::ZERO, |a, &id| a + unit(&sim, id).pos)
+            * (1.0 / ids.len() as f32);
+        assert!(
+            dist(centre, back) < blob_radius(ids.len(), 5.0),
+            "group settled at {centre:?}, not on its final goal {back:?}"
         );
     }
 

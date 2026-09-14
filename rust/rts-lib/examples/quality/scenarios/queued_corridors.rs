@@ -10,13 +10,13 @@
 //! first and loses the second; one that waits for every straggler at every
 //! waypoint does the reverse.
 //!
-//! What it catches as it stands: one unit of sixty is given a place in the
-//! first waypoint's blob that lies inside the wall's clearance, wedges against
-//! that wall trying to reach it, and so never parks and never starts the legs
-//! queued behind it. That one body costs over five of the scenario's points on
-//! `stranded` and `arrival` alone, before what it drags out of the `residual`
-//! and `spread` means. `stall_trips` never sees it at all, which is the more
-//! interesting half: nothing in the sim notices, so nothing repaths it.
+//! What it caught when it was written: one unit of sixty was given a place in
+//! the first waypoint's blob that lay inside the wall's clearance, wedged
+//! against that wall trying to reach it, and so never parked and never started
+//! the legs queued behind it — `stall_trips` never saw it, because a unit
+//! inside its arrival zone is held to be crowded rather than stuck. `assign_blob`
+//! now drops a place a body cannot stand on, so `stranded` holds at zero; a
+//! regression there is a blob laid out over ground its units cannot occupy.
 
 use godot::prelude::Vector2;
 use rts_lib::sim::{Command, Order, Sim};
