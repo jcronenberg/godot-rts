@@ -4,16 +4,16 @@ extends Node2D
 ##
 ##     cd rust && cargo run --release --example quality -- --trace door_funnel_200
 ##
-## which writes `rust/target/quality/trace_<scenario>.json`. Set [member
-## trace_path] to it and run the scene. The sim is deterministic, so this is
-## the exact run that produced the score, not a re-enactment.
+## which writes `rust/target/quality/trace_<scenario>.json`. Pick it from the
+## dropdown, which rescans [constant TRACE_DIR] each time it opens. The sim is
+## deterministic, so this is the exact run that produced the score, not a
+## re-enactment.
 ##
 ## Space plays/pauses, left/right step a tick (held: scrub), up/down change
 ## speed, Home rewinds, P toggles paths.
 ##
 ## Traces are one JSON object per tick per unit, scaling with `units * ticks`:
-## `solo_march` loads instantly, `door_funnel_200` is 67 MB. The default is a
-## small one on purpose.
+## `solo_march` loads instantly, `door_funnel_200` is 67 MB.
 
 ## Per-team unit color, indexed by team id (wraps via modulo). Matches
 ## `sim_test.gd` so a trace looks like the live view.
@@ -38,13 +38,15 @@ const FLAG_COLORS := {
 ## `_flag_color` result for a unit with nothing worth ringing.
 const NO_FLAG := Color(0, 0, 0, 0)
 
-@export_file("*.json") var trace_path: String = "res://rust/target/quality/trace_solo_march.json"
+const TRACE_DIR := "res://rust/target/quality"
+
 ## Trace ticks replayed per second at speed 1. The harness runs the sim at 30 Hz.
 @export var tick_rate: float = 30.0
 @export var show_paths: bool = true
 
 @onready var _camera: RtsCamera = $Camera2D
 
+var _trace_path: String = ""
 var _scenario: String = ""
 ## `[{tick, segments}]`, each the complete wall set from that tick on. More
 ## than one entry means the scenario added or removed an obstacle mid-run.
@@ -54,19 +56,57 @@ var _cursor: float = 0.0
 var _playing: bool = true
 var _speed: float = 1.0
 var _label: Label
+var _picker: OptionButton
 
 
 func _ready() -> void:
+	var box := VBoxContainer.new()
+	box.position = Vector2(8, 8)
+	_picker = OptionButton.new()
+	# Mouse only: with focus it would eat the space and arrow keys.
+	_picker.focus_mode = Control.FOCUS_NONE
+	_picker.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	_picker.get_popup().about_to_popup.connect(_scan_traces)
+	_picker.item_selected.connect(func(i: int) -> void: _load(_picker.get_item_metadata(i)))
+	box.add_child(_picker)
 	_label = Label.new()
-	_label.position = Vector2(8, 8)
 	_label.add_theme_color_override("font_color", Color.WHITE)
+	box.add_child(_label)
 	var ui := CanvasLayer.new()
-	ui.add_child(_label)
+	ui.add_child(box)
 	add_child(ui)
-	_load(trace_path)
+	_scan_traces()
+
+
+func _scan_traces() -> void:
+	var files := Array(DirAccess.get_files_at(TRACE_DIR)).filter(
+		func(f: String) -> bool: return f.begins_with("trace_") and f.ends_with(".json")
+	)
+	files.sort()
+	_picker.clear()
+	for f: String in files:
+		_picker.add_item(f.trim_prefix("trace_").trim_suffix(".json"))
+		_picker.set_item_metadata(_picker.item_count - 1, TRACE_DIR.path_join(f))
+	_select_current()
+
+
+func _select_current() -> void:
+	_picker.select(-1)
+	_picker.text = "select a trace"
+	for i in _picker.item_count:
+		if _picker.get_item_metadata(i) == _trace_path:
+			_picker.select(i)
 
 
 func _load(path: String) -> void:
+	# Clear first so a failed load shows the empty label, not the old trace.
+	_trace_path = path
+	_scenario = ""
+	_wall_events = []
+	_ticks = []
+	_cursor = 0.0
+	_playing = true
+	_select_current()
 	var text := FileAccess.get_file_as_string(path)
 	if text.is_empty():
 		push_error("quality_replay: cannot read %s (run the harness with --trace first)" % path)
@@ -84,7 +124,6 @@ func _load(path: String) -> void:
 		_ticks = []
 		push_error("quality_replay: %s has no wall_events (regenerate it with --trace)" % path)
 		return
-	_cursor = 0.0
 	_frame_camera()
 
 
@@ -148,7 +187,12 @@ func _seek(ticks: float) -> void:
 
 func _update_label() -> void:
 	if _ticks.is_empty():
-		_label.text = "no trace loaded; see %s" % trace_path
+		if not _trace_path.is_empty():
+			_label.text = "could not load %s" % _trace_path
+		elif _picker.item_count == 0:
+			_label.text = "no traces in %s; run the harness with --trace" % TRACE_DIR
+		else:
+			_label.text = ""
 		return
 	var frame: Dictionary = _ticks[int(_cursor)]
 	_label.text = "%s   tick %d  (%d/%d)   x%.2f %s\nspace play/pause · ←/→ step · ↑/↓ speed · home rewind · p paths" % [

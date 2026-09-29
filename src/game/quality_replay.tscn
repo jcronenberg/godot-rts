@@ -5,7 +5,6 @@
 
 [node name="QualityReplay" type="Node2D" unique_id=1269457373]
 script = ExtResource("1_qrepl")
-trace_path = "res://rust/target/quality/trace_obstacle_drop.json"
 
 [node name="Camera2D" type="Camera2D" parent="." unique_id=76378743]
 script = ExtResource("2_rtscam")
