@@ -108,11 +108,11 @@ pub static STALL_PROGRESS_EPS: TunableF32 = TunableF32::new(0.1);
 /// and chases to the end of the map; an attack-mover has a march goal that
 /// already bounds it.
 pub static LEASH_RADII: TunableF32 = TunableF32::new(12.0);
-/// Multiple of a unit's own `attack_range` used as its attack-move
-/// acquisition radius — how far it "notices" an enemy before being in
-/// weapon range, so it starts closing the distance rather than only
-/// reacting once already adjacent.
-pub static ACQUISITION_RANGE_MULT: TunableF32 = TunableF32::new(3.0);
+/// How far beyond its weapon's reach a unit notices an enemy when it picks
+/// its own targets (attack-moving or idle); see [`Unit::acquisition_range`].
+/// A fixed distance rather than a multiple of reach, which gave melee about a
+/// body width and let an attack-moving army walk past a fight next to it.
+pub static ACQUISITION_MARGIN: TunableF32 = TunableF32::new(50.0);
 /// Distance a chased target may drift from the anchor its current chase path
 /// was built toward before that path is rebuilt — chase-repath hysteresis,
 /// distance half (see [`CHASE_REPATH_TICKS`] for the time half).
@@ -263,7 +263,7 @@ pub fn set_tuning(name: &str, value: f32) -> bool {
         "straight_fan_frac" => STRAIGHT_FAN_FRAC.set(value),
         "stall_repath_ticks" => STALL_REPATH_TICKS.set(value.round().clamp(0.0, 255.0) as u8),
         "stall_progress_eps" => STALL_PROGRESS_EPS.set(value),
-        "acquisition_range_mult" => ACQUISITION_RANGE_MULT.set(value),
+        "acquisition_margin" => ACQUISITION_MARGIN.set(value),
         "leash_radii" => LEASH_RADII.set(value),
         "chase_repath_dist" => CHASE_REPATH_DIST.set(value),
         "chase_repath_ticks" => CHASE_REPATH_TICKS.set(value.round().clamp(0.0, 255.0) as u8),
@@ -303,7 +303,7 @@ pub fn get_tuning(name: &str) -> Option<f32> {
         "straight_fan_frac" => STRAIGHT_FAN_FRAC.get(),
         "stall_repath_ticks" => STALL_REPATH_TICKS.get() as f32,
         "stall_progress_eps" => STALL_PROGRESS_EPS.get(),
-        "acquisition_range_mult" => ACQUISITION_RANGE_MULT.get(),
+        "acquisition_margin" => ACQUISITION_MARGIN.get(),
         "leash_radii" => LEASH_RADII.get(),
         "chase_repath_dist" => CHASE_REPATH_DIST.get(),
         "chase_repath_ticks" => CHASE_REPATH_TICKS.get() as f32,
@@ -518,6 +518,12 @@ pub struct Unit {
 impl Unit {
     pub fn is_moving(&self) -> bool {
         !self.path.is_empty()
+    }
+
+    /// Surface distance at which this unit notices an enemy: its reach plus
+    /// [`ACQUISITION_MARGIN`].
+    pub fn acquisition_range(&self) -> f32 {
+        self.attack_range + ACQUISITION_MARGIN.get()
     }
 
     /// Next waypoint while moving, own position when idle.
@@ -2308,7 +2314,7 @@ impl Sim {
             {
                 continue;
             }
-            let acq_range = unit.attack_range * ACQUISITION_RANGE_MULT.get();
+            let acq_range = unit.acquisition_range();
             let (team, radius, pos) = (unit.team, unit.radius, unit.pos);
             let (cx, cy) = self.grid.cell_coords(s.positions[i]);
             // Clamp to the grid's extent: scanning further is a no-op, and it
@@ -2418,7 +2424,6 @@ impl Sim {
         let give_up_orbit = GIVE_UP_ORBIT.get();
         let chase_repath_dist = CHASE_REPATH_DIST.get();
         let leash_radii = LEASH_RADII.get();
-        let acq_mult = ACQUISITION_RANGE_MULT.get();
         for i in 0..s.ids.len() {
             let id = s.ids[i];
             let Some(unit) = self.units.get(id) else {
@@ -2435,7 +2440,7 @@ impl Sim {
             // thing a retreating target can otherwise do is tow a defender off
             // the map, since the return only triggers on a kill.
             if let Some(post) = unit.post {
-                let leash = (leash_radii * unit.radius).max(acq_mult * unit.attack_range);
+                let leash = (leash_radii * unit.radius).max(unit.acquisition_range());
                 if (unit.pos - post).length_squared() > leash * leash {
                     s.leash_home.push((id, post));
                     continue;
@@ -6142,7 +6147,7 @@ mod tests {
         let mut sim = arena_sim(600.0, 600.0, 59);
         let guard = spawn_stats(&mut sim, v(300.0, 300.0), 5.0, 30.0, 0, 1.0e6, 20.0, 5.0, 5);
         let post = unit(&sim, guard).pos;
-        // Inside acquisition range (3 × reach) but well outside weapon range,
+        // Inside acquisition range but well outside weapon range,
         // so the guard has to leave its post to reach it.
         let enemy = spawn_stats(&mut sim, v(322.0, 300.0), 5.0, 0.0, 1, 100.0, 0.0, 0.0, 1);
         let mut furthest = 0.0f32;
@@ -7182,15 +7187,18 @@ mod tests {
         let drift = |with_enemy: bool| -> f32 {
             let mut sim = arena_sim(1200.0, 400.0, 17);
             let start = v(150.0, 185.0);
-            if with_enemy {
-                // Dead ahead of the straggler and inside its acquisition
-                // radius (3 × reach), so it acquires on the first tick and
-                // chases along its own march heading.
-                spawn_stats(&mut sim, v(450.0, 185.0), 5.0, 0.0, 1, 1.0e9, 0.0, 0.0, 1);
-            }
-            // Reach 100 ⇒ acquisition 300; the mates carry no weapon at all,
-            // so only the straggler ever engages.
-            let straggler = spawn_stats(&mut sim, start, 5.0, 30.0, 0, 1.0e6, 0.0, 100.0, 1);
+            // Dead ahead of the straggler and just inside its acquisition
+            // range, so it acquires on the first tick. It flees along the
+            // straggler's own march heading, a little slower, so the chase
+            // lasts the whole run.
+            let enemy = with_enemy.then(|| {
+                let ahead = 10.0 + 0.9 * (2.0 + ACQUISITION_MARGIN.get());
+                let at = v(start.x + ahead, start.y);
+                spawn_stats(&mut sim, at, 5.0, 25.0, 1, 1.0e9, 0.0, 0.0, 1)
+            });
+            // Melee reach; the mates carry no weapon at all, so only the
+            // straggler ever engages.
+            let straggler = spawn_stats(&mut sim, start, 5.0, 30.0, 0, 1.0e6, 0.0, 2.0, 1);
             let mut ids = vec![straggler];
             for i in 0..3 {
                 ids.push(spawn(
@@ -7200,10 +7208,17 @@ mod tests {
                     30.0,
                 ));
             }
-            sim.step(&[Command::AttackMove {
+            let mut orders = vec![Command::AttackMove {
                 units: ids,
                 goal: v(1000.0, 200.0),
-            }]);
+            }];
+            if let Some(enemy) = enemy {
+                orders.push(Command::Move {
+                    units: vec![enemy],
+                    goal: v(1150.0, 185.0),
+                });
+            }
+            sim.step(&orders);
             assert_eq!(
                 unit(&sim, straggler).target.is_some(),
                 with_enemy,
@@ -7226,6 +7241,12 @@ mod tests {
     #[test]
     fn test_acquisition_spreads_across_targets() {
         let mut sim = arena_sim(600.0, 600.0, 23);
+        // Every attacker starts within acquisition range of every enemy, so
+        // they all choose on the same tick. Ranks arriving one after another
+        // only ever see the nearest enemy at the moment they acquire, and the
+        // penalty has nothing to spread them across.
+        let reach = 40.0;
+        let rear = 370.0 - 10.0 - 0.9 * (reach + ACQUISITION_MARGIN.get());
         let enemies: Vec<UnitId> = (0..3)
             .map(|i| {
                 spawn_stats(
@@ -7245,13 +7266,13 @@ mod tests {
             .map(|i| {
                 spawn_stats(
                     &mut sim,
-                    v(250.0 - (i / 3) as f32 * 12.0, 276.0 + (i % 3) as f32 * 12.0),
+                    v(rear + (i / 3) as f32 * 12.0, 276.0 + (i % 3) as f32 * 12.0),
                     5.0,
                     30.0,
                     0,
                     1.0e6,
                     1.0,
-                    40.0,
+                    reach,
                     1,
                 )
             })

@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use godot::prelude::Vector2;
 
-use crate::sim::{ACQUISITION_RANGE_MULT, Command, DT, Order, Sim, UnitId};
+use crate::sim::{Command, DT, Order, Sim, UnitId};
 
 /// Per-tick view state. Cheap parallel arrays; the view lerps two of these.
 #[derive(Default)]
@@ -120,7 +120,7 @@ impl Snapshot {
             }
             if let Some(radii) = &mut snap.debug_acquisition_radii {
                 let r = if u.attack_move_goal.is_some() {
-                    u.attack_range * ACQUISITION_RANGE_MULT.get()
+                    u.acquisition_range()
                 } else {
                     0.0
                 };

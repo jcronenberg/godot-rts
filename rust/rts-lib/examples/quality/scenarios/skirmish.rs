@@ -13,11 +13,11 @@
 //! swap that. A fair sim therefore draws, and `outcome_gap` is how far from a
 //! draw it lands. Variants also shift both armies, mirrored.
 //!
-//! What it showed when it was written: a unit only notices an enemy within
-//! `ACQUISITION_RANGE_MULT` weapon reaches, which for melee is about a body
-//! width, so one in seven unit-ticks next to the fight has no target and the
-//! odd fight breaks up unfinished (`bystanders`, `resolve`). And the rear
-//! ranks crush into their own front line while the enemy holds it: the
+//! What it showed when it was written: units noticed enemies only within
+//! three weapon reaches, about a body width for melee, so one in seven
+//! unit-ticks next to the fight had no target and the odd fight broke up
+//! unfinished. `ACQUISITION_MARGIN` replaced that. It also shows the rear
+//! ranks crushing into their own front line while the enemy holds it: the
 //! overlap rows are almost entirely allied pairs.
 
 use std::collections::BTreeMap;
