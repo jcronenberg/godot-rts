@@ -14,6 +14,7 @@ use crate::metrics::{Cfg, Route, Run, unit_ids, wall_segments};
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "door_funnel_200",
+    variants: super::VARIANTS,
     run,
 };
 
@@ -39,7 +40,8 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         },
     );
     run.sim.step(&super::spawn_block(
-        v(30.0, 30.0),
+        ctx,
+        v(30.0, 30.0) + ctx.offset(1, Vector2::splat(10.0)),
         10,
         13.0,
         UNITS,

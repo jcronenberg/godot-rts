@@ -29,6 +29,8 @@ use crate::metrics::{Cfg, PathProbe, Query, Route, Run, build_cdt, unit_ids, wal
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "impassable_gap_40",
+    // What it scores is path-level; its crowd rows already sit at the cap.
+    variants: 1,
     run,
 };
 

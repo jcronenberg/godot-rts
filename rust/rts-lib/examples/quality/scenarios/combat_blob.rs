@@ -31,6 +31,7 @@ use crate::metrics::{Cfg, Route, Run, unit_ids};
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "combat_blob",
+    variants: super::VARIANTS,
     run,
 };
 
@@ -51,10 +52,12 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
     let (points, constraints) = box_map(400.0, 400.0);
 
     let mut run = Run::new(Sim::new(points, &constraints, 0xB1_0B), Cfg::default());
+    // The defender shifted a little, so the block meets it off-centre.
+    let defender_at = DEFENDER + ctx.offset(1, Vector2::splat(8.0));
     // Defender first (slot 0), then the attacker block. Both sides carry
     // effectively infinite health, so the fight never decays into an idle.
     let mut spawns = vec![Command::Spawn {
-        pos: DEFENDER,
+        pos: defender_at,
         radius: RADIUS,
         max_speed: SPEED,
         team: 1,
@@ -63,18 +66,21 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         attack_range: 0.0,
         attack_cooldown_ticks: 1,
     }];
-    spawns.extend((0..ATTACKERS).map(|k| Command::Spawn {
-        pos: v(
+    spawns.extend((0..ATTACKERS).map(|k| {
+        let at = v(
             BLOCK.x + PITCH * (k % 8) as f32,
             BLOCK.y + PITCH * (k / 8) as f32,
-        ),
-        radius: RADIUS,
-        max_speed: SPEED,
-        team: 0,
-        max_health: f32::MAX,
-        damage: 5.0,
-        attack_range: 2.0,
-        attack_cooldown_ticks: 10,
+        );
+        Command::Spawn {
+            pos: at + super::cell_jitter(ctx, at, PITCH, RADIUS),
+            radius: RADIUS,
+            max_speed: SPEED,
+            team: 0,
+            max_health: f32::MAX,
+            damage: 5.0,
+            attack_range: 2.0,
+            attack_cooldown_ticks: 10,
+        }
     }));
     run.sim.step(&spawns);
 
@@ -121,7 +127,7 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         .sim
         .units()
         .get(defender)
-        .map_or(f64::INFINITY, |u| (u.pos - DEFENDER).length() as f64);
+        .map_or(f64::INFINITY, |u| (u.pos - defender_at).length() as f64);
 
     //                          name              unit         good    bad  weight
     vec![

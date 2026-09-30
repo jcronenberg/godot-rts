@@ -5,9 +5,11 @@
 //! quantities are counts feeding a score, so one already at zero keeps being
 //! watched while the behaviour around it moves.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use godot::prelude::Vector2;
 use serde::{Deserialize, Serialize};
 
 /// One scored quantity: what it is, and the two values that pin its scale.
@@ -88,10 +90,48 @@ pub struct Ctx {
     pub out_dir: PathBuf,
     /// Whether this scenario should dump a per-tick trace.
     pub trace: bool,
+    /// Which perturbation of the fixture to run. Variant 0 is the fixture
+    /// exactly as written, so its trace and numbers match a single-run card.
+    pub variant: u32,
+}
+
+impl Ctx {
+    /// A deterministic offset within `±extent` for this variant, keyed by
+    /// `salt` so separate things perturb independently. Zero on variant 0.
+    pub fn offset(&self, salt: u64, extent: Vector2) -> Vector2 {
+        if self.variant == 0 {
+            return Vector2::ZERO;
+        }
+        let hx = splitmix(salt ^ splitmix(self.variant as u64));
+        let hy = splitmix(hx);
+        let unit = |h: u64| (h >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0;
+        Vector2::new(unit(hx) * extent.x, unit(hy) * extent.y)
+    }
+
+    /// A deterministic pick in `0..n` for this variant, keyed by `salt`.
+    /// Zero on variant 0.
+    pub fn pick(&self, salt: u64, n: u64) -> u64 {
+        if self.variant == 0 {
+            return 0;
+        }
+        splitmix(salt ^ splitmix(self.variant as u64)) % n
+    }
+}
+
+fn splitmix(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 pub struct ScenarioSpec {
     pub name: &'static str,
+    /// How many perturbed copies of the fixture to score. The card reports
+    /// their mean and their worst, since one run of a chaotic crowd moves by
+    /// ten points on changes that do nothing. 1 for anything deterministic
+    /// in its geometry alone, like the path-level probes.
+    pub variants: u32,
     pub run: fn(&Ctx) -> Vec<Reading>,
 }
 
@@ -109,6 +149,9 @@ pub struct MetricResult {
     pub weight: f64,
     pub good: f64,
     pub bad: f64,
+    /// The value from the variant this metric scored lowest on.
+    #[serde(default)]
+    pub worst: Option<f64>,
 }
 
 impl MetricResult {
@@ -120,41 +163,112 @@ impl MetricResult {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ScenarioResult {
     pub name: String,
+    /// Mean over [`Self::variant_scores`].
     pub score: f64,
+    /// One score per variant, in variant order. Empty on cards written before
+    /// variants existed, which read as one variant.
+    #[serde(default)]
+    pub variant_scores: Vec<f64>,
+    /// `value` and `points` are means over the variants.
     pub metrics: Vec<MetricResult>,
 }
 
 impl ScenarioResult {
     pub fn new(name: &str, readings: Vec<Reading>) -> ScenarioResult {
-        let metrics: Vec<MetricResult> = readings
-            .into_iter()
-            .map(|r| MetricResult {
-                name: r.metric.name.to_string(),
-                unit: r.metric.unit.to_string(),
-                value: r.value,
-                points: r.metric.points(r.value),
-                weight: r.metric.weight,
-                good: r.metric.good,
-                bad: r.metric.bad,
+        ScenarioResult::from_variants(name, vec![readings])
+    }
+
+    /// Aggregate one reading set per variant. Points are averaged rather than
+    /// taken at the mean value, so the score is exactly the mean of the
+    /// variant scores and a single bad variant cannot hide inside a clamp.
+    pub fn from_variants(name: &str, runs: Vec<Vec<Reading>>) -> ScenarioResult {
+        let first = &runs[0];
+        for r in &runs[1..] {
+            assert!(
+                r.len() == first.len()
+                    && r.iter()
+                        .zip(first)
+                        .all(|(a, b)| a.metric.name == b.metric.name),
+                "{name}: every variant must report the same metrics"
+            );
+        }
+        let n = runs.len() as f64;
+        let metrics: Vec<MetricResult> = first
+            .iter()
+            .enumerate()
+            .map(|(i, r0)| {
+                let m = r0.metric;
+                let values: Vec<f64> = runs.iter().map(|r| r[i].value).collect();
+                let worst = values.iter().copied().min_by(|&a, &b| worse(&m, a, b));
+                MetricResult {
+                    name: m.name.to_string(),
+                    unit: m.unit.to_string(),
+                    value: values.iter().sum::<f64>() / n,
+                    points: values.iter().map(|&v| m.points(v)).sum::<f64>() / n,
+                    weight: m.weight,
+                    good: m.good,
+                    bad: m.bad,
+                    worst,
+                }
             })
             .collect();
-        // Weighted mean over the scored metrics; weight-0 ones are diagnostics.
-        let wsum: f64 = metrics.iter().map(|m| m.weight).sum();
-        let score = if wsum > 0.0 {
-            metrics.iter().map(|m| m.points * m.weight).sum::<f64>() / wsum
-        } else {
-            0.0
-        };
+        let variant_scores = runs
+            .iter()
+            .map(|r| {
+                weighted_score(
+                    r.iter()
+                        .map(|r| (r.metric.points(r.value), r.metric.weight)),
+                )
+            })
+            .collect();
+        let score = weighted_score(metrics.iter().map(|m| (m.points, m.weight)));
         ScenarioResult {
             name: name.to_string(),
             score,
+            variant_scores,
             metrics,
         }
+    }
+
+    pub fn variants(&self) -> usize {
+        self.variant_scores.len().max(1)
+    }
+
+    /// `(variant, score)` of the lowest-scoring variant.
+    pub fn worst(&self) -> (usize, f64) {
+        self.variant_scores
+            .iter()
+            .copied()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap_or((0, self.score))
     }
 
     fn metric(&self, name: &str) -> Option<&MetricResult> {
         self.metrics.iter().find(|m| m.name == name)
     }
+}
+
+/// Weighted mean over the scored metrics; weight-0 ones are diagnostics.
+fn weighted_score(points_weights: impl Iterator<Item = (f64, f64)>) -> f64 {
+    let (sum, wsum) = points_weights.fold((0.0, 0.0), |(s, ws), (p, w)| (s + p * w, ws + w));
+    if wsum > 0.0 { sum / wsum } else { 0.0 }
+}
+
+/// `Less` when `a` is the worse reading: fewer points, then (for ties, such as
+/// two values both past an anchor, or an unscored diagnostic) further from
+/// `good`.
+fn worse(m: &Metric, a: f64, b: f64) -> Ordering {
+    let dist = |v: f64| {
+        if v.is_nan() {
+            f64::INFINITY
+        } else {
+            (v - m.good).abs()
+        }
+    };
+    m.points(a)
+        .total_cmp(&m.points(b))
+        .then(dist(b).total_cmp(&dist(a)))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -209,6 +323,7 @@ fn anchor_digest(scenarios: &[ScenarioResult]) -> String {
     };
     for s in scenarios {
         mix(s.name.as_bytes());
+        mix(&(s.variants() as u64).to_le_bytes());
         for m in &s.metrics {
             mix(m.name.as_bytes());
             mix(&m.good.to_le_bytes());
@@ -277,30 +392,52 @@ fn fmt_delta(d: f64) -> String {
 pub fn render(card: &Scorecard, base: Option<&Scorecard>) -> String {
     let mut out = String::new();
     let mut mismatched: Vec<String> = Vec::new();
+    let mut revaried: Vec<String> = Vec::new();
 
     out.push_str(&format!(
-        "{:<w$} {:>9} {:>6} {:>5}  {:>9} {:>7}\n",
+        "{:<w$} {:>9} {:>6} {:>9} {:>5}  {:>9} {:>7}\n",
         "scenario / metric",
         "value",
         "pts",
+        "worst",
         "w",
         "Δ value",
         "Δ pts",
         w = NAME_W
     ));
-    out.push_str(&format!("{}\n", "─".repeat(NAME_W + 40)));
+    out.push_str(&format!("{}\n", "─".repeat(NAME_W + 50)));
 
     for s in &card.scenarios {
         let b = base.and_then(|b| b.scenario(&s.name));
-        let dscore = b.map(|b| s.score - b.score);
+        let varied = s.variants() > 1;
+        // Different variant sets average different runs: nothing to diff.
+        let variants_moved = b.is_some_and(|b| b.variants() != s.variants());
+        if variants_moved {
+            revaried.push(s.name.clone());
+        }
+        let dscore = match b {
+            Some(_) if variants_moved => "!".into(),
+            Some(b) => fmt_delta(s.score - b.score),
+            None => String::new(),
+        };
+        let (label, worst) = if varied {
+            let (v, score) = s.worst();
+            (
+                format!("{} ×{}", s.name, s.variants()),
+                format!("{score:.1} v{v}"),
+            )
+        } else {
+            (s.name.clone(), String::new())
+        };
         out.push_str(&format!(
-            "{:<w$} {:>9} {:>6.1} {:>5}  {:>9} {:>7}\n",
-            s.name,
+            "{:<w$} {:>9} {:>6.1} {:>9} {:>5}  {:>9} {:>7}\n",
+            label,
             "",
             s.score,
+            worst,
             "",
             "",
-            dscore.map(fmt_delta).unwrap_or_default(),
+            dscore,
             w = NAME_W
         ));
         for m in &s.metrics {
@@ -310,7 +447,7 @@ pub fn render(card: &Scorecard, base: Option<&Scorecard>) -> String {
                 mismatched.push(format!("{}/{}", s.name, m.name));
             }
             let (dv, dp) = match bm {
-                Some(bm) if !anchors_moved => (
+                Some(bm) if !anchors_moved && !variants_moved => (
                     fmt_delta(m.value - bm.value),
                     fmt_delta(m.points - bm.points),
                 ),
@@ -330,11 +467,16 @@ pub fn render(card: &Scorecard, base: Option<&Scorecard>) -> String {
             } else {
                 format!("{:.0}", m.points)
             };
+            let worst = match m.worst {
+                Some(w) if varied => fmt_val(w),
+                _ => String::new(),
+            };
             out.push_str(&format!(
-                "{:<w$} {:>9} {:>6} {:>5.1}  {:>9} {:>7}\n",
+                "{:<w$} {:>9} {:>6} {:>9} {:>5.1}  {:>9} {:>7}\n",
                 label,
                 fmt_val(m.value),
                 pts,
+                worst,
                 m.weight,
                 dv,
                 dp,
@@ -343,19 +485,23 @@ pub fn render(card: &Scorecard, base: Option<&Scorecard>) -> String {
         }
     }
 
-    out.push_str(&format!("{}\n", "─".repeat(NAME_W + 40)));
+    out.push_str(&format!("{}\n", "─".repeat(NAME_W + 50)));
     // Same scenario set only: the total is a mean over scenarios, so a
     // `--only` run against a full baseline reports the skips as a regression.
     let same_set = base.is_some_and(|b| {
         b.scenarios.len() == card.scenarios.len()
-            && card.scenarios.iter().all(|s| b.scenario(&s.name).is_some())
+            && card.scenarios.iter().all(|s| {
+                b.scenario(&s.name)
+                    .is_some_and(|bs| bs.variants() == s.variants())
+            })
     });
     let dtotal = base.filter(|_| same_set).map(|b| card.total - b.total);
     out.push_str(&format!(
-        "{:<w$} {:>9} {:>6.1} {:>5}  {:>9} {:>7}\n",
+        "{:<w$} {:>9} {:>6.1} {:>9} {:>5}  {:>9} {:>7}\n",
         "total",
         "",
         card.total,
+        "",
         "",
         "",
         dtotal.map(fmt_delta).unwrap_or_default(),
@@ -390,6 +536,12 @@ pub fn render(card: &Scorecard, base: Option<&Scorecard>) -> String {
                 "\nanchors changed on {} metric(s); those scores are not comparable:\n  {}\n",
                 mismatched.len(),
                 mismatched.join(", ")
+            ));
+        }
+        if !revaried.is_empty() {
+            out.push_str(&format!(
+                "\nvariant count changed on {}; those scores are not comparable\n",
+                revaried.join(", ")
             ));
         }
         let missing: Vec<&str> = b
@@ -622,6 +774,76 @@ mod tests {
         );
         let only_a = card_of("a", 1.0, 1.5);
         assert!(render(&only_a, Some(&base)).contains("not run this time: b"));
+    }
+
+    #[test]
+    fn test_variants_average_points_and_keep_the_worst() {
+        let m = metric("detour", "ratio", 1.0, 2.0, 1.0);
+        let d = metric("push", "radii", 0.0, 0.0, 0.0);
+        let s = ScenarioResult::from_variants(
+            "x",
+            vec![
+                vec![m.at(1.0), d.at(0.2)],
+                vec![m.at(1.5), d.at(0.5)],
+                // Past the bad anchor: points clamp at 0, so the mean of
+                // points (25) is not the points of the mean value (0).
+                vec![m.at(3.0), d.at(0.1)],
+                vec![m.at(1.5), d.at(0.0)],
+            ],
+        );
+        assert_eq!(s.variants(), 4);
+        assert_eq!(s.metrics[0].value, 1.75);
+        assert_eq!(s.metrics[0].points, 50.0);
+        assert_eq!(s.metrics[0].worst, Some(3.0));
+        assert_eq!(s.worst(), (2, 0.0));
+        assert_eq!(s.score, 50.0, "the mean of the variant scores");
+        // Unscored: every variant has the same points, so worst is furthest
+        // from `good`.
+        assert_eq!(s.metrics[1].worst, Some(0.5));
+    }
+
+    #[test]
+    fn test_variant_zero_is_the_unperturbed_fixture() {
+        let ctx = |variant| Ctx {
+            cache_dir: PathBuf::new(),
+            out_dir: PathBuf::new(),
+            trace: false,
+            variant,
+        };
+        let extent = Vector2::new(10.0, 3.0);
+        assert_eq!(ctx(0).offset(7, extent), Vector2::ZERO);
+        assert_eq!(ctx(0).pick(7, 10), 0);
+        let offsets: Vec<Vector2> = (1..20).map(|v| ctx(v).offset(7, extent)).collect();
+        assert!(
+            offsets
+                .iter()
+                .all(|o| o.x.abs() <= 10.0 && o.y.abs() <= 3.0)
+        );
+        assert_eq!(offsets[0], ctx(1).offset(7, extent), "deterministic");
+        assert_ne!(offsets[0], offsets[1], "variants differ");
+        assert_ne!(
+            ctx(1).offset(7, extent),
+            ctx(1).offset(8, extent),
+            "salts differ"
+        );
+    }
+
+    #[test]
+    fn test_render_refuses_to_diff_across_variant_counts() {
+        let single = card_of("s", 1.0, 1.5);
+        let m = metric("m", "ratio", 1.0, 2.0, 1.0);
+        let varied = Scorecard::new(
+            vec![ScenarioResult::from_variants(
+                "s",
+                vec![vec![m.at(1.5)], vec![m.at(1.9)]],
+            )],
+            BTreeMap::new(),
+        );
+        let out = render(&varied, Some(&single));
+        assert!(out.contains("variant count changed on s"), "{out}");
+        assert!(out.contains("s ×2"), "{out}");
+        assert!(!out.contains("+0.200"), "{out}");
+        assert_ne!(varied.anchors, single.anchors);
     }
 
     #[test]

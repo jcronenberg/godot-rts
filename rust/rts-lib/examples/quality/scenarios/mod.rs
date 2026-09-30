@@ -12,7 +12,7 @@ use std::rc::Rc;
 use godot::prelude::Vector2;
 use rts_lib::sim::Command;
 
-use crate::harness::{Reading, ScenarioSpec, metric as m};
+use crate::harness::{Ctx, Reading, ScenarioSpec, metric as m};
 use crate::metrics::{Stats, spawn_cmd};
 use crate::reference;
 
@@ -39,6 +39,11 @@ pub const ALL: &[ScenarioSpec] = &[
     combat_blob::SPEC,
     stutter_step::SPEC,
 ];
+
+/// Variants per crowd scenario. Spawn jitter and small shifts are enough to
+/// send a crowd down a different trajectory, and `combat_blob` needed about
+/// this many before a change that did nothing stopped moving its score.
+pub const VARIANTS: u32 = 12;
 
 /// How much crowding a fixture *forces*, which the overlap zero point scales
 /// to. Eight units on a roomy ring and forty converging on one melee target
@@ -113,9 +118,19 @@ pub fn field(
     ))
 }
 
+/// This variant's nudge for a unit spawned on a `pitch` grid at `at`: under
+/// half the gap between neighbours, so no two ever spawn touching. Keyed by
+/// the position, so two blocks never share a pattern.
+pub fn cell_jitter(ctx: &Ctx, at: Vector2, pitch: f32, radius: f32) -> Vector2 {
+    let salt = ((at.x.to_bits() as u64) << 32) | at.y.to_bits() as u64;
+    ctx.offset(salt, Vector2::splat(0.45 * (pitch - 2.0 * radius)))
+}
+
 /// `count` unarmed units in a `cols`-wide grid at `pitch` spacing, anchored at
-/// `origin`. Deterministic and collision-free as long as `pitch > 2 * radius`.
+/// `origin` and jittered per variant. Collision-free as long as
+/// `pitch > 2 * radius`.
 pub fn spawn_block(
+    ctx: &Ctx,
     origin: Vector2,
     cols: usize,
     pitch: f32,
@@ -129,7 +144,7 @@ pub fn spawn_block(
                 origin.x + (i % cols) as f32 * pitch,
                 origin.y + (i / cols) as f32 * pitch,
             );
-            spawn_cmd(p, radius, speed)
+            spawn_cmd(p + cell_jitter(ctx, p, pitch, radius), radius, speed)
         })
         .collect()
 }

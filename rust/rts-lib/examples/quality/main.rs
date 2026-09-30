@@ -12,8 +12,13 @@
 //! cargo run --release --example quality -- --only door_funnel_200,counterflow_2x60
 //! cargo run --release --example quality -- --trace door_funnel_200
 //! cargo run --release --example quality -- --trace all
+//! cargo run --release --example quality -- --only combat_blob --variant 7 --trace combat_blob
 //! cargo run --release --example quality -- --sweep cohesion_gain=0.02:0.10:0.02
 //! ```
+//!
+//! Crowd scenarios run several perturbed variants each (see
+//! [`harness::ScenarioSpec::variants`]) and report the mean and the worst.
+//! `--variant` runs one of them alone, to trace or debug the worst.
 //!
 //! `--trace` writes `target/quality/trace_<scenario>.json`, played back by the
 //! Godot scene `src/game/quality_replay.tscn`. Walls are timed events from the
@@ -59,6 +64,9 @@ quality: movement quality scorecard
                             (default: target/quality)
   --sweep <name=lo:hi:step> re-run the grid once per tunable value
                             (names are `sim::set_tuning`'s, e.g. cohesion_gain)
+  --variant <n>             run only variant n of each scenario (0 is the
+                            unperturbed fixture); traces that variant, and
+                            skips the baseline diff, which averages them all
   --list                    print the scenario names
   -h, --help                this
 ";
@@ -89,6 +97,7 @@ struct Cli {
     trace: Trace,
     out_dir: PathBuf,
     sweep: Option<Sweep>,
+    variant: Option<u32>,
     list: bool,
 }
 
@@ -134,6 +143,7 @@ impl Cli {
             trace: Trace::None,
             out_dir: root().join("target/quality"),
             sweep: None,
+            variant: None,
             list: false,
         };
         let mut i = 0;
@@ -168,6 +178,13 @@ impl Cli {
                     cli.diff = Some((a, b));
                 }
                 "--sweep" => cli.sweep = Some(parse_sweep(&next(&mut i, "--sweep")?)?),
+                "--variant" => {
+                    let arg = next(&mut i, "--variant")?;
+                    let n = arg
+                        .parse()
+                        .map_err(|_| format!("--variant wants a number, got `{arg}`"))?;
+                    cli.variant = Some(n);
+                }
                 other => return Err(format!("unknown argument `{other}`")),
             }
             i += 1;
@@ -179,10 +196,21 @@ impl Cli {
             .flatten()
             .chain(cli.trace.names())
             .find(|name| !scenarios::ALL.iter().any(|s| s.name == **name));
-        match unknown {
-            Some(name) => Err(format!("unknown scenario `{name}`")),
-            None => Ok(cli),
+        if let Some(name) = unknown {
+            return Err(format!("unknown scenario `{name}`"));
         }
+        if let Some(v) = cli.variant {
+            if cli.bless {
+                return Err("--bless takes every variant; drop --variant".into());
+            }
+            if let Some(s) = cli.selected().into_iter().find(|s| v >= s.variants) {
+                return Err(format!(
+                    "`{}` has {} variant(s), so no variant {v}; narrow with --only",
+                    s.name, s.variants
+                ));
+            }
+        }
+        Ok(cli)
     }
 
     fn selected(&self) -> Vec<&'static harness::ScenarioSpec> {
@@ -219,6 +247,13 @@ impl Cli {
         }
 
         let card = self.run_grid(BTreeMap::new());
+        if self.variant.is_some() {
+            print!("{}", harness::render(&card, None));
+            if let Some(out) = &self.out {
+                write(out, &card);
+            }
+            return;
+        }
         let baseline = root().join("quality_baseline.json");
         let base = harness::read_json(&baseline).ok();
         print!("{}", harness::render(&card, base.as_ref()));
@@ -238,20 +273,44 @@ impl Cli {
     }
 
     fn run_grid(&self, tuning: BTreeMap<String, f64>) -> Scorecard {
-        let results: Vec<ScenarioResult> = self
+        let results = self
             .selected()
-            .iter()
-            .map(|spec| {
-                let ctx = Ctx {
-                    cache_dir: self.out_dir.clone(),
-                    out_dir: self.out_dir.clone(),
-                    trace: self.trace.wants(spec.name),
-                };
-                eprintln!("running {}…", spec.name);
-                ScenarioResult::new(spec.name, (spec.run)(&ctx))
-            })
+            .into_iter()
+            .map(|spec| self.run_scenario(spec))
             .collect();
         Scorecard::new(results, tuning)
+    }
+
+    fn run_scenario(&self, spec: &'static harness::ScenarioSpec) -> ScenarioResult {
+        let traced = self.variant.unwrap_or(0);
+        let ctx = |variant| Ctx {
+            cache_dir: self.out_dir.clone(),
+            out_dir: self.out_dir.clone(),
+            trace: variant == traced && self.trace.wants(spec.name),
+            variant,
+        };
+        if let Some(v) = self.variant {
+            eprintln!("running {} variant {v}…", spec.name);
+            return ScenarioResult::new(spec.name, (spec.run)(&ctx(v)));
+        }
+        eprintln!("running {}…", spec.name);
+        // Variant 0 alone first: it fills the reference-field cache, which is
+        // not safe to write concurrently, and the rest only read it.
+        let mut runs = vec![(spec.run)(&ctx(0))];
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (1..spec.variants)
+                .map(|v| {
+                    let ctx = ctx(v);
+                    scope.spawn(move || (spec.run)(&ctx))
+                })
+                .collect();
+            runs.extend(
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("variant panicked")),
+            );
+        });
+        ScenarioResult::from_variants(spec.name, runs)
     }
 
     /// One column of scores per tunable value. Answers "which constant", not

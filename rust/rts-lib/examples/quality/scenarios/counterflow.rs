@@ -11,6 +11,7 @@ use crate::metrics::{Cfg, Route, Run, unit_ids, wall_segments};
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "counterflow_2x60",
+    variants: super::VARIANTS,
     run,
 };
 
@@ -36,9 +37,19 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
             choke: None,
         },
     );
-    let mut spawns = super::spawn_block(v(40.0, 60.0), 6, 15.0, PER_SIDE, RADIUS, SPEED);
+    let shift = Vector2::splat(10.0);
+    let mut spawns = super::spawn_block(
+        ctx,
+        v(40.0, 60.0) + ctx.offset(1, shift),
+        6,
+        15.0,
+        PER_SIDE,
+        RADIUS,
+        SPEED,
+    );
     spawns.extend(super::spawn_block(
-        v(585.0, 60.0),
+        ctx,
+        v(585.0, 60.0) + ctx.offset(2, shift),
         6,
         15.0,
         PER_SIDE,

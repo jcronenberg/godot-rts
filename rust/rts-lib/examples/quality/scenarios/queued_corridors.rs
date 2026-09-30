@@ -27,6 +27,7 @@ use crate::metrics::{Cfg, Route, Run, unit_ids, wall_segments};
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "queued_corridors_60",
+    variants: super::VARIANTS,
     run,
 };
 
@@ -78,7 +79,10 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
     // Four abreast, all a 60-wide lane takes, and fifteen ranks deep: the
     // crowd starts as a column and has to stay one.
     run.sim.step(&super::spawn_block(
-        v(20.0, 10.0),
+        ctx,
+        // Only a few units of play across the lane, or the column would
+        // start with its outer rank inside a wall's clearance.
+        v(20.0, 10.0) + ctx.offset(1, v(10.0, 3.0)),
         15,
         12.0,
         UNITS,

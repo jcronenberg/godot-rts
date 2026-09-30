@@ -1,13 +1,16 @@
 {
   "format": 1,
-  "git_sha": "a08131c",
+  "git_sha": "b33e537",
   "git_dirty": true,
-  "anchors": "8b31e1128efb7550",
+  "anchors": "5331c73cbb87cffd",
   "tuning": {},
   "scenarios": [
     {
       "name": "solo_march",
       "score": 87.19055174118715,
+      "variant_scores": [
+        87.19055174118715
+      ],
       "metrics": [
         {
           "name": "suboptimality",
@@ -16,7 +19,8 @@
           "points": 62.51274599471943,
           "weight": 2.0,
           "good": 1.02,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 1.3873750892517496
         },
         {
           "name": "min_clearance",
@@ -25,7 +29,8 @@
           "points": 100.0,
           "weight": 1.0,
           "good": 0.6,
-          "bad": 0.2
+          "bad": 0.2,
+          "worst": 0.7071067690849304
         },
         {
           "name": "abstraction_penalty",
@@ -34,7 +39,8 @@
           "points": 100.0,
           "weight": 1.0,
           "good": 1.0,
-          "bad": 1.3
+          "bad": 1.3,
+          "worst": 1.0
         },
         {
           "name": "waypoints",
@@ -43,7 +49,8 @@
           "points": 98.98989898989899,
           "weight": 0.0,
           "good": 2.0,
-          "bad": 200.0
+          "bad": 200.0,
+          "worst": 4.0
         },
         {
           "name": "turn_per_100",
@@ -52,7 +59,8 @@
           "points": 98.61579063522,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 3.0
+          "bad": 3.0,
+          "worst": 0.04152628094340034
         },
         {
           "name": "arrival",
@@ -61,7 +69,8 @@
           "points": 100.0,
           "weight": 2.0,
           "good": 1.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 1.0
         },
         {
           "name": "residual",
@@ -70,7 +79,8 @@
           "points": 100.0,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 20.0
+          "bad": 20.0,
+          "worst": 0.0
         },
         {
           "name": "detour",
@@ -79,7 +89,8 @@
           "points": 64.4986128357497,
           "weight": 2.0,
           "good": 1.05,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 1.387263178060378
         },
         {
           "name": "lateness_p50",
@@ -88,7 +99,8 @@
           "points": 79.45445497449475,
           "weight": 1.0,
           "good": 1.1,
-          "bad": 2.5
+          "bad": 2.5,
+          "worst": 1.3876376303570737
         },
         {
           "name": "stall_trips",
@@ -97,7 +109,8 @@
           "points": 100.0,
           "weight": 1.0,
           "good": 0.0,
-          "bad": 20.0
+          "bad": 20.0,
+          "worst": 0.0
         },
         {
           "name": "jitter",
@@ -106,22 +119,38 @@
           "points": 100.0,
           "weight": 1.0,
           "good": 0.01,
-          "bad": 0.4
+          "bad": 0.4,
+          "worst": 0.000895471138844539
         }
       ]
     },
     {
       "name": "door_funnel_200",
-      "score": 86.60033407211473,
+      "score": 85.60598830020466,
+      "variant_scores": [
+        86.60033407211473,
+        83.59984410770494,
+        86.21994770785982,
+        84.34481698563091,
+        83.99340738259993,
+        86.57380408931564,
+        86.63254468535165,
+        85.6768287712648,
+        85.91212481164037,
+        85.67016776209988,
+        85.90892755138226,
+        86.1391116754911
+      ],
       "metrics": [
         {
           "name": "throughput",
           "unit": "units/s",
-          "value": 34.285712497575034,
-          "points": 94.28570832525011,
+          "value": 32.94234332876769,
+          "points": 89.8078110958923,
           "weight": 3.0,
           "good": 36.0,
-          "bad": 6.0
+          "bad": 6.0,
+          "worst": 29.556648704806065
         },
         {
           "name": "arrival",
@@ -130,70 +159,78 @@
           "points": 100.0,
           "weight": 2.0,
           "good": 1.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 1.0
         },
         {
           "name": "residual",
           "unit": "radii",
-          "value": 10.799234072685254,
-          "points": 98.66794321219125,
+          "value": 10.800762436230988,
+          "points": 98.66539593961501,
           "weight": 2.0,
           "good": 10.0,
-          "bad": 70.0
+          "bad": 70.0,
+          "worst": 10.885261755943311
         },
         {
           "name": "residual_p95",
           "unit": "radii",
-          "value": 16.359580993652344,
-          "points": 98.18722534179688,
+          "value": 16.4831106821696,
+          "points": 98.02251909044054,
           "weight": 1.0,
           "good": 15.0,
-          "bad": 90.0
+          "bad": 90.0,
+          "worst": 16.90387725830078
         },
         {
           "name": "centroid_offset",
           "unit": "radii",
-          "value": 1.3147199153900146,
-          "points": 95.6176002820333,
+          "value": 1.2699103156725566,
+          "points": 95.76696561442482,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 30.0
+          "bad": 30.0,
+          "worst": 1.3764673471450806
         },
         {
           "name": "settle_p95",
           "unit": "frac run",
-          "value": 0.1672,
-          "points": 100.0,
+          "value": 0.19323333333333334,
+          "points": 99.52916666666665,
           "weight": 1.0,
           "good": 0.2,
-          "bad": 1.0
+          "bad": 1.0,
+          "worst": 0.2344
         },
         {
           "name": "lateness_p95",
           "unit": "ratio",
-          "value": 1.2967728438028654,
+          "value": 1.3012907735553287,
           "points": 100.0,
           "weight": 1.0,
           "good": 2.0,
-          "bad": 12.0
+          "bad": 12.0,
+          "worst": 1.2470630612742337
         },
         {
           "name": "detour",
           "unit": "ratio",
-          "value": 1.0259127634933163,
+          "value": 1.0298770125699188,
           "points": 100.0,
           "weight": 1.0,
           "good": 1.05,
-          "bad": 1.8
+          "bad": 1.8,
+          "worst": 1.021073079872236
         },
         {
           "name": "jitter",
           "unit": "rad/tick",
-          "value": 0.05842157749343111,
-          "points": 98.46880409210344,
+          "value": 0.06383786315844307,
+          "points": 97.48402488028309,
           "weight": 2.0,
           "good": 0.05,
-          "bad": 0.6
+          "bad": 0.6,
+          "worst": 0.0709592260875739
         },
         {
           "name": "stall_trips",
@@ -202,76 +239,98 @@
           "points": 100.0,
           "weight": 1.0,
           "good": 0.0,
-          "bad": 20.0
+          "bad": 20.0,
+          "worst": 0.0
         },
         {
           "name": "cohesion",
           "unit": "radii",
-          "value": 0.789968191742897,
+          "value": 0.7902196739792825,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.7946521059274674
         },
         {
           "name": "spread_at_end",
           "unit": "radii",
-          "value": 0.7955247163772583,
+          "value": 0.7960629115502039,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.8023509979248047
         },
         {
           "name": "push_ally",
           "unit": "radii/tick",
-          "value": 0.050772212420546324,
+          "value": 0.05134817355084623,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.052985563411667706
         },
         {
           "name": "overlap_mean",
           "unit": "radii",
-          "value": 0.07591523754980042,
-          "points": 74.69492081673319,
+          "value": 0.07803961657309035,
+          "points": 73.98679447563653,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 0.3
+          "bad": 0.3,
+          "worst": 0.08119764711229875
         },
         {
           "name": "overlap_p95",
           "unit": "radii",
-          "value": 0.6292216181755066,
-          "points": 47.564865152041115,
+          "value": 0.639987031618754,
+          "points": 46.66774736510382,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 1.2
+          "bad": 1.2,
+          "worst": 0.6687244176864624
         },
         {
           "name": "overlap_max",
           "unit": "radii",
-          "value": 1.8574893474578857,
-          "points": 7.917258474561903,
+          "value": 1.8947013517220814,
+          "points": 5.849924904328805,
           "weight": 1.0,
           "good": 0.2,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 1.9873470067977905
         },
         {
           "name": "overlap_frac",
           "unit": "frac",
-          "value": 0.180934,
-          "points": 86.21747368421052,
+          "value": 0.18903400000000004,
+          "points": 85.36484210526316,
           "weight": 1.0,
           "good": 0.05,
-          "bad": 1.0
+          "bad": 1.0,
+          "worst": 0.199368
         }
       ]
     },
     {
       "name": "counterflow_2x60",
-      "score": 87.88058283338368,
+      "score": 88.25340233373987,
+      "variant_scores": [
+        87.88058283338368,
+        88.23563682202692,
+        88.64647721429418,
+        88.1943360040385,
+        88.6664316793453,
+        87.76568946799821,
+        88.30773404287208,
+        88.42733467621946,
+        88.24099216105022,
+        88.21428655665854,
+        88.1341196651272,
+        88.32720688186423
+      ],
       "metrics": [
         {
           "name": "arrival",
@@ -280,70 +339,78 @@
           "points": 100.0,
           "weight": 3.0,
           "good": 1.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 1.0
         },
         {
           "name": "residual",
           "unit": "radii",
-          "value": 6.138146281242371,
-          "points": 98.5659634129385,
+          "value": 6.1494195002979675,
+          "points": 98.54063033640905,
           "weight": 2.0,
           "good": 5.5,
-          "bad": 50.0
+          "bad": 50.0,
+          "worst": 6.272763961156202
         },
         {
           "name": "residual_p95",
           "unit": "radii",
-          "value": 9.486067962646484,
-          "points": 97.60311618927986,
+          "value": 9.887556902567546,
+          "points": 96.95555338295559,
           "weight": 1.0,
           "good": 8.0,
-          "bad": 70.0
+          "bad": 70.0,
+          "worst": 10.219705200195312
         },
         {
           "name": "centroid_offset",
           "unit": "radii",
-          "value": 1.1063512861728668,
-          "points": 93.08530446141958,
+          "value": 1.3795017823576927,
+          "points": 91.37811386026442,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 16.0
+          "bad": 16.0,
+          "worst": 1.5700234770774841
         },
         {
           "name": "settle_p95",
           "unit": "frac run",
-          "value": 0.17166666666666666,
+          "value": 0.17019444444444445,
           "points": 100.0,
           "weight": 1.0,
           "good": 0.2,
-          "bad": 1.0
+          "bad": 1.0,
+          "worst": 0.157
         },
         {
           "name": "lateness_p50",
           "unit": "ratio",
-          "value": 1.0091553456906204,
+          "value": 0.9918940492426672,
           "points": 100.0,
           "weight": 1.0,
           "good": 1.05,
-          "bad": 3.0
+          "bad": 3.0,
+          "worst": 0.9799434552395255
         },
         {
           "name": "lateness_p95",
           "unit": "ratio",
-          "value": 1.1843430735966218,
-          "points": 100.0,
+          "value": 1.1396120871321704,
+          "points": 99.91142751903249,
           "weight": 2.0,
           "good": 1.2,
-          "bad": 6.0
+          "bad": 6.0,
+          "worst": 1.251017749037293
         },
         {
           "name": "detour",
           "unit": "ratio",
-          "value": 1.0155140566417447,
+          "value": 1.0089865580086277,
           "points": 100.0,
           "weight": 2.0,
           "good": 1.05,
-          "bad": 1.8
+          "bad": 1.8,
+          "worst": 1.0014649186624538
         },
         {
           "name": "stall_trips",
@@ -352,7 +419,8 @@
           "points": 100.0,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 10.0
+          "bad": 10.0,
+          "worst": 0.0
         },
         {
           "name": "ally_stall_trips",
@@ -361,94 +429,118 @@
           "points": 100.0,
           "weight": 1.0,
           "good": 0.0,
-          "bad": 10.0
+          "bad": 10.0,
+          "worst": 0.0
         },
         {
           "name": "repaths",
           "unit": "per unit",
-          "value": 0.3333333333333333,
+          "value": 0.24305555555555558,
           "points": 100.0,
           "weight": 1.0,
           "good": 1.0,
-          "bad": 20.0
+          "bad": 20.0,
+          "worst": 0.09166666666666666
         },
         {
           "name": "jitter",
           "unit": "rad/tick",
-          "value": 0.05735038849431643,
-          "points": 98.66356572830611,
+          "value": 0.053008263817514174,
+          "points": 99.38995617873486,
           "weight": 1.0,
           "good": 0.05,
-          "bad": 0.6
+          "bad": 0.6,
+          "worst": 0.05856674305052538
         },
         {
           "name": "cohesion",
           "unit": "radii",
-          "value": 0.8287760125497977,
+          "value": 0.8277164384350181,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.8473721188207467
         },
         {
           "name": "spread_at_end",
           "unit": "radii",
-          "value": 0.8234497308731079,
+          "value": 0.8183575570583344,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.8340297341346741
         },
         {
           "name": "push_ally",
           "unit": "radii/tick",
-          "value": 0.035048184045854414,
+          "value": 0.03215199465909682,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.035048184045854414
         },
         {
           "name": "overlap_mean",
           "unit": "radii",
-          "value": 0.06516760187668519,
-          "points": 67.41619906165741,
+          "value": 0.060978519004472126,
+          "points": 69.51074049776393,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 0.2
+          "bad": 0.2,
+          "worst": 0.06516760187668519
         },
         {
           "name": "overlap_p95",
           "unit": "radii",
-          "value": 0.5055730938911438,
-          "points": 43.82521178987292,
+          "value": 0.46968064953883487,
+          "points": 47.81326116235167,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 0.9
+          "bad": 0.9,
+          "worst": 0.507581889629364
         },
         {
           "name": "overlap_max",
           "unit": "radii",
-          "value": 1.7949419021606445,
-          "points": 10.792531465229235,
+          "value": 1.7891981105009716,
+          "points": 11.094836289422554,
           "weight": 1.0,
           "good": 0.1,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 1.819390892982483
         },
         {
           "name": "overlap_frac",
           "unit": "frac",
-          "value": 0.1583,
-          "points": 84.17,
+          "value": 0.15413634259259257,
+          "points": 84.58636574074075,
           "weight": 1.0,
           "good": 0.0,
-          "bad": 1.0
+          "bad": 1.0,
+          "worst": 0.16834722222222223
         }
       ]
     },
     {
       "name": "queued_corridors_60",
-      "score": 84.45865226399819,
+      "score": 84.39082204355353,
+      "variant_scores": [
+        84.45865226399819,
+        84.11188435761228,
+        84.40635301958365,
+        84.34810216614822,
+        84.1958140059257,
+        84.47272067887742,
+        84.51918007598867,
+        84.57548138475757,
+        84.27622570987025,
+        83.80336090830544,
+        84.86933627755782,
+        84.65275367401712
+      ],
       "metrics": [
         {
           "name": "stranded",
@@ -457,7 +549,8 @@
           "points": 100.0,
           "weight": 4.0,
           "good": 0.0,
-          "bad": 0.05
+          "bad": 0.05,
+          "worst": 0.0
         },
         {
           "name": "arrival",
@@ -466,97 +559,108 @@
           "points": 100.0,
           "weight": 3.0,
           "good": 1.0,
-          "bad": 0.9
+          "bad": 0.9,
+          "worst": 1.0
         },
         {
           "name": "lateness_p50",
           "unit": "ratio",
-          "value": 1.0037185355263272,
-          "points": 99.62814644736729,
+          "value": 1.009970330782367,
+          "points": 99.00296692176327,
           "weight": 2.0,
           "good": 1.0,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 1.0182508322346657
         },
         {
           "name": "lateness_p95",
           "unit": "ratio",
-          "value": 1.0908950254122458,
-          "points": 96.9701658195918,
+          "value": 1.0935603416895257,
+          "points": 96.8813219436825,
           "weight": 2.0,
           "good": 1.0,
-          "bad": 4.0
+          "bad": 4.0,
+          "worst": 1.126807274316736
         },
         {
           "name": "throughput",
           "unit": "units/s",
-          "value": 10.169490995043443,
-          "points": 42.173476441432015,
+          "value": 10.507027143977336,
+          "points": 44.158983199866675,
           "weight": 1.0,
           "good": 20.0,
-          "bad": 3.0
+          "bad": 3.0,
+          "worst": 10.169490995043443
         },
         {
           "name": "settle_p95",
           "unit": "frac run",
-          "value": 0.4134285714285714,
-          "points": 73.32142857142856,
+          "value": 0.42500000000000004,
+          "points": 71.87499999999999,
           "weight": 1.0,
           "good": 0.2,
-          "bad": 1.0
+          "bad": 1.0,
+          "worst": 0.45714285714285713
         },
         {
           "name": "spread",
           "unit": "radii",
-          "value": 1.005931886945452,
-          "points": 99.7034056527274,
+          "value": 0.9927307814288707,
+          "points": 99.95224759110381,
           "weight": 3.0,
           "good": 1.0,
-          "bad": 3.0
+          "bad": 3.0,
+          "worst": 1.005931886945452
         },
         {
           "name": "spread_p95",
           "unit": "radii",
-          "value": 1.6393933296203613,
-          "points": 84.3073810849871,
+          "value": 1.5668747921784718,
+          "points": 86.89732885076887,
           "weight": 2.0,
           "good": 1.2,
-          "bad": 4.0
+          "bad": 4.0,
+          "worst": 1.6393933296203613
         },
         {
           "name": "centroid_offset",
           "unit": "radii",
-          "value": 1.1261284351348877,
-          "points": 90.61559637387595,
+          "value": 1.130843589703242,
+          "points": 90.57630341913965,
           "weight": 3.0,
           "good": 0.0,
-          "bad": 12.0
+          "bad": 12.0,
+          "worst": 1.3897942304611206
         },
         {
           "name": "residual",
           "unit": "radii",
-          "value": 6.236902510325111,
-          "points": 99.46158520380656,
+          "value": 6.274302937189737,
+          "points": 99.37658423365968,
           "weight": 2.0,
           "good": 6.0,
-          "bad": 50.0
+          "bad": 50.0,
+          "worst": 6.3812200005849204
         },
         {
           "name": "residual_p95",
           "unit": "radii",
-          "value": 10.42705078125,
-          "points": 97.20186121323529,
+          "value": 10.711915715535483,
+          "points": 96.64330251855786,
           "weight": 1.0,
           "good": 9.0,
-          "bad": 60.0
+          "bad": 60.0,
+          "worst": 11.236067962646484
         },
         {
           "name": "detour",
           "unit": "ratio",
-          "value": 1.014522526051704,
+          "value": 1.0184758757526124,
           "points": 100.0,
           "weight": 1.0,
           "good": 1.05,
-          "bad": 1.8
+          "bad": 1.8,
+          "worst": 1.0138149070721807
         },
         {
           "name": "stall_trips",
@@ -565,103 +669,128 @@
           "points": 100.0,
           "weight": 1.0,
           "good": 0.0,
-          "bad": 10.0
+          "bad": 10.0,
+          "worst": 0.0
         },
         {
           "name": "jitter",
           "unit": "rad/tick",
-          "value": 0.036107599611252254,
+          "value": 0.0354147059111194,
           "points": 100.0,
           "weight": 1.0,
           "good": 0.05,
-          "bad": 0.6
+          "bad": 0.6,
+          "worst": 0.03416527228958042
         },
         {
           "name": "cohesion",
           "unit": "radii",
-          "value": 0.9846153559131282,
+          "value": 0.9748459683306634,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.9846153559131282
         },
         {
           "name": "cohesion_at_end",
           "unit": "radii",
-          "value": 0.8461311459541321,
+          "value": 0.8504160096247991,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.8617309927940369
         },
         {
           "name": "repaths",
           "unit": "per unit",
-          "value": 3.5,
+          "value": 3.513888888888889,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 3.7333333333333334
         },
         {
           "name": "push_ally",
           "unit": "radii/tick",
-          "value": 0.08502777686473666,
+          "value": 0.08721377038441937,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.09122185310247262
         },
         {
           "name": "overlap_mean",
           "unit": "radii",
-          "value": 0.16131882983870094,
-          "points": 46.22705672043302,
+          "value": 0.1638196395914299,
+          "points": 45.393453469523344,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 0.3
+          "bad": 0.3,
+          "worst": 0.1693960105017892
         },
         {
           "name": "overlap_p95",
           "unit": "radii",
-          "value": 0.7405784726142883,
-          "points": 38.28512728214264,
+          "value": 0.7515706171592077,
+          "points": 37.369115236732696,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 1.2
+          "bad": 1.2,
+          "worst": 0.7803557515144348
         },
         {
           "name": "overlap_max",
           "unit": "radii",
-          "value": 1.6622041463851929,
-          "points": 18.766436311933727,
+          "value": 1.707103023926417,
+          "points": 16.272054226310164,
           "weight": 1.0,
           "good": 0.2,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 1.77596116065979
         },
         {
           "name": "overlap_frac",
           "unit": "frac",
-          "value": 0.47791428571428574,
-          "points": 54.95639097744361,
+          "value": 0.482054365079365,
+          "points": 54.520593149540524,
           "weight": 1.0,
           "good": 0.05,
-          "bad": 1.0
+          "bad": 1.0,
+          "worst": 0.5082476190476191
         }
       ]
     },
     {
       "name": "obstacle_drop",
-      "score": 85.60822279589796,
+      "score": 84.95288862980522,
+      "variant_scores": [
+        85.60822279589796,
+        85.69531799672237,
+        85.54708382534125,
+        84.65476827270831,
+        82.9382381741248,
+        85.37286516910082,
+        85.11176604064812,
+        84.80602187075661,
+        83.92888782577008,
+        83.82444488195232,
+        85.82913293044554,
+        86.11791377419458
+      ],
       "metrics": [
         {
           "name": "detour",
           "unit": "ratio",
-          "value": 1.0380859574459584,
-          "points": 100.0,
+          "value": 1.0398904752244504,
+          "points": 99.97926333675123,
           "weight": 3.0,
           "good": 1.05,
-          "bad": 1.8
+          "bad": 1.8,
+          "worst": 1.0518662996923878
         },
         {
           "name": "arrival",
@@ -670,52 +799,58 @@
           "points": 100.0,
           "weight": 2.0,
           "good": 1.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 1.0
         },
         {
           "name": "residual",
           "unit": "radii",
-          "value": 4.578803901672364,
-          "points": 98.96642160415648,
+          "value": 4.689978459676107,
+          "points": 98.76789560772124,
           "weight": 2.0,
           "good": 4.0,
-          "bad": 60.0
+          "bad": 60.0,
+          "worst": 4.886017875671387
         },
         {
           "name": "residual_p95",
           "unit": "radii",
-          "value": 7.149187469482422,
-          "points": 98.44704396015888,
+          "value": 7.626259485880534,
+          "points": 97.80235204610739,
           "weight": 1.0,
           "good": 6.0,
-          "bad": 80.0
+          "bad": 80.0,
+          "worst": 8.309017181396484
         },
         {
           "name": "centroid_offset",
           "unit": "radii",
-          "value": 1.6814864873886108,
-          "points": 85.98761260509491,
+          "value": 1.4770023326079051,
+          "points": 87.69164722826746,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 12.0
+          "bad": 12.0,
+          "worst": 1.6814864873886108
         },
         {
           "name": "settle_p95",
           "unit": "frac run",
-          "value": 0.2612,
-          "points": 92.35,
+          "value": 0.26376666666666665,
+          "points": 92.02916666666665,
           "weight": 1.0,
           "good": 0.2,
-          "bad": 1.0
+          "bad": 1.0,
+          "worst": 0.2772
         },
         {
           "name": "lateness_p95",
           "unit": "ratio",
-          "value": 1.1349715601096289,
+          "value": 1.161313401743675,
           "points": 100.0,
           "weight": 1.0,
           "good": 1.3,
-          "bad": 6.0
+          "bad": 6.0,
+          "worst": 1.1188863758866
         },
         {
           "name": "stall_trips",
@@ -724,85 +859,97 @@
           "points": 100.0,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 10.0
+          "bad": 10.0,
+          "worst": 0.0
         },
         {
           "name": "repaths",
           "unit": "per unit",
-          "value": 1.3333333333333333,
+          "value": 1.3416666666666668,
           "points": 100.0,
           "weight": 2.0,
           "good": 2.0,
-          "bad": 20.0
+          "bad": 20.0,
+          "worst": 1.1666666666666667
         },
         {
           "name": "jitter",
           "unit": "rad/tick",
-          "value": 0.03996499413416915,
+          "value": 0.04305357043217058,
           "points": 100.0,
           "weight": 1.0,
           "good": 0.05,
-          "bad": 0.5
+          "bad": 0.5,
+          "worst": 0.03785835430796625
         },
         {
           "name": "spread_at_end",
           "unit": "radii",
-          "value": 0.8237824440002441,
+          "value": 0.856215238571167,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.8808560967445374
         },
         {
           "name": "push_ally",
           "unit": "radii/tick",
-          "value": 0.03372544223060707,
+          "value": 0.03560939359035172,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.04226097256805024
         },
         {
           "name": "overlap_mean",
           "unit": "radii",
-          "value": 0.07389026030490796,
-          "points": 63.054869847546016,
+          "value": 0.07738294965977262,
+          "points": 61.30852517011368,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 0.2
+          "bad": 0.2,
+          "worst": 0.09028672925939163
         },
         {
           "name": "overlap_p95",
           "unit": "radii",
-          "value": 0.4882827699184418,
-          "points": 45.74635889795092,
+          "value": 0.5356229394674301,
+          "points": 40.48634005917443,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 0.9
+          "bad": 0.9,
+          "worst": 0.6806689500808716
         },
         {
           "name": "overlap_max",
           "unit": "radii",
-          "value": 1.7428117990493774,
-          "points": 13.536221102664344,
+          "value": 1.7916822632153828,
+          "points": 10.964091409716689,
           "weight": 1.0,
           "good": 0.1,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 1.8886759281158447
         },
         {
           "name": "overlap_frac",
           "unit": "frac",
-          "value": 0.22854666666666668,
-          "points": 77.14533333333333,
+          "value": 0.23325777777777776,
+          "points": 76.67422222222221,
           "weight": 1.0,
           "good": 0.0,
-          "bad": 1.0
+          "bad": 1.0,
+          "worst": 0.24916
         }
       ]
     },
     {
       "name": "impassable_gap_40",
       "score": 10.107967699015582,
+      "variant_scores": [
+        10.107967699015582
+      ],
       "metrics": [
         {
           "name": "phantoms",
@@ -811,7 +958,8 @@
           "points": 0.0,
           "weight": 3.0,
           "good": 0.0,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 2.0
         },
         {
           "name": "refusals",
@@ -820,7 +968,8 @@
           "points": 100.0,
           "weight": 1.0,
           "good": 0.0,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 0.0
         },
         {
           "name": "min_clearance",
@@ -829,7 +978,8 @@
           "points": 10.625686248143513,
           "weight": 2.0,
           "good": 0.5,
-          "bad": 0.05
+          "bad": 0.05,
+          "worst": 0.09781558811664581
         },
         {
           "name": "stall_trips",
@@ -838,7 +988,8 @@
           "points": 100.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.0
         },
         {
           "name": "travel",
@@ -847,7 +998,8 @@
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 94.0352411483298
         },
         {
           "name": "push_ally",
@@ -856,7 +1008,8 @@
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 2.2499985059745606
         },
         {
           "name": "overlap_mean",
@@ -865,7 +1018,8 @@
           "points": 0.0,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 0.3
+          "bad": 0.3,
+          "worst": 1.4985274103298782
         },
         {
           "name": "overlap_p95",
@@ -874,7 +1028,8 @@
           "points": 0.0,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 1.2
+          "bad": 1.2,
+          "worst": 1.994299292564392
         },
         {
           "name": "overlap_max",
@@ -883,7 +1038,8 @@
           "points": 0.04423989189995659,
           "weight": 1.0,
           "good": 0.2,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 1.9992036819458008
         },
         {
           "name": "overlap_frac",
@@ -892,13 +1048,17 @@
           "points": 0.0,
           "weight": 1.0,
           "good": 0.05,
-          "bad": 1.0
+          "bad": 1.0,
+          "worst": 1.0
         }
       ]
     },
     {
       "name": "corridor_sizes",
       "score": 86.73153863503383,
+      "variant_scores": [
+        86.73153863503383
+      ],
       "metrics": [
         {
           "name": "suboptimality",
@@ -907,7 +1067,8 @@
           "points": 100.0,
           "weight": 3.0,
           "good": 1.02,
-          "bad": 1.4
+          "bad": 1.4,
+          "worst": 0.9894188636942984
         },
         {
           "name": "refusals",
@@ -916,7 +1077,8 @@
           "points": 100.0,
           "weight": 3.0,
           "good": 0.0,
-          "bad": 8.0
+          "bad": 8.0,
+          "worst": 0.0
         },
         {
           "name": "phantoms",
@@ -925,7 +1087,8 @@
           "points": 100.0,
           "weight": 3.0,
           "good": 0.0,
-          "bad": 8.0
+          "bad": 8.0,
+          "worst": 0.0
         },
         {
           "name": "min_clearance",
@@ -934,7 +1097,8 @@
           "points": 41.791726648807526,
           "weight": 2.0,
           "good": 0.6,
-          "bad": 0.2
+          "bad": 0.2,
+          "worst": 0.3671669065952301
         },
         {
           "name": "clearance_p5",
@@ -943,7 +1107,8 @@
           "points": 43.92654895782471,
           "weight": 1.0,
           "good": 0.6,
-          "bad": 0.2
+          "bad": 0.2,
+          "worst": 0.37570619583129883
         },
         {
           "name": "abstraction_penalty",
@@ -952,7 +1117,8 @@
           "points": 100.0,
           "weight": 1.0,
           "good": 1.0,
-          "bad": 1.3
+          "bad": 1.3,
+          "worst": 1.0
         },
         {
           "name": "waypoints",
@@ -961,7 +1127,8 @@
           "points": 97.76785714285714,
           "weight": 0.0,
           "good": 2.0,
-          "bad": 100.0
+          "bad": 100.0,
+          "worst": 4.1875
         },
         {
           "name": "turn_per_100",
@@ -970,22 +1137,38 @@
           "points": 92.03422605610182,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 3.0
+          "bad": 3.0,
+          "worst": 0.2389732183169455
         }
       ]
     },
     {
       "name": "combat_blob",
-      "score": 77.70190761114785,
+      "score": 77.36496694541923,
+      "variant_scores": [
+        77.70190761114785,
+        77.36826710473954,
+        78.92117748043215,
+        76.10219379167899,
+        78.01588617303669,
+        76.53120634115652,
+        76.0864823394093,
+        77.29815098689251,
+        78.38867316656899,
+        77.15819513694352,
+        77.29020640825802,
+        77.5172568047667
+      ],
       "metrics": [
         {
           "name": "in_range",
           "unit": "frac",
-          "value": 0.10691071428571428,
-          "points": 90.4831932773109,
+          "value": 0.10816369047619047,
+          "points": 91.95728291316526,
           "weight": 3.0,
           "good": 0.115,
-          "bad": 0.03
+          "bad": 0.03,
+          "worst": 0.10580357142857141
         },
         {
           "name": "first_shot_p95",
@@ -994,25 +1177,28 @@
           "points": 0.0,
           "weight": 2.0,
           "good": 650.0,
-          "bad": 1400.0
+          "bad": 1400.0,
+          "worst": 1400.0
         },
         {
           "name": "chase_gap",
           "unit": "reaches",
-          "value": 18.2720170121789,
+          "value": 18.16843454517211,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 19.272055508775374
         },
         {
           "name": "slot_churn",
           "unit": "per unit",
-          "value": 5.025,
-          "points": 74.875,
+          "value": 4.172916666666667,
+          "points": 79.13541666666667,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 20.0
+          "bad": 20.0,
+          "worst": 5.025
         },
         {
           "name": "hold_trips",
@@ -1021,34 +1207,38 @@
           "points": 100.0,
           "weight": 1.0,
           "good": 0.0,
-          "bad": 10.0
+          "bad": 10.0,
+          "worst": 0.0
         },
         {
           "name": "jitter",
           "unit": "rad/tick",
-          "value": 0.2737608461942186,
-          "points": 84.20355943688924,
+          "value": 0.2880104202770773,
+          "points": 82.90814361117481,
           "weight": 1.0,
           "good": 0.1,
-          "bad": 1.2
+          "bad": 1.2,
+          "worst": 0.35183960962585126
         },
         {
           "name": "push_ally",
           "unit": "radii/tick",
-          "value": 0.0335691169001265,
+          "value": 0.041437218602855576,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.047637505056214585
         },
         {
           "name": "push_enemy",
           "unit": "radii/tick",
-          "value": 1.320157778650355e-9,
+          "value": 2.005327380594224e-9,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 6.553105204381333e-9
         },
         {
           "name": "defender_drift",
@@ -1057,112 +1247,138 @@
           "points": 100.0,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 10.0
+          "bad": 10.0,
+          "worst": 0.0
         },
         {
           "name": "surround",
           "unit": "ticks",
-          "value": 171.0,
-          "points": 96.18181818181817,
+          "value": 188.41666666666666,
+          "points": 92.80303030303031,
           "weight": 2.0,
           "good": 150.0,
-          "bad": 700.0
+          "bad": 700.0,
+          "worst": 267.0
         },
         {
           "name": "lean",
           "unit": "radii",
-          "value": 0.5955602035352162,
-          "points": 85.1109949116196,
+          "value": 0.6691321772762707,
+          "points": 83.27169556809322,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 4.0
+          "bad": 4.0,
+          "worst": 1.1542504213537488
         },
         {
           "name": "overlap_mean",
           "unit": "radii",
-          "value": 0.0988109179994072,
-          "points": 93.49187760007905,
+          "value": 0.11672341094922889,
+          "points": 91.10354520676948,
           "weight": 2.0,
           "good": 0.05,
-          "bad": 0.8
+          "bad": 0.8,
+          "worst": 0.1311907019082275
         },
         {
           "name": "overlap_p95",
           "unit": "radii",
-          "value": 0.3659433424472809,
-          "points": 82.27044383684795,
+          "value": 0.40154104431470233,
+          "points": 79.89726371235318,
           "weight": 2.0,
           "good": 0.1,
-          "bad": 1.6
+          "bad": 1.6,
+          "worst": 0.4991890788078308
         },
         {
           "name": "overlap_max",
           "unit": "radii",
-          "value": 0.7753307223320007,
-          "points": 72.0393692745882,
+          "value": 0.7282014836867651,
+          "points": 74.8116774301903,
           "weight": 1.0,
           "good": 0.3,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 0.9624283909797668
         },
         {
           "name": "overlap_frac",
           "unit": "frac",
-          "value": 0.6785017421602787,
-          "points": 40.18728222996516,
+          "value": 0.6907941347270615,
+          "points": 38.6507331591173,
           "weight": 1.0,
           "good": 0.2,
-          "bad": 1.0
+          "bad": 1.0,
+          "worst": 0.7547386759581881
         }
       ]
     },
     {
       "name": "stutter_step",
-      "score": 54.626174687661184,
+      "score": 55.70389622259343,
+      "variant_scores": [
+        54.626174687661184,
+        56.09614455092906,
+        56.47700379528194,
+        54.64731729161836,
+        57.53563211031801,
+        55.46609060281211,
+        55.67749083930502,
+        56.364346130001195,
+        55.70988491817259,
+        55.63838877837597,
+        54.22980712249511,
+        55.97847384415074
+      ],
       "metrics": [
         {
           "name": "fire_efficiency",
           "unit": "frac",
-          "value": 0.12596153846153846,
-          "points": 18.990384615384613,
+          "value": 0.1267628205128205,
+          "points": 19.190705128205124,
           "weight": 3.0,
           "good": 0.45,
-          "bad": 0.05
+          "bad": 0.05,
+          "worst": 0.11923076923076922
         },
         {
           "name": "in_range",
           "unit": "frac",
-          "value": 0.25576923076923075,
-          "points": 25.96153846153846,
+          "value": 0.2587532470455604,
+          "points": 26.458874507593404,
           "weight": 3.0,
           "good": 0.7,
-          "bad": 0.1
+          "bad": 0.1,
+          "worst": 0.24712863705972438
         },
         {
           "name": "chase_gap",
           "unit": "reaches",
-          "value": 1.2628731893748044,
-          "points": 56.70206235578428,
+          "value": 1.253379672142103,
+          "points": 57.43233291214592,
           "weight": 2.0,
           "good": 0.7,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 1.2716233342360317
         },
         {
           "name": "slot_churn",
           "unit": "per unit",
-          "value": 9.75,
-          "points": 79.60526315789474,
+          "value": 7.020833333333333,
+          "points": 86.7872807017544,
           "weight": 2.0,
           "good": 2.0,
-          "bad": 40.0
+          "bad": 40.0,
+          "worst": 11.375
         },
         {
           "name": "jitter",
           "unit": "rad/tick",
-          "value": 0.4731837994310428,
-          "points": 66.07420005172338,
+          "value": 0.4731389709289584,
+          "points": 66.0782753700947,
           "weight": 2.0,
           "good": 0.1,
-          "bad": 1.2
+          "bad": 1.2,
+          "worst": 0.48512498650029945
         },
         {
           "name": "hold_trips",
@@ -1171,25 +1387,28 @@
           "points": 100.0,
           "weight": 1.0,
           "good": 0.0,
-          "bad": 20.0
+          "bad": 20.0,
+          "worst": 0.0
         },
         {
           "name": "repaths",
           "unit": "per unit",
-          "value": 241.25,
+          "value": 240.15625,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 245.25
         },
         {
           "name": "push_ally",
           "unit": "radii/tick",
-          "value": 0.02624541904946052,
+          "value": 0.025994071650976985,
           "points": 0.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.02767201185611209
         },
         {
           "name": "push_enemy",
@@ -1198,46 +1417,51 @@
           "points": 100.0,
           "weight": 0.0,
           "good": 0.0,
-          "bad": 0.0
+          "bad": 0.0,
+          "worst": 0.0
         },
         {
           "name": "overlap_mean",
           "unit": "radii",
-          "value": 0.07270053822403917,
-          "points": 63.649730887980425,
+          "value": 0.07129830288463286,
+          "points": 64.35084855768358,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 0.2
+          "bad": 0.2,
+          "worst": 0.07426862495593153
         },
         {
           "name": "overlap_p95",
           "unit": "radii",
-          "value": 0.16992512345314026,
-          "points": 81.11943072742886,
+          "value": 0.16431195040543875,
+          "points": 81.74311662161792,
           "weight": 2.0,
           "good": 0.0,
-          "bad": 0.9
+          "bad": 0.9,
+          "worst": 0.18105316162109375
         },
         {
           "name": "overlap_max",
           "unit": "radii",
-          "value": 0.24297085404396057,
-          "points": 92.47521820821261,
+          "value": 0.2524089639385541,
+          "points": 91.97847558218137,
           "weight": 1.0,
           "good": 0.1,
-          "bad": 2.0
+          "bad": 2.0,
+          "worst": 0.28162670135498047
         },
         {
           "name": "overlap_frac",
           "unit": "frac",
-          "value": 0.8373504273504273,
-          "points": 16.264957264957268,
+          "value": 0.8333689458689459,
+          "points": 16.663105413105416,
           "weight": 1.0,
           "good": 0.0,
-          "bad": 1.0
+          "bad": 1.0,
+          "worst": 0.8435897435897436
         }
       ]
     }
   ],
-  "total": 73.43399248216002
+  "total": 73.36689139450584
 }

@@ -14,6 +14,7 @@ use crate::metrics::{PathProbe, Query, build_cdt, wall_segments};
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "corridor_sizes",
+    variants: 1,
     run,
 };
 

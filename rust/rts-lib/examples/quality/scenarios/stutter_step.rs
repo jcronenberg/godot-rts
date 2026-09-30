@@ -22,6 +22,7 @@ use crate::metrics::{Cfg, Route, Run, unit_ids};
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "stutter_step",
+    variants: super::VARIANTS,
     run,
 };
 
@@ -63,18 +64,21 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
     // Eight bodies cannot all sit in reach behind one target, so this starts
     // as a real following formation. In contact on purpose: the scenario
     // scores whether contact is *held*, not closed from cold.
-    spawns.extend((0..ATTACKERS).map(|i| Command::Spawn {
-        pos: v(
+    spawns.extend((0..ATTACKERS).map(|i| {
+        let at = v(
             PREY_START.x - 52.0 + 12.0 * (i % 4) as f32,
             PREY_START.y - 6.0 + 12.0 * (i / 4) as f32,
-        ),
-        radius: RADIUS,
-        max_speed: SPEED,
-        team: 0,
-        max_health: 1.0e6,
-        damage: 5.0,
-        attack_range: RANGE,
-        attack_cooldown_ticks: COOLDOWN,
+        );
+        Command::Spawn {
+            pos: at + super::cell_jitter(ctx, at, 12.0, RADIUS),
+            radius: RADIUS,
+            max_speed: SPEED,
+            team: 0,
+            max_health: 1.0e6,
+            damage: 5.0,
+            attack_range: RANGE,
+            attack_cooldown_ticks: COOLDOWN,
+        }
     }));
     run.sim.step(&spawns);
 
@@ -91,7 +95,11 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
     if ctx.trace {
         run.record_trace(SPEC.name);
     }
-    for k in 0..TICKS {
+    // Where in its click cycle the player starts: a real one is never in
+    // phase with the target's gait.
+    let phase = ctx.pick(1, 2 * CYCLE);
+    for t in 0..TICKS {
+        let k = t + phase;
         let cmds = if !k.is_multiple_of(CYCLE) {
             Vec::new()
         } else if (k / CYCLE).is_multiple_of(2) {

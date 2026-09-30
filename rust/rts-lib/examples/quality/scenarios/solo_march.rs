@@ -22,6 +22,7 @@ use crate::metrics::{self, Cfg, PathProbe, Query, Route, Run, build_cdt, wall_se
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "solo_march",
+    variants: 1,
     run,
 };
 

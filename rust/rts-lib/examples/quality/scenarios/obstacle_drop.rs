@@ -14,6 +14,7 @@ use crate::metrics::{Cfg, Route, Run, unit_ids, wall_segments};
 
 pub const SPEC: ScenarioSpec = ScenarioSpec {
     name: "obstacle_drop",
+    variants: super::VARIANTS,
     run,
 };
 
@@ -38,8 +39,12 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
             ..Cfg::default()
         },
     );
+    // The building lands a little earlier or later, catching the group at a
+    // different point in its march.
+    let drop_tick = (DROP_TICK as f32 + ctx.offset(2, Vector2::splat(15.0)).x).round() as u64;
     run.sim.step(&super::spawn_block(
-        v(40.0, 130.0),
+        ctx,
+        v(40.0, 130.0) + ctx.offset(1, Vector2::splat(10.0)),
         5,
         14.0,
         UNITS,
@@ -59,7 +64,7 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         run.record_trace(SPEC.name);
     }
     for t in 0..TICKS {
-        if t == DROP_TICK {
+        if t == drop_tick {
             run.step(&[Command::AddObstacle {
                 points: building.clone(),
             }]);
