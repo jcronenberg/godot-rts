@@ -205,6 +205,10 @@ pub static DETOUR_LEN_RADII: TunableF32 = TunableF32::new(6.0);
 /// defender; without this the surplus queues behind them forever instead of
 /// picking another enemy.
 pub static TARGET_SPREAD_PENALTY: TunableF32 = TunableF32::new(1.0);
+/// Per-tick step, as a fraction of speed, by which a shoved stationed unit
+/// eases back onto its station. Without it neighbours drift into the gap and
+/// a ring packed exactly full loses a station.
+pub static STATION_KEEP_FRAC: TunableF32 = TunableF32::new(0.25);
 
 /// Diagnostic switch for [`Sim::last_push`]: while on, `flock` records how much
 /// separation push each unit received, split by ally and enemy.
@@ -218,6 +222,11 @@ pub static PUSH_TRACKING: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// Internal convergence detail, not a gameplay knob — plain const rather than
 /// a `Tunable`.
 const WALL_CLAMP_PASSES: u32 = 8;
+/// Passes of the enemy no-closing clip in [`Sim::flock`]: two contacts at an
+/// angle need a few to settle.
+const ENEMY_CLIP_PASSES: u32 = 3;
+/// Station-keeping dead zone, as a fraction of the unit's radius.
+const STATION_KEEP_EPS_FRAC: f32 = 0.001;
 /// Fraction of a radius by which [`assign_blob`] pushes each end of its
 /// reachability walk off the ray. Small enough to stay within the faces the
 /// ray really passes through, large enough to survive f32 rounding at map
@@ -302,6 +311,7 @@ pub fn set_tuning(name: &str, value: f32) -> bool {
         "detour_ticks" => DETOUR_TICKS.set(value.round().clamp(0.0, 255.0) as u8),
         "detour_len_radii" => DETOUR_LEN_RADII.set(value),
         "target_spread_penalty" => TARGET_SPREAD_PENALTY.set(value),
+        "station_keep_frac" => STATION_KEEP_FRAC.set(value),
         _ => return false,
     }
     true
@@ -343,6 +353,7 @@ pub fn get_tuning(name: &str) -> Option<f32> {
         "detour_ticks" => DETOUR_TICKS.get() as f32,
         "detour_len_radii" => DETOUR_LEN_RADII.get(),
         "target_spread_penalty" => TARGET_SPREAD_PENALTY.get(),
+        "station_keep_frac" => STATION_KEEP_FRAC.get(),
         _ => return None,
     })
 }
@@ -916,6 +927,18 @@ struct StepScratch {
     marching: Vec<bool>,
     /// Group-id pairs to merge this tick, as `(min, max)`; usually empty.
     merge_pairs: Vec<(u32, u32)>,
+    /// Enemy pairs near contact: dense `(i, j)`, unit normal `j -> i`, surface
+    /// gap. Resolved after the pair pass, once ally contact is known.
+    enemy_contacts: Vec<(u32, u32, Vector2, f32)>,
+    /// Per dense unit: position after the path step, and the tick's whole
+    /// motion under the enemy clip.
+    now: Vec<Vector2>,
+    moved: Vec<Vector2>,
+    /// Per dense unit: an enemy is close enough that any of this tick's
+    /// motion, station keeping included, could close on it.
+    near_enemy: Vec<bool>,
+    /// Per enemy contact: how far each side may close on the other.
+    enemy_allow: Vec<(f32, f32)>,
     /// Wall-clamp face frontier and visited list (tiny per unit).
     faces: Vec<u32>,
     visited: Vec<u32>,
@@ -928,10 +951,21 @@ struct StepScratch {
     /// Combat: units that hit their leash this tick and the post to walk back
     /// to. Almost always empty.
     leash_home: Vec<(UnitId, Vector2)>,
-    /// Combat: `(target, slot code)` chosen so far this tick, so units
-    /// deciding on the same tick spread around the ring instead of all
-    /// reading the same free slot. Slot-order, so it stays deterministic.
-    slot_claims: Vec<(UnitId, u16)>,
+    /// Combat: `(slot code, distance to it)` per dense unit, seeded from last
+    /// tick so scoring sees everyone bound for a station, not just this
+    /// tick's deciders.
+    slot_claims: Vec<(u16, f32)>,
+    /// Combat: per dense target, the furthest reach of the units stationed
+    /// around it (centre distance plus radius); 0 with none.
+    crowd_edge: Vec<f32>,
+    /// Combat: each dense unit's target, as a dense index (`u32::MAX` for
+    /// none), and everyone attacking each target, CSR over the target's dense
+    /// index: `rivals[rivals_start[k]..rivals_start[k + 1]]`.
+    target_of: Vec<u32>,
+    rivals_start: Vec<u32>,
+    rivals: Vec<u32>,
+    /// Combat: station line-of-sight answers already walked this tick.
+    los: LosCache,
     /// Combat: allies already targeting each dense unit, for acquisition
     /// spreading. Rebuilt per tick in [`Sim::acquire_targets`].
     target_count: Vec<u32>,
@@ -949,6 +983,40 @@ struct StepScratch {
     damage: Vec<(UnitId, f32)>,
     /// Combat: units whose health reached zero this tick, in slot order.
     dead: Vec<UnitId>,
+}
+
+/// Per-tick station line-of-sight answers (0 unknown, 1 clear, 2 blocked):
+/// every attacker on a target asks the same mesh walks.
+#[derive(Default)]
+struct LosCache {
+    /// Per dense target: its entry in `entries`, or `u32::MAX`.
+    of: Vec<u32>,
+    /// Keyed by `Rings`, which also pins the asker's radius (reserve rings
+    /// are `2 r` apart).
+    entries: Vec<(Rings, [u8; MAX_RING_SLOTS * MAX_RINGS])>,
+}
+
+impl LosCache {
+    fn reset(&mut self, n: usize) {
+        self.of.clear();
+        self.of.resize(n, u32::MAX);
+        self.entries.clear();
+    }
+
+    /// Answers for `target` at these rings. Only the first asker's shape is
+    /// cached; mixed shapes on one target are rare.
+    fn entry(&mut self, target: u32, rings: &Rings) -> &mut [u8; MAX_RING_SLOTS * MAX_RINGS] {
+        let at = self.of[target as usize];
+        if at != u32::MAX {
+            if self.entries[at as usize].0 == *rings {
+                return &mut self.entries[at as usize].1;
+            }
+        } else {
+            self.of[target as usize] = self.entries.len() as u32;
+        }
+        self.entries.push((*rings, [0; MAX_RING_SLOTS * MAX_RINGS]));
+        &mut self.entries.last_mut().expect("just pushed").1
+    }
 }
 
 /// One unit's combat decision for the tick, computed read-only against
@@ -981,6 +1049,8 @@ struct CombatDecision {
     /// [`Unit::hold_ticks`] for which of its two readings applies.
     best_gap: f32,
     hold_ticks: u8,
+    /// Station to ease back onto; see [`STATION_KEEP_FRAC`].
+    keep_at: Option<Vector2>,
 }
 
 pub struct Sim {
@@ -1671,6 +1741,9 @@ impl Sim {
     ///   [`SEPARATION_RELAX`] of each overlap per tick, split between the pair
     ///   by [`HOLD_WEIGHT`] — a mover yields to a unit that is holding station
     ///   (firing, parked or idle) instead of bulldozing it across the map.
+    ///   Enemies are never pushed: whoever caused an enemy overlap takes all
+    ///   of it and no motion may close on an enemy, so a crowd can't shove its
+    ///   front rank through an enemy wall.
     /// - **Cohesion** (same-group moving neighbours with no target, at
     ///   [`COHESION_RADIUS_FRAC`]
     ///   radii): pulls toward the neighbour centroid by [`COHESION_GAIN`], with
@@ -1706,10 +1779,15 @@ impl Sim {
         s.goals.clear();
         s.marching.clear();
         s.merge_pairs.clear();
+        s.enemy_contacts.clear();
+        s.near_enemy.clear();
+        s.now.clear();
         let mut max_radius = 0.0f32;
         for (id, u) in self.units.iter() {
             s.ids.push(id);
             s.positions.push(u.prev_pos);
+            s.now.push(u.pos);
+            s.near_enemy.push(false);
             s.radii.push(u.radius);
             s.speeds.push(u.max_speed);
             s.disp.push(Vector2::ZERO);
@@ -1753,6 +1831,8 @@ impl Sim {
         }
         let arrival_touch_frac = ARRIVAL_TOUCH_FRAC.get();
         let hold_weight = HOLD_WEIGHT.get();
+        let separation_max_frac = SEPARATION_MAX_FRAC.get();
+        let near_frac = 1.0 + separation_max_frac + STATION_KEEP_FRAC.get();
 
         for i in 0..s.ids.len() {
             let p = s.positions[i];
@@ -1772,7 +1852,31 @@ impl Sim {
                         let delta = p - s.positions[j];
                         let d2 = delta.x * delta.x + delta.y * delta.y;
                         let min_dist = r_i + s.radii[j];
-                        if d2 < min_dist * min_dist {
+                        // Close enough to touch within this tick's motion.
+                        let enemy = t_i != s.teams[j] && {
+                            let near = min_dist + (s.speeds[i] + s.speeds[j]) * DT * near_frac;
+                            d2 < near * near
+                                && relation_of(&self.relations, t_i, s.teams[j]) == Relation::Enemy
+                                && {
+                                    s.near_enemy[i] = true;
+                                    s.near_enemy[j] = true;
+                                    let reach = min_dist
+                                        + s.speeds[i].max(s.speeds[j])
+                                            * DT
+                                            * (1.0 + separation_max_frac);
+                                    d2 < reach * reach
+                                }
+                        };
+                        if enemy {
+                            let d = d2.sqrt();
+                            let dir = if d > 1e-6 {
+                                delta * (1.0 / d)
+                            } else {
+                                Vector2::new(1.0, 0.0)
+                            };
+                            s.enemy_contacts
+                                .push((i as u32, j as u32, dir, d - min_dist));
+                        } else if d2 < min_dist * min_dist {
                             let d = d2.sqrt();
                             // Coincident circles: deterministic x-axis tiebreak.
                             let dir = if d > 1e-6 {
@@ -1796,9 +1900,7 @@ impl Sim {
                             s.disp[i] += dir * push_i;
                             s.disp[j] -= dir * push_j;
                             // Body contact with an ally: the detour's "blocked
-                            // by units, not walls" precondition. The same test
-                            // buckets the diagnostic push, so the split costs
-                            // no extra relation lookup.
+                            // by units, not walls" precondition.
                             let ally =
                                 relation_of(&self.relations, t_i, s.teams[j]) == Relation::Ally;
                             if ally {
@@ -1806,13 +1908,13 @@ impl Sim {
                                 s.ally_contact[j] = true;
                             }
                             if track_push {
-                                if ally {
-                                    s.push_ally[i] += push_i;
-                                    s.push_ally[j] += push_j;
+                                let bucket = if ally {
+                                    &mut s.push_ally
                                 } else {
-                                    s.push_enemy[i] += push_i;
-                                    s.push_enemy[j] += push_j;
-                                }
+                                    &mut s.push_enemy
+                                };
+                                bucket[i] += push_i;
+                                bucket[j] += push_j;
                             }
                         }
                         // Merge: adjacent, both-marching, same-goal, same-size
@@ -1880,6 +1982,52 @@ impl Sim {
             }
         }
 
+        // Enemies are never shoved, or a crowd pressing on its front rank
+        // pushes whatever that rank touches and a wall of units isn't a wall.
+        if !s.enemy_contacts.is_empty() {
+            // Walking into the other body, from start-of-tick positions.
+            let presses = |a: usize, toward: Vector2| {
+                s.moving[a] && {
+                    let u = self.units.get(s.ids[a]).expect("dense id alive");
+                    let h = u.waypoint() - s.positions[a];
+                    h.x * toward.x + h.y * toward.y > 0.0
+                }
+            };
+            let targets = |a: usize, b: usize| {
+                let u = self.units.get(s.ids[a]).expect("dense id alive");
+                u.target == Some(s.ids[b])
+            };
+            for &(i, j, dir, gap) in &s.enemy_contacts {
+                if gap >= 0.0 {
+                    continue;
+                }
+                let (i, j) = (i as usize, j as usize);
+                let (pi, pj) = (presses(i, -dir), presses(j, dir));
+                let (ti, tj) = (targets(i, j), targets(j, i));
+                // The culprit takes it all, first of: pressing, moving,
+                // targeting the other, shoved in by allies. Else split.
+                let share_i = if pi != pj {
+                    if pi { 1.0 } else { 0.0 }
+                } else if !pi && s.moving[i] != s.moving[j] {
+                    if s.moving[i] { 1.0 } else { 0.0 }
+                } else if !pi && ti != tj {
+                    if ti { 1.0 } else { 0.0 }
+                } else if !pi && s.ally_contact[i] != s.ally_contact[j] {
+                    if s.ally_contact[i] { 1.0 } else { 0.0 }
+                } else {
+                    0.5
+                };
+                let push = -gap * separation_relax;
+                let (push_i, push_j) = (push * share_i, push * (1.0 - share_i));
+                s.disp[i] += dir * push_i;
+                s.disp[j] -= dir * push_j;
+                if track_push {
+                    s.push_enemy[i] += push_i;
+                    s.push_enemy[j] += push_j;
+                }
+            }
+        }
+
         for i in 0..s.ids.len() {
             let unit = self.units.get_mut(s.ids[i]).expect("dense id alive");
             if s.arrive[i] {
@@ -1912,14 +2060,62 @@ impl Sim {
                 d += pull;
             }
             let len2 = d.x * d.x + d.y * d.y;
-            if len2 == 0.0 {
+            let max_step = s.speeds[i] * DT * SEPARATION_MAX_FRAC.get();
+            if len2 > max_step * max_step {
+                d *= max_step / len2.sqrt();
+            }
+            s.disp[i] = d;
+        }
+
+        // A pair's whole motion, path step included, may close by at most
+        // its starting gap. Clipping only the push lets a unit squeeze
+        // through the seam between two enemies, whose pushes cancel.
+        if !s.enemy_contacts.is_empty() {
+            s.moved.resize(s.ids.len(), Vector2::ZERO);
+            for &(i, j, ..) in &s.enemy_contacts {
+                for a in [i as usize, j as usize] {
+                    s.moved[a] = s.now[a] + s.disp[a] - s.positions[a];
+                }
+            }
+            // Split the gap by how hard each side closes, so a unit walking
+            // up to a standing enemy still gets all of it.
+            s.enemy_allow.clear();
+            for &(i, j, n, gap) in &s.enemy_contacts {
+                let (mi, mj) = (s.moved[i as usize], s.moved[j as usize]);
+                let in_i = (-(mi.x * n.x + mi.y * n.y)).max(0.0);
+                let in_j = (mj.x * n.x + mj.y * n.y).max(0.0);
+                let gap = gap.max(0.0);
+                let sum = in_i + in_j;
+                s.enemy_allow.push(if sum > 0.0 {
+                    (gap * in_i / sum, gap * in_j / sum)
+                } else {
+                    (0.5 * gap, 0.5 * gap)
+                });
+            }
+            // Repeated so a unit wedged between two enemies satisfies both.
+            for _ in 0..ENEMY_CLIP_PASSES {
+                for (&(i, j, n, _), &(ai, aj)) in s.enemy_contacts.iter().zip(&s.enemy_allow) {
+                    for (a, n, allowed) in [(i as usize, n, ai), (j as usize, -n, aj)] {
+                        let inward = -(s.moved[a].x * n.x + s.moved[a].y * n.y);
+                        if inward > allowed {
+                            s.moved[a] += n * (inward - allowed);
+                        }
+                    }
+                }
+            }
+            for &(i, j, ..) in &s.enemy_contacts {
+                for a in [i as usize, j as usize] {
+                    s.disp[a] = s.positions[a] + s.moved[a] - s.now[a];
+                }
+            }
+        }
+
+        for i in 0..s.ids.len() {
+            let d = s.disp[i];
+            if d == Vector2::ZERO {
                 continue;
             }
-            let max_step = s.speeds[i] * DT * SEPARATION_MAX_FRAC.get();
-            let len = len2.sqrt();
-            if len > max_step {
-                d *= max_step / len;
-            }
+            let unit = self.units.get_mut(s.ids[i]).expect("dense id alive");
             // Anti-tunnel: a flock push is a raw position add with no path/LoS
             // guarantee, so it can shove a unit clean across a constrained edge —
             // wall_clamp only inspects the final position and would then amplify
@@ -2159,16 +2355,19 @@ impl Sim {
     ///   around its target instead of everyone converging on one point and
     ///   shoving. Stations are stored as a direction code, not a position, so
     ///   the ring is re-derived from the target's current position each tick
-    ///   and simply travels with it.
+    ///   and simply travels with it. A station counts as taken by every unit
+    ///   bound for it, so the swarm fills the far side too.
     /// - **Stop when there's nothing to gain.** In weapon range with elbow
     ///   room is a fine place to stand, and short walks stay short. Only a
     ///   unit that can't stop — in range but shoulder to shoulder with allies
     ///   — keeps walking, to its station, which is what spreads a swarm.
     /// - **Reserves.** Past a certain count the ring is full; the overflow
-    ///   parks a body behind the front rank rather than shoving into it, and
-    ///   re-scores on the repath cadence, so when a front-rank unit dies the
-    ///   ring simply reads free and a reserve walks in. No death events, no
-    ///   blocker ids, no retry timer.
+    ///   parks in shells behind the front rank rather than shoving into it,
+    ///   and re-scores on the repath cadence, so when a front-rank unit dies
+    ///   the ring simply reads free and a reserve walks in. No death events,
+    ///   no blocker ids, no retry timer.
+    /// - **Station keeping.** A shoved stationed unit eases back
+    ///   ([`STATION_KEEP_FRAC`]) instead of drifting into a neighbour's gap.
     /// - **Hysteresis on the station, not on the range.** Damage re-checks the
     ///   true range every tick, so the slack that keeps a jostled unit at its
     ///   post ([`FIRE_SLACK_STEPS`]) never quietly extends a weapon's reach —
@@ -2177,6 +2376,61 @@ impl Sim {
         let s = &mut self.step_scratch;
         s.combat_decisions.clear();
         s.slot_claims.clear();
+        s.target_of.clear();
+        s.crowd_edge.clear();
+        s.crowd_edge.resize(s.ids.len(), 0.0);
+        s.rivals_start.clear();
+        s.rivals_start.resize(s.ids.len() + 1, 0);
+        s.los.reset(s.ids.len());
+        for i in 0..s.ids.len() {
+            let id = s.ids[i];
+            let target = self.units.get(id).and_then(|u| {
+                let t = u.target?;
+                let k = s.ids.binary_search(&t).ok()?;
+                Some((u, t, k))
+            });
+            let Some((u, t, k)) = target else {
+                s.slot_claims.push((NO_SLOT, 0.0));
+                s.target_of.push(u32::MAX);
+                continue;
+            };
+            let claim_dist = match (u.chase_slot, self.units.get(t)) {
+                (NO_SLOT, _) | (_, None) => 0.0,
+                (code, Some(tu)) => {
+                    let rings = slot_rings(u.radius, tu.radius, u.attack_range);
+                    (s.positions[i] - slot_point(tu.pos, code, &rings)).length()
+                }
+            };
+            s.slot_claims.push((u.chase_slot, claim_dist));
+            s.target_of.push(k as u32);
+            s.rivals_start[k + 1] += 1;
+            // A unit stopped short out in the field isn't part of the crowd.
+            let d = (s.positions[i] - s.positions[k]).length();
+            if u.engaged && d <= reserve_reach(u.radius, s.radii[k], u.attack_range) + u.radius {
+                s.crowd_edge[k] = s.crowd_edge[k].max(d + u.radius);
+            }
+        }
+        if s.rivals_start.iter().all(|&c| c == 0) {
+            return; // nobody has a target
+        }
+        // Per-target rivals, so scoring reads only units that could contest.
+        for k in 0..s.ids.len() {
+            s.rivals_start[k + 1] += s.rivals_start[k];
+        }
+        s.rivals.clear();
+        s.rivals.resize(s.rivals_start[s.ids.len()] as usize, 0);
+        for i in 0..s.ids.len() {
+            let k = s.target_of[i];
+            if k != u32::MAX {
+                let at = &mut s.rivals_start[k as usize];
+                s.rivals[*at as usize] = i as u32;
+                *at += 1;
+            }
+        }
+        for k in (1..=s.ids.len()).rev() {
+            s.rivals_start[k] = s.rivals_start[k - 1];
+        }
+        s.rivals_start[0] = 0;
         s.leash_home.clear();
         let cdt = self.nav.navmesh();
         let fire_slack_steps = FIRE_SLACK_STEPS.get();
@@ -2204,6 +2458,7 @@ impl Sim {
                 let leash = (leash_radii * unit.radius).max(acq_mult * unit.attack_range);
                 if (unit.pos - post).length_squared() > leash * leash {
                     s.leash_home.push((id, post));
+                    s.slot_claims[i].0 = NO_SLOT;
                     continue;
                 }
             }
@@ -2211,7 +2466,7 @@ impl Sim {
             let surf = (delta.length() - unit.radius - target.radius).max(0.0);
             let step = unit.max_speed * DT;
             let in_range = surf <= unit.attack_range;
-            let (rings, n_rings) = slot_rings(unit.radius, target.radius, unit.attack_range);
+            let rings = slot_rings(unit.radius, target.radius, unit.attack_range);
             // Derived fresh each tick rather than stored: the station tracks
             // the target, so "am I standing on it" has to be re-asked whenever
             // the target moves. Only the outer (reserve) ring is out of weapon
@@ -2234,7 +2489,7 @@ impl Sim {
                 NO_SLOT => (false, false, surf),
                 code => {
                     let p = slot_point(target.pos, code, &rings);
-                    let d = rings[((code >> 5) as usize).min(MAX_RINGS - 1)];
+                    let d = rings.d[ring_of(code)];
                     let gap = (p - unit.pos).length();
                     (
                         gap <= arrive_tol,
@@ -2333,14 +2588,12 @@ impl Sim {
                     i,
                     unit.pos,
                     unit.radius,
-                    unit.attack_range,
                     target.pos,
-                    target.radius,
                     &rings,
-                    n_rings,
                     unit.chase_slot,
-                    target_id,
                     &s.slot_claims,
+                    rivals_of(&s.rivals_start, &s.rivals, s.target_of[i]),
+                    s.los.entry(s.target_of[i], &rings),
                 );
                 if picked != unit.chase_slot {
                     stationed = false;
@@ -2359,10 +2612,15 @@ impl Sim {
                     cadence,
                     best_gap: f32::MAX,
                     hold_ticks: station_wait,
+                    keep_at: (at_station && unit.chase_slot != NO_SLOT)
+                        .then(|| slot_point(target.pos, unit.chase_slot, &rings)),
                 });
-                s.slot_claims.push((target_id, unit.chase_slot));
                 continue;
             }
+            let outside = s.crowd_edge[s.target_of[i] as usize] + unit.radius;
+            // Re-scoring from afar is churn: the crowd will have changed by
+            // arrival, and every station lies the same way.
+            let near = delta.length() <= 2.0 * outside.max(rings.d[rings.len - 1]);
             let drift = target.pos - unit.chase_anchor;
             let far_drift = drift.length_squared() > chase_repath_dist * chase_repath_dist;
             // Every chaser walks to a station on the ring, not at the target
@@ -2378,7 +2636,12 @@ impl Sim {
                 // they mean nothing here. Fresh station, fresh yardstick.
                 best_gap = f32::MAX;
                 blocked_for = 0;
-            } else if tripped || cadence || far_drift || give_up_station || slot == NO_SLOT {
+            } else if tripped
+                || (cadence && near)
+                || far_drift
+                || give_up_station
+                || slot == NO_SLOT
+            {
                 slot = pick_slot(
                     cdt,
                     &self.grid,
@@ -2387,17 +2650,20 @@ impl Sim {
                     i,
                     unit.pos,
                     unit.radius,
-                    unit.attack_range,
                     target.pos,
-                    target.radius,
                     &rings,
-                    n_rings,
-                    slot,
-                    target_id,
+                    // Blocked: the held station failed, so no switch margin.
+                    if tripped { NO_SLOT } else { slot },
                     &s.slot_claims,
+                    rivals_of(&s.rivals_start, &s.rivals, s.target_of[i]),
+                    s.los.entry(s.target_of[i], &rings),
                 );
             }
-            s.slot_claims.push((target_id, slot));
+            let claim_dist = match slot {
+                NO_SLOT => 0.0,
+                code => (s.positions[i] - slot_point(target.pos, code, &rings)).length(),
+            };
+            s.slot_claims[i] = (slot, claim_dist);
             if tripped {
                 blocked_for = 0;
                 best_gap = f32::MAX; // fresh station, fresh yardstick
@@ -2418,6 +2684,7 @@ impl Sim {
                         cadence,
                         best_gap: f32::MAX,
                         hold_ticks: 0,
+                        keep_at: None,
                     });
                     continue;
                 }
@@ -2427,7 +2694,7 @@ impl Sim {
             // "arrived, near enough" test here would deadlock a unit that
             // stopped a body short of a station it is not in range from — it
             // would hold a position it cannot shoot from and never close.
-            let goal = slot_goal(unit.pos, target.pos, slot, &rings);
+            let goal = slot_goal(unit.pos, target.pos, slot, &rings, outside);
             // The cadence exists to refresh a path toward a target that has
             // *moved*; against a stationary one it would rebuild an identical
             // path forever, which costs an allocation every time.
@@ -2446,12 +2713,17 @@ impl Sim {
                 cadence,
                 best_gap,
                 hold_ticks: blocked_for,
+                keep_at: None,
             });
         }
+        let cdt = self.nav.navmesh();
         for i in 0..self.step_scratch.combat_decisions.len() {
             // Copied out, not borrowed: applying a decision needs `units`
             // mutably while `step_scratch` stays live for `damage`/`repath`.
             let d = self.step_scratch.combat_decisions[i];
+            let keep = d
+                .keep_at
+                .map_or(Vector2::ZERO, |at| self.keep_step(d.id, at));
             let Some(unit) = self.units.get_mut(d.id) else {
                 continue;
             };
@@ -2462,6 +2734,9 @@ impl Sim {
             if d.station {
                 unit.path.clear();
                 unit.path_i = 0;
+                if keep != Vector2::ZERO {
+                    unit.pos = clip_ray_to_walls(cdt, unit.pos, unit.pos + keep);
+                }
                 // The cooldown runs while stationed whether or not the shot
                 // lands, so a unit briefly jostled out of range comes back
                 // ready to fire instead of restarting its wind-up.
@@ -2473,6 +2748,13 @@ impl Sim {
                 } else {
                     unit.cooldown_left = unit.cooldown_left.saturating_sub(1);
                 }
+                // Keep the re-score cadence: it's how a reserve notices a
+                // freed station.
+                unit.chase_repath_in = if d.cadence {
+                    CHASE_REPATH_TICKS.get()
+                } else {
+                    unit.chase_repath_in.saturating_sub(1)
+                };
             } else if d.need_repath {
                 // Reuse the path buffer: a settled fight must not allocate.
                 unit.path.clear();
@@ -2487,6 +2769,74 @@ impl Sim {
                 unit.chase_repath_in -= 1;
             }
         }
+    }
+
+    /// Station-keeping step toward `at`, stopped short of closing on any
+    /// enemy. It runs after the flock's enemy clip, so it has to honour the
+    /// same rule itself, against live positions.
+    fn keep_step(&self, id: UnitId, at: Vector2) -> Vector2 {
+        let Some(u) = self.units.get(id) else {
+            return Vector2::ZERO;
+        };
+        let mut delta = at - u.pos;
+        let len = delta.length();
+        // Most stationed units are on station: skip the wall walk.
+        if len <= STATION_KEEP_EPS_FRAC * u.radius {
+            return Vector2::ZERO;
+        }
+        let step = u.max_speed * DT * STATION_KEEP_FRAC.get();
+        if len > step {
+            delta *= step / len;
+        }
+        let s = &self.step_scratch;
+        let Ok(i) = s.ids.binary_search(&id) else {
+            return delta;
+        };
+        if !s.near_enemy[i] {
+            return delta;
+        }
+        let (cx, cy) = self.grid.cell_coords(s.positions[i]);
+        // Clipping only shortens the step, so its starting length bounds the
+        // reach of every pass.
+        let reach = delta.length();
+        // Repeated so a unit wedged between two enemies satisfies both; a
+        // pass that clips nothing means every contact already holds.
+        for _ in 0..ENEMY_CLIP_PASSES {
+            let mut clipped = false;
+            for ny in cy.saturating_sub(1)..=(cy + 1).min(self.grid.rows - 1) {
+                for nx in cx.saturating_sub(1)..=(cx + 1).min(self.grid.cols - 1) {
+                    for &j in self.grid.cell_entries(nx, ny) {
+                        let j = j as usize;
+                        if s.teams[j] == u.team
+                            || relation_of(&self.relations, u.team, s.teams[j]) != Relation::Enemy
+                        {
+                            continue;
+                        }
+                        let Some(e) = self.units.get(s.ids[j]) else {
+                            continue;
+                        };
+                        let off = u.pos - e.pos;
+                        let d2 = off.x * off.x + off.y * off.y;
+                        let out_of_reach = u.radius + e.radius + reach;
+                        if d2 >= out_of_reach * out_of_reach || d2 <= 1e-12 {
+                            continue;
+                        }
+                        let dist = d2.sqrt();
+                        let n = off * (1.0 / dist);
+                        let allowed = (dist - u.radius - e.radius).max(0.0);
+                        let inward = -(delta.x * n.x + delta.y * n.y);
+                        if inward > allowed {
+                            delta += n * (inward - allowed);
+                            clipped = true;
+                        }
+                    }
+                }
+            }
+            if !clipped {
+                break;
+            }
+        }
+        delta
     }
 
     /// Walk the units that hit their leash this tick back to their posts.
@@ -3126,40 +3476,68 @@ fn route_onto_channel(
 
 // ── Approach slots ────────────────────────────────────────────────────────────
 
-/// Unit directions at 15° steps, as literal `(cos, sin)` pairs: the sim's
-/// determinism contract is f32 add/mul/div/sqrt only, so no trig may run at
-/// runtime. Exact axis values are written as literal zeroes rather than the
-/// 1e-16 residue a real cosine would return.
-const SLOT_DIRS: [(f32, f32); 24] = [
+/// Most stations on one ring: the direction index is the low five bits of a
+/// slot code.
+const MAX_RING_SLOTS: usize = 32;
+
+/// `(cos, sin)` of `pi / n`, half a station's turn on an `n`-station ring, for
+/// staggering alternate rings. Literals: the sim may not run trig. Entry 0 is
+/// unused.
+const HALF_STEP: [(f32, f32); MAX_RING_SLOTS + 1] = [
     (1.0, 0.0),
-    (COS15, SIN15),
-    (COS30, 0.5),
-    (SQRT_HALF, SQRT_HALF),
-    (0.5, COS30),
-    (SIN15, COS15),
-    (0.0, 1.0),
-    (-SIN15, COS15),
-    (-0.5, COS30),
-    (-SQRT_HALF, SQRT_HALF),
-    (-COS30, 0.5),
-    (-COS15, SIN15),
     (-1.0, 0.0),
-    (-COS15, -SIN15),
-    (-COS30, -0.5),
-    (-SQRT_HALF, -SQRT_HALF),
-    (-0.5, -COS30),
-    (-SIN15, -COS15),
-    (0.0, -1.0),
-    (SIN15, -COS15),
-    (0.5, -COS30),
-    (SQRT_HALF, -SQRT_HALF),
-    (COS30, -0.5),
-    (COS15, -SIN15),
+    (0.0, 1.0),
+    (0.5, 0.8660254),
+    (SQRT_HALF, SQRT_HALF),
+    (0.809017, 0.58778524),
+    (0.8660254, 0.5),
+    (0.90096885, 0.43388373),
+    (0.9238795, 0.38268343),
+    (0.9396926, 0.34202015),
+    (0.95105654, 0.309017),
+    (0.959493, 0.28173256),
+    (0.9659258, 0.25881904),
+    (0.97094184, 0.23931566),
+    (0.9749279, 0.22252093),
+    (0.9781476, 0.20791169),
+    (0.98078525, 0.19509032),
+    (0.9829731, 0.18374951),
+    (0.9848077, 0.17364818),
+    (0.9863613, 0.16459459),
+    (0.98768836, 0.15643446),
+    (0.9888308, 0.14904226),
+    (0.98982143, 0.14231484),
+    (0.99068594, 0.13616665),
+    (0.9914449, 0.13052619),
+    (0.9921147, 0.12533323),
+    (0.99270886, 0.12053668),
+    (0.99323833, 0.11609291),
+    (0.9937122, 0.11196448),
+    (0.99413794, 0.10811902),
+    (0.9945219, 0.104528464),
+    (0.99486935, 0.10116832),
+    (0.9951847, 0.09801714),
 ];
 
-const COS15: f32 = 0.9659258;
-const SIN15: f32 = 0.25881904;
-const COS30: f32 = 0.8660254;
+/// `RING_DIRS[n][j]`: direction `j` half-stations round an `n`-station ring.
+/// Const f32 rotation by [`HALF_STEP`], bit-identical to runtime.
+static RING_DIRS: [[(f32, f32); 2 * MAX_RING_SLOTS]; MAX_RING_SLOTS + 1] = {
+    let mut t = [[(0.0, 0.0); 2 * MAX_RING_SLOTS]; MAX_RING_SLOTS + 1];
+    let mut n = 1;
+    while n <= MAX_RING_SLOTS {
+        let (c, s) = HALF_STEP[n];
+        let mut v = (1.0f32, 0.0f32);
+        let mut j = 0;
+        while j < 2 * n {
+            t[n][j] = v;
+            v = (v.0 * c - v.1 * s, v.0 * s + v.1 * c);
+            j += 1;
+        }
+        n += 1;
+    }
+    t
+};
+
 const SQRT_HALF: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 /// τ, for the ring-circumference stride below (no runtime trig, so it's a
@@ -3173,11 +3551,25 @@ fn station_margin(r_self: f32, attack_range: f32) -> f32 {
     (SLOT_STANDOFF.get() * r_self).min(attack_range)
 }
 
-/// Most approach rings a unit will consider (the last is always the
-/// out-of-range reserve).
-const MAX_RINGS: usize = 4;
+/// Most in-range approach rings a unit will consider.
+const MAX_INNER_RINGS: usize = 3;
+/// Out-of-range reserve rings beyond them, where a big crowd's overflow waits.
+const RESERVE_RINGS: usize = 3;
+const MAX_RINGS: usize = MAX_INNER_RINGS + RESERVE_RINGS;
 
-/// Radii of the approach rings around a target, outermost first.
+/// The approach rings around a target, for one attacker shape.
+#[derive(Clone, Copy, PartialEq)]
+struct Rings {
+    /// Radius of each ring, centre to centre.
+    d: [f32; MAX_RINGS],
+    /// Stations on each ring.
+    n: [u8; MAX_RINGS],
+    len: usize,
+    /// Rings `..inner` are within weapon reach; the rest are reserves.
+    inner: usize,
+}
+
+/// The approach rings around a target.
 ///
 /// Ring 0 sits at `r_self + r_target + SLOT_STANDOFF * attack_range` — inside
 /// weapon range, which is the whole point; dropping either radius from the
@@ -3186,28 +3578,63 @@ const MAX_RINGS: usize = 4;
 /// still clear the target's own body, so a long-reach unit's whole in-range
 /// disc gets used instead of a single one-body-thick shell — with 24 attackers
 /// on one target, one ring leaves a third of them standing outside their own
-/// range doing nothing. The final entry is one body diameter *beyond* ring 0:
-/// the reserve ring, out of range by construction, where overflow waits.
-fn slot_rings(r_self: f32, r_target: f32, attack_range: f32) -> ([f32; MAX_RINGS], usize) {
-    let mut rings = [0.0; MAX_RINGS];
+/// range doing nothing. Then [`RESERVE_RINGS`] reserve rings a body diameter
+/// apart beyond ring 0, out of range, so overflow waits in shells instead of
+/// pressing on the front rank.
+///
+/// Stations sit a body diameter apart on every ring, so outer shells pack as
+/// tightly as inner ones.
+fn slot_rings(r_self: f32, r_target: f32, attack_range: f32) -> Rings {
+    let mut rings = Rings {
+        d: [0.0; MAX_RINGS],
+        n: [0; MAX_RINGS],
+        len: 0,
+        inner: 0,
+    };
     let outer = r_self + r_target + attack_range - station_margin(r_self, attack_range);
     let floor = r_self + r_target;
     let mut n = 0;
-    while n < MAX_RINGS - 1 {
+    while n < MAX_INNER_RINGS {
         let d = outer - 2.0 * r_self * n as f32;
         if d < floor {
             break;
         }
-        rings[n] = d;
+        rings.d[n] = d;
         n += 1;
     }
     if n == 0 {
         // Degenerate (zero radii): one ring at the standoff, whatever it is.
-        rings[0] = outer;
+        rings.d[0] = outer;
         n = 1;
     }
-    rings[n] = outer + 2.0 * r_self;
-    (rings, n + 1)
+    rings.inner = n;
+    for k in 0..RESERVE_RINGS {
+        rings.d[n + k] = outer + 2.0 * r_self * (k + 1) as f32;
+    }
+    rings.len = n + RESERVE_RINGS;
+    for k in 0..rings.len {
+        let fit = if r_self > 0.0 {
+            TAU * rings.d[k] / (2.0 * r_self)
+        } else {
+            MAX_RING_SLOTS as f32
+        };
+        rings.n[k] = (fit as usize).clamp(1, MAX_RING_SLOTS) as u8;
+    }
+    rings
+}
+
+/// Centre distance of the outermost reserve ring (see [`slot_rings`]).
+fn reserve_reach(r_self: f32, r_target: f32, attack_range: f32) -> f32 {
+    let outer = r_self + r_target + attack_range - station_margin(r_self, attack_range);
+    outer + 2.0 * r_self * RESERVE_RINGS as f32
+}
+
+/// The units attacking dense target `k`, from [`StepScratch::rivals`].
+fn rivals_of<'a>(start: &[u32], rivals: &'a [u32], k: u32) -> &'a [u32] {
+    match k {
+        u32::MAX => &[],
+        k => &rivals[start[k as usize] as usize..start[k as usize + 1] as usize],
+    }
 }
 
 /// Ring index of a slot code (`ring * 32 + direction index`), clamped so a
@@ -3216,24 +3643,37 @@ fn ring_of(code: u16) -> usize {
     ((code >> 5) as usize).min(MAX_RINGS - 1)
 }
 
+/// Dense index of a slot code, for per-station tallies.
+fn slot_index(code: u16) -> usize {
+    ring_of(code) * MAX_RING_SLOTS + (code & 31) as usize
+}
+
+/// Unit direction of a slot code: evenly around its ring, every other ring
+/// turned half a station so each shell nests in the gaps of the one inside.
+fn slot_dir(code: u16, rings: &Rings) -> Vector2 {
+    let ring = ring_of(code);
+    let n = rings.n[ring].max(1) as usize;
+    let (x, y) = RING_DIRS[n][2 * ((code & 31) as usize % n) + ring % 2];
+    Vector2::new(x, y)
+}
+
 /// World point of a slot code (`ring * 32 + direction index`).
-fn slot_point(target_pos: Vector2, code: u16, rings: &[f32; MAX_RINGS]) -> Vector2 {
-    let (c, s) = SLOT_DIRS[(code & 31) as usize];
-    let d = rings[ring_of(code)];
-    Vector2::new(target_pos.x + c * d, target_pos.y + s * d)
+fn slot_point(target_pos: Vector2, code: u16, rings: &Rings) -> Vector2 {
+    target_pos + slot_dir(code, rings) * rings.d[ring_of(code)]
 }
 
 /// Where a unit holding slot `code` should walk next: its station, or the arc
 /// step toward it when the target's own body sits on the direct chord (see
 /// [`orbit_step`]). [`NO_SLOT`] walks at the target itself.
-fn slot_goal(pos: Vector2, target_pos: Vector2, code: u16, rings: &[f32; MAX_RINGS]) -> Vector2 {
+fn slot_goal(pos: Vector2, target_pos: Vector2, code: u16, rings: &Rings, outside: f32) -> Vector2 {
     match code {
         NO_SLOT => target_pos,
         code => orbit_step(
             pos,
             target_pos,
             slot_point(target_pos, code, rings),
-            rings[ring_of(code)],
+            rings.d[ring_of(code)],
+            outside,
         ),
     }
 }
@@ -3278,17 +3718,10 @@ fn occupancy(
 /// Pick the approach slot a blocked attacker should walk to, as a slot code
 /// (or [`NO_SLOT`] to keep walking at the target).
 ///
-/// World-anchored rings of sampled directions, scored by ally occupancy at the
-/// point, plus the arc the unit would have to walk to get there, plus a
-/// per-ring penalty; lowest wins, ties by table index. No assignment and no
-/// capacity — beyond a within-tick claim so units deciding together don't all
-/// read the same station as free, two units may pick the same one and
-/// separation sorts it out.
-///
-/// The sampling stride comes from the ring circumference, never from the table
-/// directly: 24 evenly spaced directions around a small ring sit well under a
-/// body diameter apart, so every candidate reads as occupied by the units on
-/// its neighbouring slots and nobody ever moves in.
+/// Every station (see [`slot_rings`]) scored by ally occupancy, rival claims,
+/// the arc to walk there and a per-ring penalty; lowest wins. No assignment
+/// and no capacity: two units may pick the same station and separation sorts
+/// it out.
 ///
 /// A candidate needs clear line of sight from the *target* (the slot has to be
 /// somewhere the unit could actually stand and shoot from); with a target in a
@@ -3303,25 +3736,27 @@ fn pick_slot(
     self_i: usize,
     pos: Vector2,
     r_self: f32,
-    attack_range: f32,
     target_pos: Vector2,
-    r_target: f32,
-    rings: &[f32; MAX_RINGS],
-    n_rings: usize,
+    rings: &Rings,
     current: u16,
-    target_id: UnitId,
-    claims: &[(UnitId, u16)],
+    claims: &[(u16, f32)],
+    rivals: &[u32],
+    los: &mut [u8; MAX_RING_SLOTS * MAX_RINGS],
 ) -> u16 {
-    // Stations already claimed against this target on this tick. Bodies not
-    // yet standing there are invisible to the occupancy scan, so without this
-    // every unit deciding on the same tick reads the same station as free and
-    // they queue behind each other instead of fanning out. Counted once per
-    // call, not once per candidate.
-    let mut claimed = [0u8; 128];
-    for &(t, code) in claims {
-        if t == target_id && code != NO_SLOT {
-            let k = (code & 127) as usize;
-            claimed[k] = claimed[k].saturating_add(1);
+    // Occupancy can't see bodies still walking in, so without claims the
+    // whole swarm heads for the near side. A claim counts only if its holder
+    // is at most a body further off, so nobody holds a station from afar.
+    let mut claimed = [0u8; MAX_RING_SLOTS * MAX_RINGS];
+    let here = positions[self_i];
+    for &k in rivals {
+        let k = k as usize;
+        let (code, theirs) = claims[k];
+        if k != self_i && code != NO_SLOT {
+            let idx = slot_index(code);
+            let mine = (here - slot_point(target_pos, code, rings)).length();
+            if theirs <= mine + r_self {
+                claimed[idx] = claimed[idx].saturating_add(1);
+            }
         }
     }
     // The unit's own bearing *as seen from the target*: the arc from here to a
@@ -3333,51 +3768,76 @@ fn pick_slot(
     let turn_cost = SLOT_TURN_COST.get();
     let outer_penalty = SLOT_OUTER_PENALTY.get();
     let inner_penalty = SLOT_INNER_PENALTY.get();
-    // `cutoff` is the best score so far: a candidate that can't beat it is
-    // dropped before the line-of-sight walk, which is two face locations plus
-    // a walk across the triangulation where everything above it is one 3×3
-    // grid sweep. Skipping it changes no outcome — the candidate had already
-    // lost — but it takes the mesh walk off most of the ~32 candidates a call
-    // scores. `None` forces the full evaluation, for the held station below.
-    let cost_of = |code: u16, cutoff: Option<f32>| -> Option<f32> {
-        let p = slot_point(target_pos, code, rings);
-        let mut cost = occupancy(grid, positions, radii, self_i, p, r_self)
-            + claimed[(code & 127) as usize] as f32;
-        let (dx, dy) = SLOT_DIRS[(code & 31) as usize];
-        cost += turn_cost * (1.0 - (bearing.x * dx + bearing.y * dy));
-        // Prefer standing at reach: each ring inward is a step closer than
-        // this unit needs to be, and the last ring can't shoot at all.
+    // Everything but occupancy: cheap, and a floor on the full cost, since
+    // occupancy is never negative.
+    let base_of = |code: u16| -> f32 {
         let ring = ring_of(code);
-        let reserve = rings[ring] - r_self - r_target > attack_range;
-        cost += if reserve {
-            outer_penalty
+        let dir = slot_dir(code, rings);
+        let mut cost = claimed[slot_index(code)] as f32
+            + turn_cost * (1.0 - (bearing.x * dir.x + bearing.y * dir.y));
+        // Prefer standing at reach: each ring inward is a step closer than
+        // this unit needs to be, a reserve ring can't shoot at all, and each
+        // reserve ring outward is a step further to walk in when room opens.
+        cost += if ring >= rings.inner {
+            outer_penalty + (ring - rings.inner) as f32 * inner_penalty
         } else {
             ring as f32 * inner_penalty
         };
+        cost
+    };
+    // Line of sight only for what still beats `cutoff`: it's a mesh walk.
+    // `None` forces the full evaluation, for the held station below.
+    let mut cost_of = |code: u16, base: f32, cutoff: Option<f32>| -> Option<f32> {
+        let p = slot_point(target_pos, code, rings);
+        let cost = base + occupancy(grid, positions, radii, self_i, p, r_self);
         if cutoff.is_some_and(|bc| cost >= bc) {
             return None;
         }
-        if !clear_los(cdt, target_pos, p, r_self) {
+        let seen = &mut los[slot_index(code)];
+        if *seen == 0 {
+            *seen = if clear_los(cdt, target_pos, p, r_self) {
+                1
+            } else {
+                2
+            };
+        }
+        if *seen == 2 {
             return None;
         }
         Some(cost)
     };
 
-    let mut best: Option<(f32, u16)> = None;
-    for (ring, &d) in rings.iter().enumerate().take(n_rings) {
-        if d <= 0.0 {
+    // Cheapest floor first, so the search usually stops within a few of up
+    // to ~200 stations.
+    let mut cands = [(0.0f32, 0u16); MAX_RINGS * MAX_RING_SLOTS];
+    let mut n_cands = 0;
+    // Outer reserve rings only while the inner ones can't hold every rival:
+    // otherwise they're just more line-of-sight walks.
+    let mut room = 0;
+    for ring in 0..rings.len {
+        if ring > rings.inner && room >= rivals.len() {
+            break;
+        }
+        room += rings.n[ring] as usize;
+        if rings.d[ring] <= 0.0 {
             continue;
         }
-        // Slots at least a body diameter apart along the ring.
-        let stride = (SLOT_DIRS.len() as f32 * 2.0 * r_self / (TAU * d)).ceil() as usize;
-        let stride = stride.clamp(1, SLOT_DIRS.len());
-        let mut k = 0;
-        while k < SLOT_DIRS.len() {
-            let code = (ring as u16) * 32 + k as u16;
-            if let Some(cost) = cost_of(code, best.map(|(bc, _)| bc)) {
-                best = Some((cost, code));
-            }
-            k += stride;
+        for k in 0..rings.n[ring] as u16 {
+            let code = ring as u16 * MAX_RING_SLOTS as u16 + k;
+            cands[n_cands] = (base_of(code), code);
+            n_cands += 1;
+        }
+    }
+    let cands = &mut cands[..n_cands];
+    cands.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut best: Option<(f32, u16)> = None;
+    for &(base, code) in cands.iter() {
+        let cutoff = best.map(|(bc, _)| bc);
+        if cutoff.is_some_and(|bc| base >= bc) {
+            break;
+        }
+        if let Some(cost) = cost_of(code, base, cutoff) {
+            best = Some((cost, code));
         }
     }
     let Some((best_cost, best_code)) = best else {
@@ -3386,7 +3846,7 @@ fn pick_slot(
     // Switch margin: re-scoring on the repath cadence must not turn the goal
     // itself into a stutter source.
     if current != NO_SLOT
-        && let Some(held) = cost_of(current, None)
+        && let Some(held) = cost_of(current, base_of(current), None)
         && best_cost > held - SLOT_SWITCH_MARGIN.get()
     {
         return current;
@@ -3400,16 +3860,26 @@ fn pick_slot(
 /// line: the target's own body sits on the chord, so a unit aimed straight at
 /// it grinds into the target and stays there (paths are computed against
 /// walls, not bodies). So a unit more than 45° of bearing away from its
-/// station walks the ring instead — one 45° arc step at a time, re-derived
-/// every repath, which reads as circling the target rather than shoving
-/// through it.
+/// station circles instead: one 45° arc step at a time, re-derived every
+/// repath, which reads as circling the target rather than shoving through it.
+///
+/// It circles at its own distance, clamped between `ring` and `outside` (the
+/// stationed crowd's edge): lower ploughs through the crowd, higher is the
+/// long way round.
 ///
 /// 45° is the widest step whose chord still clears both bodies: the chord of a
 /// `d` ring subtends `d * cos(22.5°)` ≈ `0.92 d` at closest approach, and the
 /// ring itself starts at `r_self + r_target`. No trig at runtime — a 45°
 /// rotation is a fixed matrix built from [`SQRT_HALF`].
-fn orbit_step(pos: Vector2, target_pos: Vector2, slot_pos: Vector2, ring: f32) -> Vector2 {
-    let from = norm(pos - target_pos);
+fn orbit_step(
+    pos: Vector2,
+    target_pos: Vector2,
+    slot_pos: Vector2,
+    ring: f32,
+    outside: f32,
+) -> Vector2 {
+    let offset = pos - target_pos;
+    let from = norm(offset);
     let to = norm(slot_pos - target_pos);
     if from == Vector2::ZERO || to == Vector2::ZERO {
         return slot_pos;
@@ -3428,7 +3898,7 @@ fn orbit_step(pos: Vector2, target_pos: Vector2, slot_pos: Vector2, ring: f32) -
         from.x * SQRT_HALF - from.y * sin,
         from.x * sin + from.y * SQRT_HALF,
     );
-    target_pos + stepped * ring
+    target_pos + stepped * ring.max(offset.length().min(outside))
 }
 
 /// Reset everything about one engagement: the post to return to, whose choice
@@ -4127,9 +4597,13 @@ mod tests {
                 let mut cmds = Vec::new();
                 if t == 250 {
                     // Kill the front rank: the survivors must re-slot and
-                    // close, which is the refill path.
+                    // close, which is the refill path. Engaged *and* in
+                    // reach: reserves are engaged too.
+                    let def_pos = unit(&sim, defender).pos;
                     for &id in &attackers {
-                        if sim.units().get(id).is_some_and(|u| u.engaged) {
+                        if sim.units().get(id).is_some_and(|u| {
+                            u.engaged && dist(u.pos, def_pos) - 10.0 <= u.attack_range
+                        }) {
                             cmds.push(Command::Damage {
                                 unit: id,
                                 amount: 1.0e9,
@@ -5656,13 +6130,25 @@ mod tests {
     }
 
     #[test]
-    fn test_mixed_teams_do_not_perturb_movement() {
+    fn test_allied_teams_do_not_perturb_movement() {
         // Same movement scenario, once with every unit on team 0 and once
-        // split across four teams: final positions must match exactly. Not a
+        // split across four mutually allied teams: final positions must match
+        // exactly, since movement reads the relation, never the team. Not a
         // `state_hash` comparison — team is itself hashed, so that would
         // trivially differ; this compares the movement outcome instead.
         let run = |teams: [u32; 4]| -> Vec<Vector2> {
             let mut sim = rooms_sim(3, 3, 9);
+            let mut alliances = Vec::new();
+            for a in 0..4 {
+                for b in a + 1..4 {
+                    alliances.push(Command::SetRelation {
+                        team_a: a,
+                        team_b: b,
+                        relation: Relation::Ally,
+                    });
+                }
+            }
+            sim.step(&alliances);
             let mut ids = Vec::new();
             for (i, &team) in teams.iter().enumerate() {
                 ids.push(spawn_stats(
@@ -6389,14 +6875,15 @@ mod tests {
                 if u.engaged {
                     firing += 1;
                     let a = u.pos - dp;
-                    let mut sector = if a.y < 0.0 { 4 } else { 0 };
-                    if a.x.abs() < a.y.abs() {
-                        sector += 2;
+                    // Ring stations sit on the compass axes, so a unit on one
+                    // counts for both sides rather than for whichever the
+                    // sign of a 1e-6 offset picks.
+                    let bearing = a.y.atan2(a.x);
+                    for off in [-1e-3, 1e-3] {
+                        let eighth = (bearing + off).rem_euclid(std::f32::consts::TAU)
+                            / (std::f32::consts::TAU / 8.0);
+                        sectors[eighth as usize % 8] = true;
                     }
-                    if (a.x < 0.0) != (a.y < 0.0) {
-                        sector += 1;
-                    }
-                    sectors[sector] = true;
                 }
             }
             min_firing = min_firing.min(firing);
@@ -6478,6 +6965,132 @@ mod tests {
             s.min_surf > -5.0,
             "attacker centre inside the defender's radius: {s:?}"
         );
+    }
+
+    #[test]
+    fn test_swarm_never_shoves_a_mobile_defender() {
+        // The speed-0 case above holds trivially; this defender can move.
+        let mut sim = arena_sim(600.0, 600.0, 7);
+        let defender = spawn_stats(&mut sim, DEF, 5.0, 10.0, 1, 1.0e6, 0.0, 0.0, 1);
+        let attackers: Vec<UnitId> = (0..12)
+            .map(|i| {
+                let (col, row) = ((i / 4) as f32, (i % 4) as f32);
+                let pos = v(280.0 - col * 12.0, DEF.y - 18.0 + row * 12.0);
+                spawn_stats(&mut sim, pos, 5.0, 30.0, 0, 1.0e6, 1.0, 2.0, 1)
+            })
+            .collect();
+        sim.step(&[Command::Attack {
+            units: attackers,
+            target: defender,
+        }]);
+        for t in 0..500 {
+            sim.step(&[]);
+            assert_eq!(unit(&sim, defender).pos, DEF, "defender shoved by tick {t}");
+        }
+    }
+
+    #[test]
+    fn test_crowd_cannot_push_through_an_enemy_wall_off() {
+        // Three enemy bodies plug the only gap in a wall; a crowd walking
+        // through must neither move them nor get past.
+        let (pts, cons) = thin_wall_map(31.0);
+        let mut sim = Sim::new(pts, &cons, 3);
+        let plug: Vec<UnitId> = [5.2, 15.5, 25.8]
+            .iter()
+            .map(|&y| spawn_stats(&mut sim, v(151.5, y), 5.0, 10.0, 1, 1.0e6, 0.0, 0.0, 1))
+            .collect();
+        let crowd: Vec<UnitId> = (0..12)
+            .map(|i| {
+                let pos = v(60.0 + (i % 4) as f32 * 12.0, 40.0 + (i / 4) as f32 * 12.0);
+                spawn_stats(&mut sim, pos, 5.0, 30.0, 0, 1.0e6, 0.0, 0.0, 1)
+            })
+            .collect();
+        let held: Vec<Vector2> = plug.iter().map(|&id| unit(&sim, id).pos).collect();
+        sim.step(&[Command::Move {
+            units: crowd.clone(),
+            goal: v(180.0, 100.0),
+        }]);
+        for t in 0..400 {
+            sim.step(&[]);
+            for (&id, &at) in plug.iter().zip(&held) {
+                assert_eq!(unit(&sim, id).pos, at, "plug shoved by tick {t}");
+            }
+        }
+        for &id in &crowd {
+            assert!(unit(&sim, id).pos.x < 150.0, "a unit got past the wall-off");
+        }
+    }
+
+    #[test]
+    fn test_station_keeping_never_shoves_a_bystander_enemy() {
+        // A stationed attacker knocked off its station, still within its
+        // holding slack, with an idle enemy between it and the station.
+        // Station keeping moves it after the flock's enemy clip, so it must
+        // not walk into that enemy and shove it.
+        let mut sim = arena_sim(600.0, 600.0, 7);
+        let defender = spawn_stats(&mut sim, DEF, 5.0, 0.0, 1, 1.0e6, 0.0, 0.0, 1);
+        let a = spawn_stats(&mut sim, v(300.0, DEF.y), 5.0, 30.0, 0, 1.0e6, 1.0, 2.0, 1);
+        sim.step(&[Command::Attack {
+            units: vec![a],
+            target: defender,
+        }]);
+        step_n(&mut sim, 200);
+        let u = unit(&sim, a);
+        assert!(
+            u.engaged && u.chase_slot != NO_SLOT,
+            "attacker never stationed"
+        );
+        let rings = slot_rings(u.radius, 5.0, u.attack_range);
+        let station = slot_point(DEF, u.chase_slot, &rings);
+        let out = norm(station - DEF);
+        let side = Vector2::new(-out.y, out.x);
+        sim.units.get_mut(a).expect("alive").pos = station + side * 4.0;
+        let bystander = spawn_stats(
+            &mut sim,
+            station - side * 6.5,
+            5.0,
+            10.0,
+            1,
+            1.0e6,
+            0.0,
+            0.0,
+            1,
+        );
+        let held = unit(&sim, bystander).pos;
+        for t in 0..60 {
+            sim.step(&[]);
+            assert_eq!(
+                unit(&sim, bystander).pos,
+                held,
+                "bystander shoved by tick {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_head_on_enemies_never_overlap() {
+        // Two enemies marching straight at each other from apart. Each may
+        // close by at most the starting gap, which lets the pair close by
+        // twice it; together they must not end up overlapping.
+        let mut sim = arena_sim(600.0, 600.0, 7);
+        let a = spawn_stats(&mut sim, v(200.0, 300.0), 5.0, 30.0, 0, 1.0e6, 0.0, 0.0, 1);
+        let b = spawn_stats(&mut sim, v(230.5, 300.0), 5.0, 30.0, 1, 1.0e6, 0.0, 0.0, 1);
+        sim.step(&[
+            Command::Move {
+                units: vec![a],
+                goal: v(500.0, 300.0),
+            },
+            Command::Move {
+                units: vec![b],
+                goal: v(50.0, 300.0),
+            },
+        ]);
+        for t in 0..60 {
+            sim.step(&[]);
+            let (ua, ub) = (unit(&sim, a), unit(&sim, b));
+            let gap = dist(ua.pos, ub.pos) - ua.radius - ub.radius;
+            assert!(gap > -1e-3, "enemies overlap by {} at tick {t}", -gap);
+        }
     }
 
     /// Step 3, slot spacing: with more attackers than the inner ring holds,
@@ -6595,12 +7208,18 @@ mod tests {
     /// timer — and a permanent concede latch fails this outright.
     #[test]
     fn test_ring_refills_after_front_rank_dies() {
-        let (mut sim, attackers, _) = blob_fight(12, false);
+        let (mut sim, attackers, defender) = blob_fight(12, false);
+        // Engaged *and* in reach: reserves are engaged too.
+        let firing = |sim: &Sim, id: UnitId| {
+            sim.units().get(id).is_some_and(|u| {
+                u.engaged && dist(u.pos, unit(sim, defender).pos) - 10.0 <= u.attack_range
+            })
+        };
         step_n(&mut sim, 300);
         let front: Vec<UnitId> = attackers
             .iter()
             .copied()
-            .filter(|&id| unit(&sim, id).engaged)
+            .filter(|&id| firing(&sim, id))
             .collect();
         assert!(front.len() >= 5, "front rank never formed: {}", front.len());
         let kill: Vec<Command> = front
@@ -6616,13 +7235,10 @@ mod tests {
             "front rank must be dead"
         );
         step_n(&mut sim, 120);
-        let firing = attackers
-            .iter()
-            .filter(|&&id| sim.units().get(id).is_some_and(|u| u.engaged))
-            .count();
+        let refilled = attackers.iter().filter(|&&id| firing(&sim, id)).count();
         assert!(
-            firing >= 4,
-            "survivors never closed onto the freed ring: {firing} firing"
+            refilled >= 4,
+            "survivors never closed onto the freed ring: {refilled} firing"
         );
     }
 
@@ -7070,8 +7686,10 @@ mod tests {
             assert!(!u.engaged, "engaged must be cleared");
             assert_eq!(u.chase_slot, NO_SLOT, "slot must be released");
             assert_eq!(u.hold_ticks, 0, "block counter must be cleared");
+            // A body looser than usual: the march resumes from reserve
+            // shells, not a packed blob.
             assert!(
-                dist(u.pos, goal) < u.arrival_r + 2.0 * u.radius,
+                u.parked && dist(u.pos, goal) < u.arrival_r + 3.0 * u.radius,
                 "must resume and reach the march goal"
             );
         }

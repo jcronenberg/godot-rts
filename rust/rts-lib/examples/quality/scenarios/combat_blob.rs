@@ -15,10 +15,15 @@
 //! `first_shot_p95` is anchored against the *travel* floor, not zero: the
 //! farthest attacker is 209 units out at speed 10, so nothing beats ~630
 //! ticks. That makes it read as queuing delay rather than as a restatement of
-//! how far away the block spawned.
+//! how far away the block spawned. With every body immortal only the ring
+//! (~6) ever fires, so it sits on the bad anchor.
+//!
+//! `defender_drift` must stay 0: enemies may block but never push.
+
+use std::f32::consts::TAU;
 
 use godot::prelude::Vector2;
-use rts_lib::sim::{Command, Sim};
+use rts_lib::sim::{Command, Sim, UnitId};
 
 use crate::harness::{Ctx, Reading, ScenarioSpec, metric as m};
 use crate::maps::{box_map, v};
@@ -39,6 +44,8 @@ const DEFENDER: Vector2 = Vector2::new(300.0, 200.0);
 /// Block origin, 8 wide at a [`PITCH`] that clears `2 * RADIUS`.
 const BLOCK: Vector2 = Vector2::new(100.0, 140.0);
 const PITCH: f32 = 12.0;
+/// Widest bearing gap in the ring that still counts as surrounded.
+const SURROUND_GAP: f32 = TAU / 4.0;
 
 fn run(ctx: &Ctx) -> Vec<Reading> {
     let (points, constraints) = box_map(400.0, 400.0);
@@ -84,13 +91,37 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
     if ctx.trace {
         run.record_trace(SPEC.name);
     }
-    for _ in 0..TICKS {
+    let (mut contact, mut surrounded) = (None, None);
+    let (mut lean_sum, mut lean_n) = (0.0f64, 0u32);
+    for k in 0..TICKS {
         run.step(&[]);
+        if k >= TICKS / 2 {
+            lean_sum += lean(&run.sim, defender, attackers) as f64;
+            lean_n += 1;
+        }
+        if surrounded.is_none()
+            && let Some(widest) = widest_gap(&run.sim, defender, attackers)
+        {
+            contact.get_or_insert(run.sim.tick());
+            if widest <= SURROUND_GAP {
+                surrounded = Some(run.sim.tick());
+            }
+        }
     }
     if ctx.trace {
         run.write_trace(&ctx.out_dir);
     }
     let s = run.stats();
+    // Never closing scores as the whole run.
+    let surround = match (contact, surrounded) {
+        (Some(a), Some(b)) => (b - a) as f64,
+        _ => TICKS as f64,
+    };
+    let drift = run
+        .sim
+        .units()
+        .get(defender)
+        .map_or(f64::INFINITY, |u| (u.pos - DEFENDER).length() as f64);
 
     //                          name              unit         good    bad  weight
     vec![
@@ -102,8 +133,49 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         m("jitter", "rad/tick", 0.10, 1.20, 1.0).at(s.jitter),
         m("push_ally", "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
         m("push_enemy", "radii/tick", 0.00, 0.00, 0.0).at(s.push_enemy),
+        m("defender_drift", "units", 0.00, 10.00, 2.0).at(drift),
+        m("surround", "ticks", 150.00, 700.00, 2.0).at(surround),
+        m("lean", "radii", 0.00, 4.00, 2.0).at(lean_sum / lean_n.max(1) as f64),
     ]
     .into_iter()
     .chain(super::overlap_readings(super::Crowding::Crush, &s))
     .collect()
+}
+
+/// Widest bearing gap between attackers in reach of `defender`, if any.
+fn widest_gap(sim: &Sim, defender: UnitId, attackers: &[UnitId]) -> Option<f32> {
+    let d = sim.units().get(defender)?;
+    let mut bearings: Vec<f32> = attackers
+        .iter()
+        .filter_map(|&id| sim.units().get(id))
+        .filter(|u| (u.pos - d.pos).length() - u.radius - d.radius <= u.attack_range)
+        .map(|u| {
+            let o = u.pos - d.pos;
+            o.y.atan2(o.x)
+        })
+        .collect();
+    bearings.sort_by(f32::total_cmp);
+    let wrap = bearings.first()? + TAU - bearings.last()?;
+    Some(
+        bearings
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .fold(wrap, f32::max),
+    )
+}
+
+/// Attacker centroid's offset from the defender, in radii: 0 for an even wrap.
+fn lean(sim: &Sim, defender: UnitId, attackers: &[UnitId]) -> f32 {
+    let Some(d) = sim.units().get(defender) else {
+        return 0.0;
+    };
+    let (mut sum, mut n) = (Vector2::ZERO, 0);
+    for u in attackers.iter().filter_map(|&id| sim.units().get(id)) {
+        sum += u.pos - d.pos;
+        n += 1;
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    (sum / n as f32).length() / RADIUS
 }
