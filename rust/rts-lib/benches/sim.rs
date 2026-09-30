@@ -65,14 +65,24 @@ const COMBAT_DAMAGE: f32 = 5.0;
 const COMBAT_RANGE: f32 = 8.0;
 const COMBAT_COOLDOWN: u32 = 10;
 
-/// `n` units spread over the rooms map like `marching_sim`, alternating team
-/// 0/1, armed but not yet ordered. Base fixture for the attack-move benches.
+/// Room column and row of unit `i` in `two_team_sim`, and its team: team 0
+/// fills the left half of the rooms, team 1 the right, with an empty column
+/// between them so neither side starts within acquisition range of the other.
+fn two_team_room(i: usize) -> (usize, usize, u32) {
+    let (rx, ry) = (i % SIDE, (i / SIDE) % SIDE);
+    let team = (rx >= SIDE / 2) as u32;
+    (rx + team as usize, ry, team)
+}
+
+/// `n` units spread over the rooms map like `marching_sim`, split into two
+/// teams by `two_team_room`, armed but not yet ordered. Base fixture for the
+/// attack-move benches.
 fn two_team_sim(n: usize) -> Sim {
-    let (points, constraints) = rooms_map(SIDE, SIDE);
+    let (points, constraints) = rooms_map(SIDE + 1, SIDE);
     let mut sim = Sim::new(points, &constraints, 0x7EA3);
     let spawns: Vec<Command> = (0..n)
         .map(|i| {
-            let (rx, ry) = (i % SIDE, (i / SIDE) % SIDE);
+            let (rx, ry, team) = two_team_room(i);
             let k = (i / (SIDE * SIDE)) as f32;
             Command::Spawn {
                 pos: Vector2::new(
@@ -81,7 +91,7 @@ fn two_team_sim(n: usize) -> Sim {
                 ),
                 radius: RADIUS,
                 max_speed: SPEED,
-                team: (i % 2) as u32,
+                team,
                 max_health: f32::MAX,
                 damage: COMBAT_DAMAGE,
                 attack_range: COMBAT_RANGE,
@@ -93,20 +103,22 @@ fn two_team_sim(n: usize) -> Sim {
     sim
 }
 
-/// `two_team_sim` with every unit attack-moving to the opposite corner,
-/// scattered widely enough that acquisition finds nothing — isolates the
-/// acquisition scan every unit pays every tick, fighting or not.
+/// `two_team_sim` with every unit attack-moving to the opposite corner of its
+/// own team's half, so the teams never meet and acquisition finds nothing:
+/// isolates the scan every unit pays every tick, fighting or not.
 fn combat_idle_sim(n: usize) -> Sim {
     let mut sim = two_team_sim(n);
     let moves: Vec<Command> = unit_ids(&sim)
         .into_iter()
         .enumerate()
         .map(|(i, id)| {
-            let (rx, ry) = (i % SIDE, (i / SIDE) % SIDE);
+            let (rx, ry, team) = two_team_room(i);
+            let first = team as usize * (SIDE / 2 + 1);
+            let last = first + SIDE / 2 - 1;
             Command::AttackMove {
                 units: vec![id],
                 goal: Vector2::new(
-                    (SIDE - 1 - rx) as f32 * ROOM_SIZE + 50.0,
+                    (first + last - rx) as f32 * ROOM_SIZE + 50.0,
                     (SIDE - 1 - ry) as f32 * ROOM_SIZE + 50.0,
                 ),
             }
