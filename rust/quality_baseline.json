@@ -1,8 +1,8 @@
 {
   "format": 1,
-  "git_sha": "b33e537",
+  "git_sha": "7477f62",
   "git_dirty": true,
-  "anchors": "5331c73cbb87cffd",
+  "anchors": "6e3097e1c3981128",
   "tuning": {},
   "scenarios": [
     {
@@ -1461,7 +1461,177 @@
           "worst": 0.8435897435897436
         }
       ]
+    },
+    {
+      "name": "skirmish_2x36",
+      "score": 50.74014889766895,
+      "variant_scores": [
+        53.015892836975965,
+        51.783659429291895,
+        52.23066853528235,
+        46.78630328714167,
+        39.80969372343136,
+        53.799912073212795,
+        50.872174181923484,
+        52.522168878262896,
+        53.495038378992525,
+        52.3994813784065,
+        55.66099539672328,
+        46.50579867238282
+      ],
+      "metrics": [
+        {
+          "name": "fire_efficiency",
+          "unit": "frac",
+          "value": 0.4754609328956185,
+          "points": 55.09218657912371,
+          "weight": 3.0,
+          "good": 0.7,
+          "bad": 0.2,
+          "worst": 0.394163051439594
+        },
+        {
+          "name": "bystanders",
+          "unit": "frac",
+          "value": 0.1428123025289268,
+          "points": 64.29692436776831,
+          "weight": 3.0,
+          "good": 0.0,
+          "bad": 0.4,
+          "worst": 0.22500618148850243
+        },
+        {
+          "name": "resolve",
+          "unit": "ticks",
+          "value": 787.6666666666666,
+          "points": 77.85416666666667,
+          "weight": 2.0,
+          "good": 400.0,
+          "bad": 2000.0,
+          "worst": 2400.0
+        },
+        {
+          "name": "ranged_contact",
+          "unit": "frac",
+          "value": 0.1807579723037002,
+          "points": 70.94267282139997,
+          "weight": 1.0,
+          "good": 0.05,
+          "bad": 0.5,
+          "worst": 0.2584394023242944
+        },
+        {
+          "name": "outcome_gap",
+          "unit": "hp frac",
+          "value": 0.19188034154164293,
+          "points": 61.62393169167141,
+          "weight": 1.0,
+          "good": 0.0,
+          "bad": 0.5,
+          "worst": 0.38846153020858765
+        },
+        {
+          "name": "jitter",
+          "unit": "rad/tick",
+          "value": 0.1901147623232062,
+          "points": 74.52458866850797,
+          "weight": 1.0,
+          "good": 0.05,
+          "bad": 0.6,
+          "worst": 0.22642575482071642
+        },
+        {
+          "name": "first_mover_edge",
+          "unit": "hp frac",
+          "value": -0.04818376161468526,
+          "points": 0.0,
+          "weight": 0.0,
+          "good": 0.0,
+          "bad": 0.0,
+          "worst": 0.38846153020858765
+        },
+        {
+          "name": "dead",
+          "unit": "frac",
+          "value": 0.8171296296296297,
+          "points": 0.0,
+          "weight": 0.0,
+          "good": 0.0,
+          "bad": 0.0,
+          "worst": 0.9305555555555556
+        },
+        {
+          "name": "slot_churn",
+          "unit": "per unit",
+          "value": 3.7870370370370376,
+          "points": 0.0,
+          "weight": 0.0,
+          "good": 0.0,
+          "bad": 0.0,
+          "worst": 4.888888888888889
+        },
+        {
+          "name": "push_enemy",
+          "unit": "radii/tick",
+          "value": 0.00004499003014384461,
+          "points": 0.0,
+          "weight": 0.0,
+          "good": 0.0,
+          "bad": 0.0,
+          "worst": 0.0001296751615355859
+        },
+        {
+          "name": "push_ally",
+          "unit": "radii/tick",
+          "value": 0.026717269700695417,
+          "points": 0.0,
+          "weight": 0.0,
+          "good": 0.0,
+          "bad": 0.0,
+          "worst": 0.03005475620732912
+        },
+        {
+          "name": "overlap_mean",
+          "unit": "radii",
+          "value": 0.2158289829912856,
+          "points": 28.057005669571463,
+          "weight": 2.0,
+          "good": 0.0,
+          "bad": 0.3,
+          "worst": 0.26798669433935496
+        },
+        {
+          "name": "overlap_p95",
+          "unit": "radii",
+          "value": 1.0330166916052501,
+          "points": 13.915275699562493,
+          "weight": 2.0,
+          "good": 0.0,
+          "bad": 1.2,
+          "worst": 1.094516396522522
+        },
+        {
+          "name": "overlap_max",
+          "unit": "radii",
+          "value": 1.931168834368388,
+          "points": 3.8239536462006742,
+          "weight": 1.0,
+          "good": 0.2,
+          "bad": 2.0,
+          "worst": 1.999993920326233
+        },
+        {
+          "name": "overlap_frac",
+          "unit": "frac",
+          "value": 0.48845202255700787,
+          "points": 53.84715552031497,
+          "weight": 1.0,
+          "good": 0.05,
+          "bad": 1.0,
+          "worst": 0.5993253959389729
+        }
+      ]
     }
   ],
-  "total": 73.36689139450584
+  "total": 71.10421714482216
 }

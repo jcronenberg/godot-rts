@@ -127,6 +127,31 @@ pub fn serpentine(lane: f32) -> (Vec<Vector2>, Vec<(u32, u32)>) {
     b.finish()
 }
 
+/// A `1000 x 600` field for two armies starting at opposite ends. Point-
+/// symmetric about its centre, so both sides fight over the same ground: a
+/// rock off each army's left flank short of the middle, leaving the centre
+/// open between them.
+///
+/// Nothing sits on the centre line itself. Mirrored armies deflect in mirror
+/// image, so an obstacle there sends them round opposite sides of it and past
+/// each other, whatever the sim does.
+pub fn battlefield() -> (Vec<Vector2>, Vec<(u32, u32)>) {
+    let (w, h) = (1000.0, 600.0);
+    let c = v(w * 0.5, h * 0.5);
+    let rock = [
+        v(390.0, 150.0),
+        v(450.0, 125.0),
+        v(490.0, 170.0),
+        v(465.0, 225.0),
+        v(400.0, 215.0),
+    ];
+    let mut b = MapBuilder::new();
+    b.rect(0.0, 0.0, w, h)
+        .poly(&rock)
+        .poly(&rock.map(|p| c * 2.0 - p));
+    b.finish()
+}
+
 /// A 200x200 box with a 3px-thick wall leaving a `gap`-wide slot to the
 /// bottom boundary.
 pub fn thin_wall(gap: f32) -> (Vec<Vector2>, Vec<(u32, u32)>) {

@@ -23,6 +23,7 @@ mod door_funnel;
 mod impassable_gap;
 mod obstacle_drop;
 mod queued_corridors;
+mod skirmish;
 mod solo_march;
 mod stutter_step;
 
@@ -38,6 +39,7 @@ pub const ALL: &[ScenarioSpec] = &[
     corridor_sizes::SPEC,
     combat_blob::SPEC,
     stutter_step::SPEC,
+    skirmish::SPEC,
 ];
 
 /// Variants per crowd scenario. Spawn jitter and small shifts are enough to
