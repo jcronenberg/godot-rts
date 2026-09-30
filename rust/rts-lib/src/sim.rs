@@ -121,9 +121,9 @@ pub static CHASE_REPATH_DIST: TunableF32 = TunableF32::new(15.0);
 /// weaving right at [`CHASE_REPATH_DIST`] still gets a fresh path
 /// periodically.
 pub static CHASE_REPATH_TICKS: TunableU8 = TunableU8::new(15);
-/// Station-hold hysteresis, in full path steps (`max_speed * DT`): a unit
-/// takes up its firing station at `attack_range` and only gives it up (and
-/// walks again) past `attack_range + this`.
+/// Stand hysteresis, in full path steps (`max_speed * DT`): a unit stops a
+/// little inside `attack_range` (see [`STOP_INSIDE_RADII`]) and only gives
+/// its stand up (and walks again) past `attack_range + this`.
 ///
 /// It has to clear the per-tick jitter it is there to absorb, which is
 /// [`SEPARATION_MAX_FRAC`] of a step — one step, the obvious reading of
@@ -132,53 +132,28 @@ pub static CHASE_REPATH_TICKS: TunableU8 = TunableU8::new(15);
 /// tick, so a unit shoved out of range holds its ground and its cooldown but
 /// lands no hits until it is back inside.
 pub static FIRE_SLACK_STEPS: TunableF32 = TunableF32::new(3.0);
-/// Fraction of a full step by which a chasing unit must close its surface gap
-/// to count as advancing. A fraction, not an absolute distance: a unit
-/// grinding through a crush still covers real ground every tick, so any
-/// absolute epsilon reads that as progress and the block signal never fires.
-pub static BLOCK_PROGRESS_FRAC: TunableF32 = TunableF32::new(0.25);
-/// Consecutive non-advancing chase ticks before a unit concedes the direct
-/// approach and re-goals onto a free approach slot.
-pub static BLOCK_TICKS: TunableU8 = TunableU8::new(10);
-/// How far *inside* weapon reach an approach station sits, in the unit's own
-/// radii: a station is at `r_self + r_target + attack_range - this * r_self`.
-///
-/// A margin in body units, deliberately not a fraction of `attack_range`: the
-/// margin exists to absorb the crowd shoving a stationed unit around, which is
-/// a body-scale effect and has nothing to do with how far the weapon reaches.
-/// As a fraction of range it vanishes exactly where it is needed most — a
-/// melee station would sit 0.4 units inside a reach of 2, so the first shove
-/// puts the front rank out of range and it walks back in, shove after shove,
-/// which is the stutter. Both radii stay in the formula: dropping them (the
-/// classic "ring attractor" bug) parks attackers just out of reach instead.
-pub static SLOT_STANDOFF: TunableF32 = TunableF32::new(0.5);
-/// Flat cost added to reserve-ring (out of weapon range) slot candidates, so
-/// a unit only waits in reserve when every in-range station is genuinely
-/// crowded. Well above a single body's worth of occupancy: standing where you
-/// can shoot beats standing somewhere roomy where you can't.
-pub static SLOT_OUTER_PENALTY: TunableF32 = TunableF32::new(2.0);
-/// Cost per ring stepped inward from weapon reach, so units fill the outermost
-/// ring first and only crowd closer when it is full.
-pub static SLOT_INNER_PENALTY: TunableF32 = TunableF32::new(0.35);
-/// Weight on the arc a unit would have to walk to reach a candidate station
-/// (`1 - cos` between its own bearing from the target and the candidate's), so
-/// a unit takes the free station nearest to where it already stands rather
-/// than crossing the fight for an equally free one.
-///
-/// Low on purpose: it is the only term pulling *against* spreading out, and
-/// the walk it saves is short compared to what an evenly surrounded target is
-/// worth. Measured, dropping it from 0.5 to 0.15 took ten ranged attackers
-/// from four compass sectors to seven with no loss of damage.
-pub static SLOT_TURN_COST: TunableF32 = TunableF32::new(0.15);
-/// Cost a new station must beat the held one by before a unit switches.
-///
-/// Above one body's worth of occupancy, deliberately: the crowd around a
-/// station changes every tick, so a margin thinner than a body has units
-/// swapping stations on every re-score, walking the long way round to each new
-/// one and never arriving anywhere. Measured, raising it from a quarter of a
-/// body to one and a half took a 12-attacker melee from 6.3 to 8.6 damage a
-/// tick, purely by letting units commit.
-pub static SLOT_SWITCH_MARGIN: TunableF32 = TunableF32::new(1.5);
+/// How much closer to its target, in its own radii, a unit steering round
+/// bodies has to get for that to count as progress (resetting
+/// [`Unit::orbit`]).
+pub static BLOCK_PROGRESS_RADII: TunableF32 = TunableF32::new(0.5);
+/// How far inside weapon reach, in its own radii, a chasing unit stops (at
+/// most half its reach). Stopping right on the line leaves a target that is
+/// walking off out of reach again a tick later.
+pub static STOP_INSIDE_RADII: TunableF32 = TunableF32::new(0.5);
+/// How far ahead a moving unit looks for bodies to steer round, in its own
+/// radii beyond this tick's step. Enough to start curving before contact
+/// rather than bouncing off it.
+pub static STEER_LOOKAHEAD_RADII: TunableF32 = TunableF32::new(1.0);
+/// [`STEER_LOOKAHEAD_RADII`] for allies in the way, kept shorter: a unit
+/// should brush along its own side's bodies, not swing wide of them.
+pub static ALLY_LOOKAHEAD_RADII: TunableF32 = TunableF32::new(0.5);
+/// Consecutive ticks a chasing unit may stand hemmed in, with nowhere to
+/// steer, before it gives up and waits where it is.
+pub static GIVE_UP_TICKS: TunableU8 = TunableU8::new(20);
+/// How far round its target, in radians, a unit may steer round the crowd
+/// without getting closer before it gives up and waits: the overflow of a full
+/// surround stands behind it instead of circling it forever.
+pub static GIVE_UP_ORBIT: TunableF32 = TunableF32::new(3.2);
 /// Separation weight of a *holding* unit (firing, parked or idle) against a
 /// moving one's weight of 1: each side takes `w_other / (w_i + w_j)` of the
 /// pairwise correction, so a mover shoves a stationary unit only `1/(1+w)` as
@@ -205,10 +180,6 @@ pub static DETOUR_LEN_RADII: TunableF32 = TunableF32::new(6.0);
 /// defender; without this the surplus queues behind them forever instead of
 /// picking another enemy.
 pub static TARGET_SPREAD_PENALTY: TunableF32 = TunableF32::new(1.0);
-/// Per-tick step, as a fraction of speed, by which a shoved stationed unit
-/// eases back onto its station. Without it neighbours drift into the gap and
-/// a ring packed exactly full loses a station.
-pub static STATION_KEEP_FRAC: TunableF32 = TunableF32::new(0.25);
 
 /// Diagnostic switch for [`Sim::last_push`]: while on, `flock` records how much
 /// separation push each unit received, split by ally and enemy.
@@ -225,8 +196,6 @@ const WALL_CLAMP_PASSES: u32 = 8;
 /// Passes of the enemy no-closing clip in [`Sim::flock`]: two contacts at an
 /// angle need a few to settle.
 const ENEMY_CLIP_PASSES: u32 = 3;
-/// Station-keeping dead zone, as a fraction of the unit's radius.
-const STATION_KEEP_EPS_FRAC: f32 = 0.001;
 /// Fraction of a radius by which [`assign_blob`] pushes each end of its
 /// reachability walk off the ray. Small enough to stay within the faces the
 /// ray really passes through, large enough to survive f32 rounding at map
@@ -299,19 +268,17 @@ pub fn set_tuning(name: &str, value: f32) -> bool {
         "chase_repath_dist" => CHASE_REPATH_DIST.set(value),
         "chase_repath_ticks" => CHASE_REPATH_TICKS.set(value.round().clamp(0.0, 255.0) as u8),
         "fire_slack_steps" => FIRE_SLACK_STEPS.set(value),
-        "block_progress_frac" => BLOCK_PROGRESS_FRAC.set(value),
-        "block_ticks" => BLOCK_TICKS.set(value.round().clamp(0.0, 255.0) as u8),
-        "slot_standoff" => SLOT_STANDOFF.set(value),
-        "slot_outer_penalty" => SLOT_OUTER_PENALTY.set(value),
-        "slot_inner_penalty" => SLOT_INNER_PENALTY.set(value),
-        "slot_turn_cost" => SLOT_TURN_COST.set(value),
-        "slot_switch_margin" => SLOT_SWITCH_MARGIN.set(value),
+        "block_progress_radii" => BLOCK_PROGRESS_RADII.set(value),
+        "give_up_orbit" => GIVE_UP_ORBIT.set(value),
+        "stop_inside_radii" => STOP_INSIDE_RADII.set(value),
+        "steer_lookahead_radii" => STEER_LOOKAHEAD_RADII.set(value),
+        "ally_lookahead_radii" => ALLY_LOOKAHEAD_RADII.set(value),
+        "give_up_ticks" => GIVE_UP_TICKS.set(value.round().clamp(0.0, 255.0) as u8),
         "hold_weight" => HOLD_WEIGHT.set(value),
         "detour_frac" => DETOUR_FRAC.set(value),
         "detour_ticks" => DETOUR_TICKS.set(value.round().clamp(0.0, 255.0) as u8),
         "detour_len_radii" => DETOUR_LEN_RADII.set(value),
         "target_spread_penalty" => TARGET_SPREAD_PENALTY.set(value),
-        "station_keep_frac" => STATION_KEEP_FRAC.set(value),
         _ => return false,
     }
     true
@@ -341,19 +308,17 @@ pub fn get_tuning(name: &str) -> Option<f32> {
         "chase_repath_dist" => CHASE_REPATH_DIST.get(),
         "chase_repath_ticks" => CHASE_REPATH_TICKS.get() as f32,
         "fire_slack_steps" => FIRE_SLACK_STEPS.get(),
-        "block_progress_frac" => BLOCK_PROGRESS_FRAC.get(),
-        "block_ticks" => BLOCK_TICKS.get() as f32,
-        "slot_standoff" => SLOT_STANDOFF.get(),
-        "slot_outer_penalty" => SLOT_OUTER_PENALTY.get(),
-        "slot_inner_penalty" => SLOT_INNER_PENALTY.get(),
-        "slot_turn_cost" => SLOT_TURN_COST.get(),
-        "slot_switch_margin" => SLOT_SWITCH_MARGIN.get(),
+        "block_progress_radii" => BLOCK_PROGRESS_RADII.get(),
+        "give_up_orbit" => GIVE_UP_ORBIT.get(),
+        "stop_inside_radii" => STOP_INSIDE_RADII.get(),
+        "steer_lookahead_radii" => STEER_LOOKAHEAD_RADII.get(),
+        "ally_lookahead_radii" => ALLY_LOOKAHEAD_RADII.get(),
+        "give_up_ticks" => GIVE_UP_TICKS.get() as f32,
         "hold_weight" => HOLD_WEIGHT.get(),
         "detour_frac" => DETOUR_FRAC.get(),
         "detour_ticks" => DETOUR_TICKS.get() as f32,
         "detour_len_radii" => DETOUR_LEN_RADII.get(),
         "target_spread_penalty" => TARGET_SPREAD_PENALTY.get(),
-        "station_keep_frac" => STATION_KEEP_FRAC.get(),
         _ => return None,
     })
 }
@@ -428,6 +393,9 @@ pub struct Unit {
     pub pos: Vector2,
     /// Position at the start of the current tick (velocity = `(pos - prev_pos) / DT`).
     pub prev_pos: Vector2,
+    /// How far the unit moved over the last whole tick: its velocity as the
+    /// others see it when deciding whether it is getting out of their way.
+    pub last_move: Vector2,
     pub radius: f32,
     pub max_speed: f32,
     /// Remaining waypoints `[next, …, goal]`; empty when idle.
@@ -474,7 +442,8 @@ pub struct Unit {
     /// Ticks between attacks; authored and clamped to at least 1 at spawn.
     /// Kept in ticks, not seconds, so combat stays exactly reproducible.
     pub attack_cooldown_ticks: u32,
-    /// Ticks remaining before this unit may fire again.
+    /// Ticks remaining before this unit may fire again. Counts down every
+    /// tick, moving or not.
     pub cooldown_left: u32,
     /// Active combat target while executing `Attack` or an acquired
     /// `AttackMove` engagement; `None` when idle or marching without a
@@ -505,7 +474,7 @@ pub struct Unit {
     /// judgement: a commanded fight blocks queued orders until the target
     /// dies, where a unit that merely defended itself lets the queue proceed.
     pub target_commanded: bool,
-    /// Latched "standing at my firing station". A *position* state, not a
+    /// Latched "standing my ground in reach". A *position* state, not a
     /// licence to fire: damage still needs a true `surf <= attack_range` on
     /// the tick it lands, so the slack that keeps this latched (see
     /// [`FIRE_SLACK_STEPS`]) can be as wide as crowd jitter needs without ever
@@ -516,30 +485,28 @@ pub struct Unit {
     /// `path.is_empty()` (which made a firing unit look idle to cohesion,
     /// merge and crowd arrival).
     pub engaged: bool,
-    /// Approach slot this unit is walking to instead of the target itself,
-    /// encoded `ring * 32 + direction index` ([`NO_SLOT`] = chase the target
-    /// directly). Stored as a code, not a point, so the ring is re-derived from
-    /// the target's *current* position each tick and a moving target simply
-    /// drags its ring along.
-    pub chase_slot: u16,
-    /// Smallest distance to the station this unit is walking to (its target's
-    /// surface, when it has no station) seen since the block counter last
-    /// reset — the jitter-proof yardstick for "am I actually closing?"
-    /// (`MAX` = unset). Same shape as [`Unit::min_remaining`] for walls.
+    /// Which way this unit is steering round the bodies in its way: `1`
+    /// counter-clockwise, `-1` clockwise, `0` unobstructed. Held for as long
+    /// as the way ahead stays blocked, so a unit following a crowd's edge
+    /// keeps going the same way round instead of dithering at every body.
+    pub steer_side: i8,
+    /// Consecutive ticks the way ahead has been clear; a held
+    /// [`Unit::steer_side`] is let go once it reaches [`STEER_RELEASE_TICKS`].
+    pub steer_free: u8,
+    /// Smallest surface gap to the target seen since the block counter last
+    /// reset: the jitter-proof yardstick for "am I actually closing?"
+    /// (`MAX` = unset).
     pub best_gap: f32,
-    /// One counter serving both halves of "how long have I been stuck here",
-    /// which are mutually exclusive — a unit is either walking to a station or
-    /// standing on one, never both, so the two never need to be live at once:
-    ///
-    /// - **chasing**: consecutive ticks without closing [`BLOCK_PROGRESS_FRAC`]
-    ///   of a step on the station; at [`BLOCK_TICKS`] it re-goals onto a free
-    ///   approach slot.
-    /// - **stationed**: consecutive ticks held at a station it can't shoot
-    ///   from; at [`BLOCK_TICKS`] it gives the station up and re-scores.
-    ///
-    /// Crossing between the two resets it (and [`Unit::best_gap`] with it),
-    /// since a value accrued under one reading means nothing under the other.
-    pub hold_ticks: u8,
+    /// Consecutive chase ticks hemmed in with nowhere to steer; at
+    /// [`GIVE_UP_TICKS`] the unit stops and waits.
+    pub blocked_ticks: u8,
+    /// How far round its target, in radians, this unit has gone while
+    /// steering round bodies without getting closer; past [`GIVE_UP_ORBIT`]
+    /// it stops and waits.
+    pub orbit: f32,
+    /// Gave up on reaching the target for now: stands behind the crowd,
+    /// leaning in, until the way into reach opens or the target moves off.
+    pub waiting: bool,
     /// Consecutive ticks moving in ally contact without shortening the
     /// remaining path by [`DETOUR_FRAC`] of a step; trips a lateral detour.
     pub ally_stall: u8,
@@ -547,9 +514,6 @@ pub struct Unit {
     /// (`MAX` = unset).
     pub ally_min_remaining: f32,
 }
-
-/// [`Unit::chase_slot`] value meaning "no slot: walk at the target itself".
-pub const NO_SLOT: u16 = u16::MAX;
 
 impl Unit {
     pub fn is_moving(&self) -> bool {
@@ -834,6 +798,10 @@ impl SpatialGrid {
         self.starts[0] = 0;
     }
 
+    fn cell_size(&self) -> f32 {
+        1.0 / self.inv_cell
+    }
+
     fn cell_coords(&self, p: Vector2) -> (u32, u32) {
         let cx = (((p.x - self.origin.x) * self.inv_cell) as u32).min(self.cols - 1);
         let cy = (((p.y - self.origin.y) * self.inv_cell) as u32).min(self.rows - 1);
@@ -934,9 +902,6 @@ struct StepScratch {
     /// motion under the enemy clip.
     now: Vec<Vector2>,
     moved: Vec<Vector2>,
-    /// Per dense unit: an enemy is close enough that any of this tick's
-    /// motion, station keeping included, could close on it.
-    near_enemy: Vec<bool>,
     /// Per enemy contact: how far each side may close on the other.
     enemy_allow: Vec<(f32, f32)>,
     /// Wall-clamp face frontier and visited list (tiny per unit).
@@ -951,21 +916,32 @@ struct StepScratch {
     /// Combat: units that hit their leash this tick and the post to walk back
     /// to. Almost always empty.
     leash_home: Vec<(UnitId, Vector2)>,
-    /// Combat: `(slot code, distance to it)` per dense unit, seeded from last
-    /// tick so scoring sees everyone bound for a station, not just this
-    /// tick's deciders.
-    slot_claims: Vec<(u16, f32)>,
-    /// Combat: per dense target, the furthest reach of the units stationed
-    /// around it (centre distance plus radius); 0 with none.
-    crowd_edge: Vec<f32>,
-    /// Combat: each dense unit's target, as a dense index (`u32::MAX` for
-    /// none), and everyone attacking each target, CSR over the target's dense
-    /// index: `rivals[rivals_start[k]..rivals_start[k + 1]]`.
-    target_of: Vec<u32>,
-    rivals_start: Vec<u32>,
-    rivals: Vec<u32>,
-    /// Combat: station line-of-sight answers already walked this tick.
-    los: LosCache,
+    /// Per dense unit: whether it is standing its ground in a fight, which a
+    /// moving unit steers round rather than shoves. Snapshotted before
+    /// `integrate`.
+    solid: Vec<bool>,
+    /// Per dense unit: [`Unit::waiting`]. A waiting unit is crowd to be
+    /// pushed, not a body to steer round. Only filled while steering is on.
+    waiting: Vec<bool>,
+    /// Per dense unit: whether its way ahead was blocked by bodies this tick.
+    steered: Vec<bool>,
+    /// Per dense unit: [`Unit::last_move`].
+    moves: Vec<Vector2>,
+    /// Per dense unit: whether it is held up rather than just setting off:
+    /// standing, waiting, hemmed in on its chase or steering round something.
+    /// Only filled while steering is on.
+    stuck: Vec<bool>,
+    /// Whether `grid` already holds this tick's start positions at the flock's
+    /// cell size (built by `snapshot_bodies`), so `flock` can skip the build.
+    grid_fresh: bool,
+    /// One unit's steering obstacles: `(direction, cos, sin)` of the cone of
+    /// headings that would run into each, and `(distance, reach)`: how far
+    /// off its centre is and how close the two centres may come.
+    steer_obs: Vec<(Vector2, f32, f32, f32, f32)>,
+    /// One unit's waiting allies within a step of touching, in `steer_obs`'s
+    /// layout (cone unused). Pushed through rather than steered round, but a
+    /// waiting unit's own lean slides along them rather than into them.
+    waiting_obs: Vec<(Vector2, f32, f32, f32, f32)>,
     /// Combat: allies already targeting each dense unit, for acquisition
     /// spreading. Rebuilt per tick in [`Sim::acquire_targets`].
     target_count: Vec<u32>,
@@ -985,40 +961,6 @@ struct StepScratch {
     dead: Vec<UnitId>,
 }
 
-/// Per-tick station line-of-sight answers (0 unknown, 1 clear, 2 blocked):
-/// every attacker on a target asks the same mesh walks.
-#[derive(Default)]
-struct LosCache {
-    /// Per dense target: its entry in `entries`, or `u32::MAX`.
-    of: Vec<u32>,
-    /// Keyed by `Rings`, which also pins the asker's radius (reserve rings
-    /// are `2 r` apart).
-    entries: Vec<(Rings, [u8; MAX_RING_SLOTS * MAX_RINGS])>,
-}
-
-impl LosCache {
-    fn reset(&mut self, n: usize) {
-        self.of.clear();
-        self.of.resize(n, u32::MAX);
-        self.entries.clear();
-    }
-
-    /// Answers for `target` at these rings. Only the first asker's shape is
-    /// cached; mixed shapes on one target are rare.
-    fn entry(&mut self, target: u32, rings: &Rings) -> &mut [u8; MAX_RING_SLOTS * MAX_RINGS] {
-        let at = self.of[target as usize];
-        if at != u32::MAX {
-            if self.entries[at as usize].0 == *rings {
-                return &mut self.entries[at as usize].1;
-            }
-        } else {
-            self.of[target as usize] = self.entries.len() as u32;
-        }
-        self.entries.push((*rings, [0; MAX_RING_SLOTS * MAX_RINGS]));
-        &mut self.entries.last_mut().expect("just pushed").1
-    }
-}
-
 /// One unit's combat decision for the tick, computed read-only against
 /// pre-tick state in [`Sim::engage`] and applied afterward.
 ///
@@ -1032,25 +974,19 @@ struct CombatDecision {
     /// Target is genuinely inside `attack_range` this tick. Damage needs
     /// both; `station` alone only stops the unit and ticks its cooldown.
     in_range: bool,
-    /// Target position at decision time; only meaningful when `!fire`.
+    /// Target position at decision time; only meaningful when chasing.
     target_pos: Vector2,
-    /// Where the unit is walking: its approach slot, or the target itself.
-    /// Only meaningful when `!fire`.
-    goal: Vector2,
-    /// Approach slot chosen this tick ([`NO_SLOT`] = walk at the target).
-    slot: u16,
-    /// Only meaningful when `!fire`: whether the chase path needs rebuilding.
+    /// Only meaningful when chasing: whether the chase path needs rebuilding.
     need_repath: bool,
-    /// Whether the re-scoring cadence came due this tick (it restarts even
-    /// when nothing needed rebuilding, so a held slot is re-scored on a fixed
-    /// period rather than every tick).
+    /// Whether the repath cadence came due this tick.
     cadence: bool,
-    /// Block-progress bookkeeping, carried out of the read-only pass; see
-    /// [`Unit::hold_ticks`] for which of its two readings applies.
+    /// Block-progress bookkeeping carried out of the read-only pass.
     best_gap: f32,
-    hold_ticks: u8,
-    /// Station to ease back onto; see [`STATION_KEEP_FRAC`].
-    keep_at: Option<Vector2>,
+    blocked_ticks: u8,
+    orbit: f32,
+    waiting: bool,
+    /// Only meaningful while waiting: how far it leans in this tick.
+    creep: Vector2,
 }
 
 pub struct Sim {
@@ -1168,6 +1104,9 @@ impl Sim {
         self.advance_orders();
         self.wall_clamp(mesh_changed);
         self.repath_stalled();
+        for (_, u) in self.units.iter_mut() {
+            u.last_move = u.pos - u.prev_pos;
+        }
         self.tick += 1;
     }
 
@@ -1186,6 +1125,7 @@ impl Sim {
                 self.units.spawn(Unit {
                     pos: *pos,
                     prev_pos: *pos,
+                    last_move: Vector2::ZERO,
                     radius: *radius,
                     max_speed: *max_speed,
                     path: Vec::new(),
@@ -1214,9 +1154,12 @@ impl Sim {
                     post: None,
                     target_commanded: false,
                     engaged: false,
-                    chase_slot: NO_SLOT,
+                    steer_side: 0,
+                    steer_free: 0,
                     best_gap: f32::MAX,
-                    hold_ticks: 0,
+                    blocked_ticks: 0,
+                    orbit: 0.0,
+                    waiting: false,
                     ally_stall: 0,
                     ally_min_remaining: f32::MAX,
                 });
@@ -1684,9 +1627,15 @@ impl Sim {
     /// A waypoint counts as rounded once the unit is past its gate (on the next
     /// leg's side) *and* has clear line-of-sight to the following waypoint — the
     /// LoS test is what stops it cutting an unrounded corner.
+    ///
+    /// Then it **steers** (see [`steer`]): with a body in the way that won't
+    /// make way for it, it walks round it this tick instead of along the path,
+    /// and picks the path back up once past.
     fn integrate(&mut self) {
+        let steering = self.snapshot_bodies();
         let cdt = self.nav.navmesh();
-        for (_, unit) in self.units.iter_mut() {
+        let s = &mut self.step_scratch;
+        for (i, (_, unit)) in self.units.iter_mut().enumerate() {
             if unit.path.is_empty() {
                 continue;
             }
@@ -1700,7 +1649,39 @@ impl Sim {
                     break;
                 }
             }
+            if steering && let Some(&next) = unit.path.get(unit.path_i as usize) {
+                match steer(s, &self.grid, &self.relations, i, unit, next, false) {
+                    Steer::Clear => {
+                        unit.steer_free = unit.steer_free.saturating_add(1);
+                        if unit.steer_free >= STEER_RELEASE_TICKS {
+                            unit.steer_side = 0;
+                        }
+                    }
+                    Steer::Round(side, dir) => {
+                        s.steered[i] = true;
+                        unit.steer_side = side;
+                        unit.steer_free = 0;
+                        let press =
+                            free_ahead(dir, &s.waiting_obs) + PRESS_DEPTH_RADII * unit.radius;
+                        unit.pos += dir * (unit.max_speed * DT).min(press);
+                        continue;
+                    }
+                    // Nowhere to steer: close up and stand, rather than shove
+                    // into bodies that won't give way.
+                    Steer::Boxed(step) => {
+                        s.steered[i] = true;
+                        unit.steer_free = 0;
+                        unit.pos += step;
+                        continue;
+                    }
+                }
+            }
             let mut remaining = unit.max_speed * DT;
+            if steering && !s.waiting_obs.is_empty() {
+                let h = norm(unit.waypoint() - unit.pos);
+                remaining =
+                    remaining.min(free_ahead(h, &s.waiting_obs) + PRESS_DEPTH_RADII * unit.radius);
+            }
             while remaining > 0.0 {
                 // Waypoints exhausted: the post-loop guard clears the path.
                 let Some(&target) = unit.path.get(unit.path_i as usize) else {
@@ -1719,8 +1700,8 @@ impl Sim {
             }
             if unit.path_i as usize >= unit.path.len() {
                 if unit.target.is_some() {
-                    // Reached an approach slot, not a march goal. Combat keeps
-                    // its own hold state (`engaged`, `chase_slot`), and parking
+                    // Reached a chase anchor, not a march goal. Combat keeps
+                    // its own hold state (`engaged`), and parking
                     // here would seed crowd-arrival for same-group units — an
                     // attack-moving rear rank would stop at an arbitrary
                     // distance from the enemy, since `arrival_r` is sized for
@@ -1732,6 +1713,56 @@ impl Sim {
                 }
             }
         }
+    }
+
+    /// Snapshot every unit's body for [`steer`]: position, size, team and
+    /// whether it is standing its ground in a fight, over start-of-tick
+    /// positions (so the order units move in never changes what they see),
+    /// with the flock grid built over them. Returns whether anything could
+    /// be in anyone's way at all: with no fight on and one team on the map
+    /// there is nothing to steer round, and the pass is skipped.
+    fn snapshot_bodies(&mut self) -> bool {
+        let s = &mut self.step_scratch;
+        s.ids.clear();
+        s.positions.clear();
+        s.radii.clear();
+        s.teams.clear();
+        s.solid.clear();
+        s.waiting.clear();
+        s.steered.clear();
+        s.moves.clear();
+        s.stuck.clear();
+        let mut max_radius = 0.0f32;
+        let mut any = false;
+        for (id, u) in self.units.iter() {
+            let solid = u.engaged;
+            any |= solid || s.teams.first().is_some_and(|&t| t != u.team);
+            s.ids.push(id);
+            s.positions.push(u.pos);
+            s.radii.push(u.radius);
+            s.teams.push(u.team);
+            s.solid.push(solid);
+            s.steered.push(false);
+            s.moves.push(u.last_move);
+            max_radius = max_radius.max(u.radius);
+        }
+        s.grid_fresh = false;
+        // Only steering reads these, so a march with no fight on skips them.
+        if any {
+            for (_, u) in self.units.iter() {
+                s.waiting.push(u.waiting);
+                s.stuck
+                    .push(!u.is_moving() || u.waiting || u.blocked_ticks > 0 || u.steer_side != 0);
+            }
+        }
+        if !any || s.ids.len() < 2 || max_radius <= 0.0 {
+            return false;
+        }
+        let r_coh = max_radius * COHESION_RADIUS_FRAC.get();
+        self.grid
+            .rebuild(&s.positions, (max_radius * 2.0).max(r_coh));
+        s.grid_fresh = true;
+        true
     }
 
     /// One grid pass over start-of-tick positions, deriving three per-unit
@@ -1780,14 +1811,12 @@ impl Sim {
         s.marching.clear();
         s.merge_pairs.clear();
         s.enemy_contacts.clear();
-        s.near_enemy.clear();
         s.now.clear();
         let mut max_radius = 0.0f32;
         for (id, u) in self.units.iter() {
             s.ids.push(id);
             s.positions.push(u.prev_pos);
             s.now.push(u.pos);
-            s.near_enemy.push(false);
             s.radii.push(u.radius);
             s.speeds.push(u.max_speed);
             s.disp.push(Vector2::ZERO);
@@ -1819,7 +1848,11 @@ impl Sim {
         let r_coh = max_radius * COHESION_RADIUS_FRAC.get();
         let r_coh2 = r_coh * r_coh;
         // Cell covers the larger radius so the 3×3 scan still finds every pair.
-        self.grid.rebuild(&s.positions, max_diameter.max(r_coh));
+        // `snapshot_bodies` may already have built exactly this grid: same
+        // start-of-tick positions, same cell size.
+        if !s.grid_fresh {
+            self.grid.rebuild(&s.positions, max_diameter.max(r_coh));
+        }
         let cdt = self.nav.navmesh();
         let separation_relax = SEPARATION_RELAX.get();
         // Sized here, not pushed per unit above, so the default path does no
@@ -1831,8 +1864,9 @@ impl Sim {
         }
         let arrival_touch_frac = ARRIVAL_TOUCH_FRAC.get();
         let hold_weight = HOLD_WEIGHT.get();
+        let any_waiting = !s.waiting.is_empty();
         let separation_max_frac = SEPARATION_MAX_FRAC.get();
-        let near_frac = 1.0 + separation_max_frac + STATION_KEEP_FRAC.get();
+        let near_frac = 1.0 + separation_max_frac;
 
         for i in 0..s.ids.len() {
             let p = s.positions[i];
@@ -1858,8 +1892,6 @@ impl Sim {
                             d2 < near * near
                                 && relation_of(&self.relations, t_i, s.teams[j]) == Relation::Enemy
                                 && {
-                                    s.near_enemy[i] = true;
-                                    s.near_enemy[j] = true;
                                     let reach = min_dist
                                         + s.speeds[i].max(s.speeds[j])
                                             * DT
@@ -1889,10 +1921,19 @@ impl Sim {
                             // correction. Equal weights give exactly 0.5 each
                             // (`w / (w + w)` is exact in f32), which is why a
                             // packing at rest is bit-for-bit unaffected.
-                            let (w_i, w_j) = (
-                                if mv_i { 1.0 } else { hold_weight },
-                                if s.moving[j] { 1.0 } else { hold_weight },
-                            );
+                            let weight = |k: usize| {
+                                if s.solid[k] {
+                                    SOLID_WEIGHT
+                                } else if s.moving[k] || (any_waiting && s.waiting[k]) {
+                                    // A waiting unit gives way like a moving
+                                    // one, so a crowd pressing in flows round
+                                    // the target instead of heaping up.
+                                    1.0
+                                } else {
+                                    hold_weight
+                                }
+                            };
+                            let (w_i, w_j) = (weight(i), weight(j));
                             let sum = w_i + w_j;
                             let overlap = min_dist - d;
                             let push_i = overlap * (w_j / sum) * separation_relax;
@@ -2182,6 +2223,11 @@ impl Sim {
     /// dead. Slots in after `flock` and before `advance_orders` so an order
     /// completing because its target died is retired the same tick.
     fn combat(&mut self) {
+        // A weapon reloads whatever its unit is doing, so a unit can use the
+        // wait between shots to move: the whole of stutter-stepping.
+        for (_, u) in self.units.iter_mut() {
+            u.cooldown_left = u.cooldown_left.saturating_sub(1);
+        }
         self.acquire_targets();
         self.engage();
         self.leash_home();
@@ -2342,100 +2388,34 @@ impl Sim {
         }
     }
 
-    /// For every unit with a live target: fire if in range (stop, tick the
-    /// cooldown, buffer damage on zero), else chase. Decisions are computed
-    /// read-only first — resolving a unit's target needs a second live borrow
-    /// of `units` — then applied.
+    /// For every unit with a live target: fire if in range, else chase.
+    /// Decisions are computed read-only first (resolving a unit's target
+    /// needs a second live borrow of `units`), then applied.
     ///
-    /// Everything here beyond "walk at the target and shoot" exists because
-    /// one shared goal point turns an approach into a crush:
+    /// The chase is deliberately plain: walk at the target and stop the moment
+    /// it is in reach. How a crowd spreads round its target is left to
+    /// steering (see [`steer`]): a unit in reach stands its ground, anyone
+    /// arriving later steers round it rather than shoving, and the crowd wraps
+    /// round the target by itself. What is left here:
     ///
-    /// - **Stations, not a goal point.** A unit walking to a target picks a
-    ///   free station on a ring around it ([`pick_slot`]) — so a swarm spreads
-    ///   around its target instead of everyone converging on one point and
-    ///   shoving. Stations are stored as a direction code, not a position, so
-    ///   the ring is re-derived from the target's current position each tick
-    ///   and simply travels with it. A station counts as taken by every unit
-    ///   bound for it, so the swarm fills the far side too.
-    /// - **Stop when there's nothing to gain.** In weapon range with elbow
-    ///   room is a fine place to stand, and short walks stay short. Only a
-    ///   unit that can't stop — in range but shoulder to shoulder with allies
-    ///   — keeps walking, to its station, which is what spreads a swarm.
-    /// - **Reserves.** Past a certain count the ring is full; the overflow
-    ///   parks in shells behind the front rank rather than shoving into it,
-    ///   and re-scores on the repath cadence, so when a front-rank unit dies
-    ///   the ring simply reads free and a reserve walks in. No death events,
-    ///   no blocker ids, no retry timer.
-    /// - **Station keeping.** A shoved stationed unit eases back
-    ///   ([`STATION_KEEP_FRAC`]) instead of drifting into a neighbour's gap.
-    /// - **Hysteresis on the station, not on the range.** Damage re-checks the
-    ///   true range every tick, so the slack that keeps a jostled unit at its
-    ///   post ([`FIRE_SLACK_STEPS`]) never quietly extends a weapon's reach —
-    ///   the trap that turned a 2.0 melee reach into 4.5 in an earlier spike.
+    /// - **Hysteresis on the stand, not on the range.** A standing unit only
+    ///   walks again past `attack_range` plus [`FIRE_SLACK_STEPS`], so the
+    ///   press jostling it across the line doesn't flap it. Damage re-checks
+    ///   the true range every tick, so the slack never extends the weapon.
+    /// - **Giving up.** A unit that has gone [`GIVE_UP_ORBIT`] round its
+    ///   target without getting closer, or stood hemmed in for
+    ///   [`GIVE_UP_TICKS`], waits: it leans in, sliding along the bodies
+    ///   ahead, and steps in once the way into reach opens, trying the other
+    ///   way round. A full surround's overflow packs behind it instead of
+    ///   circling it forever.
     fn engage(&mut self) {
         let s = &mut self.step_scratch;
         s.combat_decisions.clear();
-        s.slot_claims.clear();
-        s.target_of.clear();
-        s.crowd_edge.clear();
-        s.crowd_edge.resize(s.ids.len(), 0.0);
-        s.rivals_start.clear();
-        s.rivals_start.resize(s.ids.len() + 1, 0);
-        s.los.reset(s.ids.len());
-        for i in 0..s.ids.len() {
-            let id = s.ids[i];
-            let target = self.units.get(id).and_then(|u| {
-                let t = u.target?;
-                let k = s.ids.binary_search(&t).ok()?;
-                Some((u, t, k))
-            });
-            let Some((u, t, k)) = target else {
-                s.slot_claims.push((NO_SLOT, 0.0));
-                s.target_of.push(u32::MAX);
-                continue;
-            };
-            let claim_dist = match (u.chase_slot, self.units.get(t)) {
-                (NO_SLOT, _) | (_, None) => 0.0,
-                (code, Some(tu)) => {
-                    let rings = slot_rings(u.radius, tu.radius, u.attack_range);
-                    (s.positions[i] - slot_point(tu.pos, code, &rings)).length()
-                }
-            };
-            s.slot_claims.push((u.chase_slot, claim_dist));
-            s.target_of.push(k as u32);
-            s.rivals_start[k + 1] += 1;
-            // A unit stopped short out in the field isn't part of the crowd.
-            let d = (s.positions[i] - s.positions[k]).length();
-            if u.engaged && d <= reserve_reach(u.radius, s.radii[k], u.attack_range) + u.radius {
-                s.crowd_edge[k] = s.crowd_edge[k].max(d + u.radius);
-            }
-        }
-        if s.rivals_start.iter().all(|&c| c == 0) {
-            return; // nobody has a target
-        }
-        // Per-target rivals, so scoring reads only units that could contest.
-        for k in 0..s.ids.len() {
-            s.rivals_start[k + 1] += s.rivals_start[k];
-        }
-        s.rivals.clear();
-        s.rivals.resize(s.rivals_start[s.ids.len()] as usize, 0);
-        for i in 0..s.ids.len() {
-            let k = s.target_of[i];
-            if k != u32::MAX {
-                let at = &mut s.rivals_start[k as usize];
-                s.rivals[*at as usize] = i as u32;
-                *at += 1;
-            }
-        }
-        for k in (1..=s.ids.len()).rev() {
-            s.rivals_start[k] = s.rivals_start[k - 1];
-        }
-        s.rivals_start[0] = 0;
         s.leash_home.clear();
-        let cdt = self.nav.navmesh();
         let fire_slack_steps = FIRE_SLACK_STEPS.get();
-        let block_progress_frac = BLOCK_PROGRESS_FRAC.get();
-        let block_limit = BLOCK_TICKS.get();
+        let block_progress = BLOCK_PROGRESS_RADII.get();
+        let give_up = GIVE_UP_TICKS.get();
+        let give_up_orbit = GIVE_UP_ORBIT.get();
         let chase_repath_dist = CHASE_REPATH_DIST.get();
         let leash_radii = LEASH_RADII.get();
         let acq_mult = ACQUISITION_RANGE_MULT.get();
@@ -2458,298 +2438,141 @@ impl Sim {
                 let leash = (leash_radii * unit.radius).max(acq_mult * unit.attack_range);
                 if (unit.pos - post).length_squared() > leash * leash {
                     s.leash_home.push((id, post));
-                    s.slot_claims[i].0 = NO_SLOT;
                     continue;
                 }
             }
-            let delta = target.pos - unit.pos;
-            let surf = (delta.length() - unit.radius - target.radius).max(0.0);
+            let surf = ((target.pos - unit.pos).length() - unit.radius - target.radius).max(0.0);
             let step = unit.max_speed * DT;
             let in_range = surf <= unit.attack_range;
-            let rings = slot_rings(unit.radius, target.radius, unit.attack_range);
-            // Derived fresh each tick rather than stored: the station tracks
-            // the target, so "am I standing on it" has to be re-asked whenever
-            // the target moves. Only the outer (reserve) ring is out of weapon
-            // range — an inner station is in range by construction — so a unit
-            // aiming at an inner one is not allowed to settle for "close
-            // enough" and stop short of its own reach.
-            // Asymmetric tolerance, which is where the hysteresis lives.
-            // *Arriving* is tight — the standoff only leaves
-            // `(1 - SLOT_STANDOFF) * attack_range` of margin inside weapon
-            // range, so a unit that calls a station reached from a body away
-            // has stopped somewhere it cannot shoot from. *Staying* is loose,
-            // so crowd jitter around a station no longer rebuilds a path every
-            // tick. Neither buys reach: `in_range` re-decides every shot.
-            let arrive_tol = if unit.engaged {
-                unit.radius + step * fire_slack_steps
+            // Stop a little inside reach, and only walk again a little past
+            // it: the gap between the two is what keeps a unit standing
+            // through the jostle, or through a target edging away, rather
+            // than taking a step every time either crosses the line.
+            let stop = unit.attack_range
+                - (STOP_INSIDE_RADII.get() * unit.radius).min(0.5 * unit.attack_range);
+            let reach = if unit.engaged {
+                unit.attack_range + step * fire_slack_steps
             } else {
-                station_margin(unit.radius, unit.attack_range).max(unit.radius * 0.05)
+                stop
             };
-            let (at_station, reserve_station, to_station) = match unit.chase_slot {
-                NO_SLOT => (false, false, surf),
-                code => {
-                    let p = slot_point(target.pos, code, &rings);
-                    let d = rings.d[ring_of(code)];
-                    let gap = (p - unit.pos).length();
-                    (
-                        gap <= arrive_tol,
-                        d - unit.radius - target.radius > unit.attack_range,
-                        gap,
-                    )
-                }
-            };
-
-            // Block signal: is this unit closing on the place it is trying to
-            // stand? Measured against the *station*, not the target — a unit
-            // walking around a ring is not closing on the target at all, and
-            // scoring it against the target's surface reads that as blocked
-            // (or, once it starts circling, as progress) either way by
-            // accident.
-            //
-            // A fraction of a step per tick, never an absolute epsilon: a unit
-            // grinding through bodies still covers real ground. The bar grows
-            // with the window (`blocked_for` ticks must buy `blocked_for`
-            // fractions of a step), so slow-but-steady closing keeps the
-            // counter down while a compressing crush doesn't.
-            let (mut best_gap, mut blocked_for) = (unit.best_gap, unit.hold_ticks);
-            blocked_for = blocked_for.saturating_add(1);
-            if to_station < best_gap - step * block_progress_frac * blocked_for as f32 {
-                best_gap = to_station;
-                blocked_for = 0;
-            }
-            let tripped = blocked_for >= block_limit;
             let cadence = unit.chase_repath_in == 0;
-
-            // Three ways to be standing still with a target:
-            //
-            // - **holding** — already stationed and still by its station. The
-            //   patience counter below, not the range check, is what ends
-            //   this: a melee station sits only a fraction of a body inside
-            //   reach, so requiring `in_range` every tick would un-station a
-            //   front-rank unit the moment the press jostled it, and it would
-            //   repath, shove back in and be jostled again — the stutter.
-            // - **arrived** — standing on the station this unit chose. A unit
-            //   that drew an outer-ring station is a *reserve*: it parks a body
-            //   behind the front rank rather than shoving into it, and keeps
-            //   re-scoring below, so it walks in the moment the inner ring
-            //   frees up. An inner station is in weapon range by construction,
-            //   so arriving near one without being in range means the unit
-            //   stopped short — it keeps closing instead.
-            // - **in range with elbow room** — nothing to gain by walking on.
-            //   This is what fills a ranged unit's whole in-range disc rather
-            //   than a one-body-thick ring, and what keeps short walks short.
-            //   The room test is the point: stopping on *contact* is what packs
-            //   a swarm into a facing arc and has everyone shoving inward.
-            // - **stuck but able to shoot** — in range and demonstrably not
-            //   advancing. Stopping beats grinding on toward a station it
-            //   cannot reach: it can already fire from here.
-            let mut stationed = (at_station && (unit.engaged || in_range || reserve_station))
-                || (in_range && (unit.chase_slot == NO_SLOT || !s.ally_contact[i] || tripped));
-            // Patience, not a latch: a unit that is standing still and cannot
-            // actually shoot — shoved a body past its own reach by the press,
-            // say — gives it a moment for the jostling to settle, then walks
-            // back onto its station instead of parking outside its range for
-            // the rest of the fight. A unit standing on a *reserve* station is
-            // meant to be out of range and waits there.
-            let mut station_wait = unit.hold_ticks;
-            let mut give_up_station = false;
-            if stationed {
-                if in_range || (at_station && reserve_station) {
-                    station_wait = 0;
-                } else {
-                    station_wait = station_wait.saturating_add(1);
-                    if station_wait >= block_limit {
-                        stationed = false;
-                        station_wait = 0;
-                        // Re-score on the way out: the station it holds is one
-                        // it evidently can't shoot from, and walking back into
-                        // an occupied spot only to be pushed out again is the
-                        // stutter this whole pass exists to remove.
-                        give_up_station = true;
-                    }
-                }
-            }
-
-            // A stationed unit doesn't re-score — its station is where it
-            // wants to be — unless it is out of weapon range, i.e. a reserve
-            // waiting for room. That re-score is what refills the ring after a
-            // front-rank death: no death events, no blocker ids, no timer.
-            // Room turned up: give the reserve station back and walk in. The
-            // chase path below does the rest — the slot is carried across in
-            // `rescored` rather than re-picked, which would only pay for the
-            // same scan twice.
-            let mut rescored = None;
-            if stationed && !in_range && cadence {
-                let picked = pick_slot(
-                    cdt,
-                    &self.grid,
-                    &s.positions,
-                    &s.radii,
-                    i,
-                    unit.pos,
-                    unit.radius,
-                    target.pos,
-                    &rings,
-                    unit.chase_slot,
-                    &s.slot_claims,
-                    rivals_of(&s.rivals_start, &s.rivals, s.target_of[i]),
-                    s.los.entry(s.target_of[i], &rings),
-                );
-                if picked != unit.chase_slot {
-                    stationed = false;
-                    rescored = Some(picked);
-                }
-            }
-            if stationed {
-                s.combat_decisions.push(CombatDecision {
-                    id,
-                    station: true,
-                    in_range,
-                    target_pos: target.pos,
-                    goal: target.pos,
-                    slot: unit.chase_slot,
-                    need_repath: false,
-                    cadence,
-                    best_gap: f32::MAX,
-                    hold_ticks: station_wait,
-                    keep_at: (at_station && unit.chase_slot != NO_SLOT)
-                        .then(|| slot_point(target.pos, unit.chase_slot, &rings)),
-                });
-                continue;
-            }
-            let outside = s.crowd_edge[s.target_of[i] as usize] + unit.radius;
-            // Re-scoring from afar is churn: the crowd will have changed by
-            // arrival, and every station lies the same way.
-            let near = delta.length() <= 2.0 * outside.max(rings.d[rings.len - 1]);
             let drift = target.pos - unit.chase_anchor;
             let far_drift = drift.length_squared() > chase_repath_dist * chase_repath_dist;
-            // Every chaser walks to a station on the ring, not at the target
-            // itself: one shared goal point for everyone is what turns an
-            // approach into a crush. Re-scored on the existing cadence (or the
-            // moment the unit concedes), never every tick — the goal itself
-            // would otherwise become a new stutter source.
-            let mut slot = unit.chase_slot;
-            if let Some(picked) = rescored {
-                slot = picked;
-                // Leaving a station: `best_gap`/`blocked_for` above were
-                // derived from `hold_ticks` while it held `station_wait`, so
-                // they mean nothing here. Fresh station, fresh yardstick.
-                best_gap = f32::MAX;
-                blocked_for = 0;
-            } else if tripped
-                || (cadence && near)
-                || far_drift
-                || give_up_station
-                || slot == NO_SLOT
-            {
-                slot = pick_slot(
-                    cdt,
-                    &self.grid,
-                    &s.positions,
-                    &s.radii,
-                    i,
-                    unit.pos,
-                    unit.radius,
-                    target.pos,
-                    &rings,
-                    // Blocked: the held station failed, so no switch margin.
-                    if tripped { NO_SLOT } else { slot },
-                    &s.slot_claims,
-                    rivals_of(&s.rivals_start, &s.rivals, s.target_of[i]),
-                    s.los.entry(s.target_of[i], &rings),
-                );
-            }
-            let claim_dist = match slot {
-                NO_SLOT => 0.0,
-                code => (s.positions[i] - slot_point(target.pos, code, &rings)).length(),
-            };
-            s.slot_claims[i] = (slot, claim_dist);
-            if tripped {
-                blocked_for = 0;
-                best_gap = f32::MAX; // fresh station, fresh yardstick
-                // Blocked, and re-scoring turned up nothing better than the
-                // station it already can't reach: stand still rather than keep
-                // shoving. Not a latch — a stationed unit out of weapon range
-                // re-scores on the cadence above, so it walks in as soon as
-                // the ring frees up.
-                if slot == unit.chase_slot {
-                    s.combat_decisions.push(CombatDecision {
-                        id,
-                        station: true,
-                        in_range,
-                        target_pos: target.pos,
-                        goal: target.pos,
-                        slot,
-                        need_repath: false,
-                        cadence,
-                        best_gap: f32::MAX,
-                        hold_ticks: 0,
-                        keep_at: None,
-                    });
-                    continue;
-                }
-            }
-            // Reaching this branch at all means the unit is *not* stationed,
-            // so an empty path below is always something to fix: walk on. An
-            // "arrived, near enough" test here would deadlock a unit that
-            // stopped a body short of a station it is not in range from — it
-            // would hold a position it cannot shoot from and never close.
-            let goal = slot_goal(unit.pos, target.pos, slot, &rings, outside);
-            // The cadence exists to refresh a path toward a target that has
-            // *moved*; against a stationary one it would rebuild an identical
-            // path forever, which costs an allocation every time.
-            let need_repath = slot != unit.chase_slot
-                || unit.path.is_empty()
-                || far_drift
-                || (cadence && drift.length_squared() > 0.0);
-            s.combat_decisions.push(CombatDecision {
+            let mut d = CombatDecision {
                 id,
                 station: false,
                 in_range,
                 target_pos: target.pos,
-                goal,
-                slot,
-                need_repath,
+                need_repath: false,
                 cadence,
-                best_gap,
-                hold_ticks: blocked_for,
-                keep_at: None,
-            });
+                best_gap: f32::MAX,
+                blocked_ticks: 0,
+                orbit: 0.0,
+                waiting: false,
+                creep: Vector2::ZERO,
+            };
+            // At the stop line, or gave up short of it but inside reach: it
+            // stands and fires from where it is.
+            if surf <= reach || (in_range && unit.waiting) {
+                d.station = true;
+                s.combat_decisions.push(d);
+                continue;
+            }
+            // Waiting its turn: stand until the whole way into reach opens
+            // (the body ahead fell) or the target walks off. Meanwhile it
+            // leans in at the target, sliding off the bodies ahead rather than
+            // stopping dead on them, so the crowd behind a full ring settles
+            // round it instead of heaping wherever each unit gave up.
+            if unit.waiting
+                && !far_drift
+                && !matches!(
+                    steer(s, &self.grid, &self.relations, i, unit, target.pos, true),
+                    Steer::Clear
+                )
+            {
+                let h = norm(target.pos - unit.pos);
+                let room = (surf - stop.max(0.0)).max(0.0);
+                // Off the bodies ahead, then off waiting neighbours, which the
+                // steering left out of its way.
+                d.creep = slide(slide(h * step.min(room), &s.steer_obs), &s.waiting_obs);
+                d.waiting = true;
+                s.combat_decisions.push(d);
+                continue;
+            }
+            // Only time spent against bodies counts toward giving up: a unit
+            // walking the long way round a wall isn't closing either.
+            let (mut best_gap, mut blocked, mut orbit) =
+                (unit.best_gap, unit.blocked_ticks, unit.orbit);
+            if s.steered[i] {
+                if surf < best_gap - unit.radius * block_progress {
+                    best_gap = surf;
+                    blocked = 0;
+                    orbit = 0.0;
+                }
+                let moved = unit.pos - unit.prev_pos;
+                if moved.length_squared() < (step * 0.25) * (step * 0.25) {
+                    blocked = blocked.saturating_add(1);
+                } else {
+                    // Swept angle, as its sine: small per tick.
+                    let (a, b) = (unit.prev_pos - target.prev_pos, unit.pos - target.pos);
+                    let ab = (a.length_squared() * b.length_squared()).sqrt();
+                    if ab > 0.0 {
+                        orbit += (a.x * b.y - a.y * b.x).abs() / ab;
+                    }
+                }
+            } else {
+                best_gap = surf;
+                blocked = 0;
+                orbit = 0.0;
+            }
+            if blocked >= give_up.max(1) || orbit > give_up_orbit {
+                d.waiting = true;
+                s.combat_decisions.push(d);
+                continue;
+            }
+            d.orbit = orbit;
+            d.best_gap = best_gap;
+            d.blocked_ticks = blocked;
+            // The cadence exists to refresh a path toward a target that has
+            // *moved*; against a stationary one it would rebuild an identical
+            // path forever, which costs an allocation every time.
+            d.need_repath =
+                unit.path.is_empty() || far_drift || (cadence && drift.length_squared() > 0.0);
+            s.combat_decisions.push(d);
         }
         let cdt = self.nav.navmesh();
         for i in 0..self.step_scratch.combat_decisions.len() {
             // Copied out, not borrowed: applying a decision needs `units`
             // mutably while `step_scratch` stays live for `damage`/`repath`.
             let d = self.step_scratch.combat_decisions[i];
-            let keep = d
-                .keep_at
-                .map_or(Vector2::ZERO, |at| self.keep_step(d.id, at));
             let Some(unit) = self.units.get_mut(d.id) else {
                 continue;
             };
+            // Giving up: try the other way round next time.
+            if d.waiting && !unit.waiting {
+                unit.steer_side = -unit.steer_side;
+            }
             unit.engaged = d.station;
-            unit.chase_slot = d.slot;
             unit.best_gap = d.best_gap;
-            unit.hold_ticks = d.hold_ticks;
-            if d.station {
+            unit.blocked_ticks = d.blocked_ticks;
+            unit.orbit = d.orbit;
+            unit.waiting = d.waiting;
+            if d.station || d.waiting {
                 unit.path.clear();
                 unit.path_i = 0;
-                if keep != Vector2::ZERO {
-                    unit.pos = clip_ray_to_walls(cdt, unit.pos, unit.pos + keep);
+                if d.creep != Vector2::ZERO {
+                    unit.pos = clip_ray_to_walls(cdt, unit.pos, unit.pos + d.creep);
                 }
-                // The cooldown runs while stationed whether or not the shot
-                // lands, so a unit briefly jostled out of range comes back
-                // ready to fire instead of restarting its wind-up.
-                if unit.cooldown_left == 0 && d.in_range {
+                if d.station {
+                    unit.steer_side = 0;
+                }
+                // Counted down in `combat`, walking or not.
+                if unit.cooldown_left == 0 && d.in_range && d.station {
                     let dmg = unit.damage;
                     let target_id = unit.target.expect("a decision implies a target");
                     self.step_scratch.damage.push((target_id, dmg));
-                    unit.cooldown_left = unit.attack_cooldown_ticks.saturating_sub(1);
-                } else {
-                    unit.cooldown_left = unit.cooldown_left.saturating_sub(1);
+                    unit.cooldown_left = unit.attack_cooldown_ticks;
                 }
-                // Keep the re-score cadence: it's how a reserve notices a
-                // freed station.
                 unit.chase_repath_in = if d.cadence {
                     CHASE_REPATH_TICKS.get()
                 } else {
@@ -2758,7 +2581,7 @@ impl Sim {
             } else if d.need_repath {
                 // Reuse the path buffer: a settled fight must not allocate.
                 unit.path.clear();
-                unit.path.push(d.goal);
+                unit.path.push(d.target_pos);
                 unit.path_i = 0;
                 unit.chase_anchor = d.target_pos;
                 unit.chase_repath_in = CHASE_REPATH_TICKS.get();
@@ -2769,74 +2592,6 @@ impl Sim {
                 unit.chase_repath_in -= 1;
             }
         }
-    }
-
-    /// Station-keeping step toward `at`, stopped short of closing on any
-    /// enemy. It runs after the flock's enemy clip, so it has to honour the
-    /// same rule itself, against live positions.
-    fn keep_step(&self, id: UnitId, at: Vector2) -> Vector2 {
-        let Some(u) = self.units.get(id) else {
-            return Vector2::ZERO;
-        };
-        let mut delta = at - u.pos;
-        let len = delta.length();
-        // Most stationed units are on station: skip the wall walk.
-        if len <= STATION_KEEP_EPS_FRAC * u.radius {
-            return Vector2::ZERO;
-        }
-        let step = u.max_speed * DT * STATION_KEEP_FRAC.get();
-        if len > step {
-            delta *= step / len;
-        }
-        let s = &self.step_scratch;
-        let Ok(i) = s.ids.binary_search(&id) else {
-            return delta;
-        };
-        if !s.near_enemy[i] {
-            return delta;
-        }
-        let (cx, cy) = self.grid.cell_coords(s.positions[i]);
-        // Clipping only shortens the step, so its starting length bounds the
-        // reach of every pass.
-        let reach = delta.length();
-        // Repeated so a unit wedged between two enemies satisfies both; a
-        // pass that clips nothing means every contact already holds.
-        for _ in 0..ENEMY_CLIP_PASSES {
-            let mut clipped = false;
-            for ny in cy.saturating_sub(1)..=(cy + 1).min(self.grid.rows - 1) {
-                for nx in cx.saturating_sub(1)..=(cx + 1).min(self.grid.cols - 1) {
-                    for &j in self.grid.cell_entries(nx, ny) {
-                        let j = j as usize;
-                        if s.teams[j] == u.team
-                            || relation_of(&self.relations, u.team, s.teams[j]) != Relation::Enemy
-                        {
-                            continue;
-                        }
-                        let Some(e) = self.units.get(s.ids[j]) else {
-                            continue;
-                        };
-                        let off = u.pos - e.pos;
-                        let d2 = off.x * off.x + off.y * off.y;
-                        let out_of_reach = u.radius + e.radius + reach;
-                        if d2 >= out_of_reach * out_of_reach || d2 <= 1e-12 {
-                            continue;
-                        }
-                        let dist = d2.sqrt();
-                        let n = off * (1.0 / dist);
-                        let allowed = (dist - u.radius - e.radius).max(0.0);
-                        let inward = -(delta.x * n.x + delta.y * n.y);
-                        if inward > allowed {
-                            delta += n * (inward - allowed);
-                            clipped = true;
-                        }
-                    }
-                }
-            }
-            if !clipped {
-                break;
-            }
-        }
-        delta
     }
 
     /// Walk the units that hit their leash this tick back to their posts.
@@ -2877,7 +2632,12 @@ impl Sim {
             let Some(unit) = self.units.get_mut(id) else {
                 continue;
             };
-            if !s.ally_contact[i] || !unit.is_moving() || s.within_arrival[i] {
+            // A chaser steers round the bodies in its way instead (see `steer`).
+            if !s.ally_contact[i]
+                || !unit.is_moving()
+                || s.within_arrival[i]
+                || unit.target.is_some()
+            {
                 unit.ally_stall = 0;
                 unit.ally_min_remaining = f32::MAX;
                 continue;
@@ -3346,9 +3106,13 @@ impl Sim {
             h.write_v2(u.chase_anchor);
             h.write_u64(u.chase_repath_in as u64);
             h.write_u64(u.engaged as u64);
-            h.write_u64(u.chase_slot as u64);
+            h.write_v2(u.last_move);
+            h.write_u64(u.steer_side as u64);
+            h.write_u64(u.steer_free as u64);
             h.write_f32(u.best_gap);
-            h.write_u64(u.hold_ticks as u64);
+            h.write_u64(u.blocked_ticks as u64);
+            h.write_f32(u.orbit);
+            h.write_u64(u.waiting as u64);
             h.write_u64(u.ally_stall as u64);
             h.write_f32(u.ally_min_remaining);
             h.write_u64(u.orders.len() as u64);
@@ -3474,207 +3238,279 @@ fn route_onto_channel(
     }
 }
 
-// ── Approach slots ────────────────────────────────────────────────────────────
+// ── Steering ──────────────────────────────────────────────────────────────────
 
-/// Most stations on one ring: the direction index is the low five bits of a
-/// slot code.
-const MAX_RING_SLOTS: usize = 32;
+/// Separation weight of a unit standing its ground in a fight (see
+/// [`HOLD_WEIGHT`] for how weights split a push): all but immovable, so
+/// whoever walks into it gives way. Steering is what keeps that rare.
+const SOLID_WEIGHT: f32 = 1000.0;
+/// An ally ahead of a chaser that covered less than this fraction of the
+/// chaser's step along its heading last tick is in the way.
+const SLOW_FRAC: f32 = 0.5;
+/// Clear ticks before a held steering side is let go.
+const STEER_RELEASE_TICKS: u8 = 10;
+/// Widest turn off the path heading a unit will steer, as [`turn_of`]'s
+/// pseudo-angle (`1 - cos`, so 1.7 is about 135°).
+const MAX_STEER_TURN: f32 = 1.7;
 
-/// `(cos, sin)` of `pi / n`, half a station's turn on an `n`-station ring, for
-/// staggering alternate rings. Literals: the sim may not run trig. Entry 0 is
-/// unused.
-const HALF_STEP: [(f32, f32); MAX_RING_SLOTS + 1] = [
-    (1.0, 0.0),
-    (-1.0, 0.0),
-    (0.0, 1.0),
-    (0.5, 0.8660254),
-    (SQRT_HALF, SQRT_HALF),
-    (0.809017, 0.58778524),
-    (0.8660254, 0.5),
-    (0.90096885, 0.43388373),
-    (0.9238795, 0.38268343),
-    (0.9396926, 0.34202015),
-    (0.95105654, 0.309017),
-    (0.959493, 0.28173256),
-    (0.9659258, 0.25881904),
-    (0.97094184, 0.23931566),
-    (0.9749279, 0.22252093),
-    (0.9781476, 0.20791169),
-    (0.98078525, 0.19509032),
-    (0.9829731, 0.18374951),
-    (0.9848077, 0.17364818),
-    (0.9863613, 0.16459459),
-    (0.98768836, 0.15643446),
-    (0.9888308, 0.14904226),
-    (0.98982143, 0.14231484),
-    (0.99068594, 0.13616665),
-    (0.9914449, 0.13052619),
-    (0.9921147, 0.12533323),
-    (0.99270886, 0.12053668),
-    (0.99323833, 0.11609291),
-    (0.9937122, 0.11196448),
-    (0.99413794, 0.10811902),
-    (0.9945219, 0.104528464),
-    (0.99486935, 0.10116832),
-    (0.9951847, 0.09801714),
-];
+/// [`MAX_STEER_TURN`] for a unit closing on its target (1.5 is 120°). Much
+/// past a right angle it is walking away from the fight, which reads as
+/// backing off: better to stand, give up and wait.
+const MAX_CHASE_TURN: f32 = 1.5;
+/// How far past touching, in its own radii, a unit may walk into a waiting
+/// ally in one tick. Pressing is what wraps a crowd round its target, but a
+/// full stride into the body ahead is a shove, and separation can't undo
+/// those as fast as a column delivers them.
+const PRESS_DEPTH_RADII: f32 = 0.1;
 
-/// `RING_DIRS[n][j]`: direction `j` half-stations round an `n`-station ring.
-/// Const f32 rotation by [`HALF_STEP`], bit-identical to runtime.
-static RING_DIRS: [[(f32, f32); 2 * MAX_RING_SLOTS]; MAX_RING_SLOTS + 1] = {
-    let mut t = [[(0.0, 0.0); 2 * MAX_RING_SLOTS]; MAX_RING_SLOTS + 1];
-    let mut n = 1;
-    while n <= MAX_RING_SLOTS {
-        let (c, s) = HALF_STEP[n];
-        let mut v = (1.0f32, 0.0f32);
-        let mut j = 0;
-        while j < 2 * n {
-            t[n][j] = v;
-            v = (v.0 * c - v.1 * s, v.0 * s + v.1 * c);
-            j += 1;
-        }
-        n += 1;
+/// What [`steer`] decided for one moving unit this tick.
+enum Steer {
+    /// Nothing in the way: follow the path.
+    Clear,
+    /// Go round, this way (`1` counter-clockwise, `-1` clockwise), heading here.
+    Round(i8, Vector2),
+    /// Hemmed in both ways: only close up to what is in the way, this far.
+    Boxed(Vector2),
+}
+
+/// Local avoidance for one moving unit heading for `next`: go round the bodies
+/// that won't move for it instead of into them. `all_the_way` looks as far as
+/// the grid allows rather than one step ahead: whether the whole way is open.
+///
+/// Only bodies that won't make way count: enemies (which can't be pushed at
+/// all), allies standing their ground in a fight, and, for a chaser, allies
+/// ahead of it in the queue that are held up (not merely slow off the mark).
+/// Other allies sort themselves out by separation, the way a crowd flows;
+/// that includes allies waiting behind a full ring, which a chaser presses
+/// into so the crowd wraps round the target. Its own target is exempt, or a
+/// unit would steer round the very thing it is walking up to. Allies are
+/// looked for over a shorter reach ([`ALLY_LOOKAHEAD_RADII`]), so a unit
+/// brushes along them rather than swinging wide.
+///
+/// Each body within reach rules out a cone of headings, the ones that would
+/// run into it within the look-ahead; the unit turns off its path heading,
+/// always the same way round, until it is out of every cone. Leaving a cone along its
+/// edge grazes the body, so a unit following a crowd's edge traces it
+/// smoothly, and walks in the moment a gap opens. That, with units in reach
+/// standing their ground, is all there is to a surround.
+///
+/// The way round is kept while the unit stays blocked ([`Unit::steer_side`]),
+/// and picked fresh as away from the nearest body in the way. Vector-only: no
+/// trig, so bit-deterministic.
+fn steer(
+    s: &mut StepScratch,
+    grid: &SpatialGrid,
+    relations: &[((u32, u32), Relation)],
+    i: usize,
+    unit: &Unit,
+    next: Vector2,
+    all_the_way: bool,
+) -> Steer {
+    s.waiting_obs.clear();
+    let h = norm(next - unit.pos);
+    if h == Vector2::ZERO || grid.cols == 0 || grid.rows == 0 {
+        return Steer::Clear;
     }
-    t
-};
-
-const SQRT_HALF: f32 = std::f32::consts::FRAC_1_SQRT_2;
-
-/// τ, for the ring-circumference stride below (no runtime trig, so it's a
-/// literal).
-const TAU: f32 = 6.283_185_5;
-
-/// How far inside weapon reach a station sits — see [`SLOT_STANDOFF`]. Capped
-/// at the reach itself, so a melee station lands against the target's body
-/// rather than behind the unit.
-fn station_margin(r_self: f32, attack_range: f32) -> f32 {
-    (SLOT_STANDOFF.get() * r_self).min(attack_range)
-}
-
-/// Most in-range approach rings a unit will consider.
-const MAX_INNER_RINGS: usize = 3;
-/// Out-of-range reserve rings beyond them, where a big crowd's overflow waits.
-const RESERVE_RINGS: usize = 3;
-const MAX_RINGS: usize = MAX_INNER_RINGS + RESERVE_RINGS;
-
-/// The approach rings around a target, for one attacker shape.
-#[derive(Clone, Copy, PartialEq)]
-struct Rings {
-    /// Radius of each ring, centre to centre.
-    d: [f32; MAX_RINGS],
-    /// Stations on each ring.
-    n: [u8; MAX_RINGS],
-    len: usize,
-    /// Rings `..inner` are within weapon reach; the rest are reserves.
-    inner: usize,
-}
-
-/// The approach rings around a target.
-///
-/// Ring 0 sits at `r_self + r_target + SLOT_STANDOFF * attack_range` — inside
-/// weapon range, which is the whole point; dropping either radius from the
-/// standoff (as a naive "ring attractor" does) parks attackers just out of
-/// reach. Further rings step *inward* a body diameter at a time while they
-/// still clear the target's own body, so a long-reach unit's whole in-range
-/// disc gets used instead of a single one-body-thick shell — with 24 attackers
-/// on one target, one ring leaves a third of them standing outside their own
-/// range doing nothing. Then [`RESERVE_RINGS`] reserve rings a body diameter
-/// apart beyond ring 0, out of range, so overflow waits in shells instead of
-/// pressing on the front rank.
-///
-/// Stations sit a body diameter apart on every ring, so outer shells pack as
-/// tightly as inner ones.
-fn slot_rings(r_self: f32, r_target: f32, attack_range: f32) -> Rings {
-    let mut rings = Rings {
-        d: [0.0; MAX_RINGS],
-        n: [0; MAX_RINGS],
-        len: 0,
-        inner: 0,
+    let p = s.positions[i];
+    let target = unit.target.and_then(|t| s.ids.binary_search(&t).ok());
+    let step = unit.max_speed * DT;
+    let slow = step * SLOW_FRAC;
+    let seeking = target.is_none() && unit.attack_move_goal.is_some();
+    let mut look = if all_the_way {
+        f32::MAX
+    } else {
+        step + unit.radius * STEER_LOOKAHEAD_RADII.get()
     };
-    let outer = r_self + r_target + attack_range - station_margin(r_self, attack_range);
-    let floor = r_self + r_target;
-    let mut n = 0;
-    while n < MAX_INNER_RINGS {
-        let d = outer - 2.0 * r_self * n as f32;
-        if d < floor {
-            break;
+    // A chaser stops once in reach: nothing past that is in its way.
+    if let Some(k) = target {
+        let gap = (s.positions[k] - p).length() - unit.radius - s.radii[k] - unit.attack_range
+            + (STOP_INSIDE_RADII.get() * unit.radius).min(0.5 * unit.attack_range);
+        look = look.min(gap.max(0.0) + unit.radius * 0.5);
+    }
+    // The 3x3 scan below only sees bodies within a cell.
+    look = look.min(grid.cell_size() - 2.0 * unit.radius).max(0.0);
+    s.steer_obs.clear();
+    let ally_look = step + unit.radius * ALLY_LOOKAHEAD_RADII.get();
+    let (cx, cy) = grid.cell_coords(p);
+    for ny in cy.saturating_sub(1)..=(cy + 1).min(grid.rows - 1) {
+        for nx in cx.saturating_sub(1)..=(cx + 1).min(grid.cols - 1) {
+            for &j in grid.cell_entries(nx, ny) {
+                let j = j as usize;
+                if j == i || Some(j) == target {
+                    continue;
+                }
+                let ally = s.teams[j] == unit.team
+                    || relation_of(relations, unit.team, s.teams[j]) != Relation::Enemy;
+                let off = s.positions[j] - p;
+                if ally && !s.solid[j] && s.waiting[j] {
+                    let d = off.length();
+                    let reach = unit.radius + s.radii[j];
+                    if d > 1e-6 && d - reach < step + unit.radius {
+                        s.waiting_obs.push((off * (1.0 / d), 0.0, 0.0, d, reach));
+                    }
+                    continue;
+                }
+                if ally && !s.solid[j] {
+                    // Only in a chaser's way if it is ahead in the queue (in
+                    // front, and nearer where this unit is going; ties to the
+                    // lower index) and held up, not merely slow because it
+                    // has only just set off. One beside or behind is
+                    // shouldered aside like any moving crowd, and no two ever
+                    // wait on each other.
+                    let ahead = off.dot(h) > 0.0 && {
+                        let mine = (next - p).length_squared();
+                        let theirs = (next - s.positions[j]).length_squared();
+                        theirs < mine || (theirs == mine && j < i)
+                    };
+                    if target.is_none() || !ahead || !s.stuck[j] || s.moves[j].dot(h) >= slow {
+                        continue;
+                    }
+                }
+                // An attack-move is out looking for a fight: walking round the
+                // enemy would be walking round the thing it wants to notice.
+                if !ally && seeking {
+                    continue;
+                }
+                let d = off.length();
+                let reach = unit.radius + s.radii[j];
+                let look = if ally && !all_the_way {
+                    look.min(ally_look)
+                } else {
+                    look
+                };
+                if d - reach >= look || d <= 1e-6 {
+                    continue;
+                }
+                let n = off * (1.0 / d);
+                // Half-angle of the headings that touch it within `look`:
+                // the whole tangent cone if `look` reaches the tangent point,
+                // else only those whose endpoint lands inside it (law of
+                // cosines on `d`, `look` and `reach`).
+                let (cos, sin) = if d <= reach {
+                    (0.0, 1.0)
+                } else {
+                    let tangent2 = d * d - reach * reach;
+                    if look * look >= tangent2 {
+                        (tangent2.sqrt() / d, reach / d)
+                    } else {
+                        let cos = ((tangent2 + look * look) / (2.0 * d * look)).min(1.0);
+                        (cos, (1.0 - cos * cos).max(0.0).sqrt())
+                    }
+                };
+                s.steer_obs.push((n, cos, sin, d, reach));
+            }
         }
-        rings.d[n] = d;
-        n += 1;
     }
-    if n == 0 {
-        // Degenerate (zero radii): one ring at the standoff, whatever it is.
-        rings.d[0] = outer;
-        n = 1;
+    // Blocking obstacle nearest dead ahead, if any.
+    let blocker = s
+        .steer_obs
+        .iter()
+        .filter(|&&(n, cos, ..)| h.dot(n) > cos + CONE_EPS)
+        .max_by(|a, b| h.dot(a.0).total_cmp(&h.dot(b.0)));
+    let Some(&(n0, ..)) = blocker else {
+        return Steer::Clear;
+    };
+    let side = match unit.steer_side {
+        0 => {
+            // Away from the body: it sits on one side of the heading, so the
+            // short way out is the other.
+            if h.x * n0.y - h.y * n0.x > 0.0 { -1 } else { 1 }
+        }
+        side => side,
+    };
+    let max_turn = if target.is_some() {
+        MAX_CHASE_TURN
+    } else {
+        MAX_STEER_TURN
+    };
+    if let Some(dir) = turn_clear(h, side as f32, &s.steer_obs, max_turn) {
+        return Steer::Round(side, dir);
     }
-    rings.inner = n;
-    for k in 0..RESERVE_RINGS {
-        rings.d[n + k] = outer + 2.0 * r_self * (k + 1) as f32;
+    // A side already held is kept even when it is shut for now: turning back
+    // and forth between the two is the dithering it exists to prevent.
+    if unit.steer_side == 0
+        && let Some(dir) = turn_clear(h, -side as f32, &s.steer_obs, max_turn)
+    {
+        return Steer::Round(-side, dir);
     }
-    rings.len = n + RESERVE_RINGS;
-    for k in 0..rings.len {
-        let fit = if r_self > 0.0 {
-            TAU * rings.d[k] / (2.0 * r_self)
-        } else {
-            MAX_RING_SLOTS as f32
-        };
-        rings.n[k] = (fit as usize).clamp(1, MAX_RING_SLOTS) as u8;
+    // Still close up to whatever is in the way: a crowd packs, it doesn't
+    // queue a look-ahead apart.
+    Steer::Boxed(h * free_ahead(h, &s.steer_obs).min(step))
+}
+
+/// How far a unit can walk along `h` before touching any of `obs` (see
+/// [`StepScratch::steer_obs`]); `f32::MAX` if nothing lies across the way.
+fn free_ahead(h: Vector2, obs: &[(Vector2, f32, f32, f32, f32)]) -> f32 {
+    obs.iter()
+        .filter_map(|&(n, _, _, d, reach)| {
+            let b = d * h.dot(n);
+            let disc = b * b - (d * d - reach * reach);
+            (b > 0.0 && disc >= 0.0).then(|| (b - disc.sqrt()).max(0.0))
+        })
+        .fold(f32::MAX, f32::min)
+}
+
+/// `m` with every component that would carry a unit into one of `obs` (see
+/// [`StepScratch::steer_obs`]) past touching taken out: it slides along what
+/// it leans on. Nothing if that leaves it walking away from where it leant.
+fn slide(m: Vector2, obs: &[(Vector2, f32, f32, f32, f32)]) -> Vector2 {
+    let mut v = m;
+    // Repeated so a unit leaning into two bodies at once satisfies both.
+    for _ in 0..3 {
+        for &(n, _, _, d, reach) in obs {
+            let into = v.dot(n) - (d - reach).max(0.0);
+            if into > 0.0 {
+                v -= n * into;
+            }
+        }
     }
-    rings
+    if v.dot(m) > 0.0 { v } else { Vector2::ZERO }
 }
 
-/// Centre distance of the outermost reserve ring (see [`slot_rings`]).
-fn reserve_reach(r_self: f32, r_target: f32, attack_range: f32) -> f32 {
-    let outer = r_self + r_target + attack_range - station_margin(r_self, attack_range);
-    outer + 2.0 * r_self * RESERVE_RINGS as f32
-}
+/// Slack on the cone test, so a heading exactly along a cone's edge (where the
+/// last turn left it) reads as clear.
+const CONE_EPS: f32 = 1e-4;
 
-/// The units attacking dense target `k`, from [`StepScratch::rivals`].
-fn rivals_of<'a>(start: &[u32], rivals: &'a [u32], k: u32) -> &'a [u32] {
-    match k {
-        u32::MAX => &[],
-        k => &rivals[start[k as usize] as usize..start[k as usize + 1] as usize],
+/// Turn from `h` the `side` way (`1` counter-clockwise) until outside every
+/// obstacle cone `(direction, cos, sin, ..)`; `None` past `max_turn`.
+fn turn_clear(
+    h: Vector2,
+    side: f32,
+    obs: &[(Vector2, f32, f32, f32, f32)],
+    max_turn: f32,
+) -> Option<Vector2> {
+    let mut v = h;
+    for _ in 0..=obs.len() {
+        let mut exit: Option<(f32, Vector2)> = None;
+        for &(n, cos, sin, ..) in obs {
+            if v.dot(n) <= cos + CONE_EPS {
+                continue;
+            }
+            // The cone's far edge this way round: `n` turned by its half-angle.
+            let s = sin * side;
+            let e = Vector2::new(n.x * cos - n.y * s, n.x * s + n.y * cos);
+            let t = turn_of(h, e, side);
+            if exit.is_none_or(|(bt, _)| t > bt) {
+                exit = Some((t, e));
+            }
+        }
+        match exit {
+            None => return Some(v),
+            Some((t, _)) if t > max_turn => return None,
+            Some((_, e)) => v = e,
+        }
     }
+    None
 }
 
-/// Ring index of a slot code (`ring * 32 + direction index`), clamped so a
-/// code from a call with more rings than this one can still be read.
-fn ring_of(code: u16) -> usize {
-    ((code >> 5) as usize).min(MAX_RINGS - 1)
-}
-
-/// Dense index of a slot code, for per-station tallies.
-fn slot_index(code: u16) -> usize {
-    ring_of(code) * MAX_RING_SLOTS + (code & 31) as usize
-}
-
-/// Unit direction of a slot code: evenly around its ring, every other ring
-/// turned half a station so each shell nests in the gaps of the one inside.
-fn slot_dir(code: u16, rings: &Rings) -> Vector2 {
-    let ring = ring_of(code);
-    let n = rings.n[ring].max(1) as usize;
-    let (x, y) = RING_DIRS[n][2 * ((code & 31) as usize % n) + ring % 2];
-    Vector2::new(x, y)
-}
-
-/// World point of a slot code (`ring * 32 + direction index`).
-fn slot_point(target_pos: Vector2, code: u16, rings: &Rings) -> Vector2 {
-    target_pos + slot_dir(code, rings) * rings.d[ring_of(code)]
-}
-
-/// Where a unit holding slot `code` should walk next: its station, or the arc
-/// step toward it when the target's own body sits on the direct chord (see
-/// [`orbit_step`]). [`NO_SLOT`] walks at the target itself.
-fn slot_goal(pos: Vector2, target_pos: Vector2, code: u16, rings: &Rings, outside: f32) -> Vector2 {
-    match code {
-        NO_SLOT => target_pos,
-        code => orbit_step(
-            pos,
-            target_pos,
-            slot_point(target_pos, code, rings),
-            rings.d[ring_of(code)],
-            outside,
-        ),
+/// Monotone stand-in for the angle turned from `h` to `v` going the `side` way
+/// round: 0 straight ahead, 1 at 90°, 2 at 180°, up to 4. Trig-free.
+fn turn_of(h: Vector2, v: Vector2, side: f32) -> f32 {
+    let c = h.dot(v);
+    if side * (h.x * v.y - h.y * v.x) >= 0.0 {
+        1.0 - c
+    } else {
+        3.0 + c
     }
 }
 
@@ -3715,204 +3551,21 @@ fn occupancy(
     total
 }
 
-/// Pick the approach slot a blocked attacker should walk to, as a slot code
-/// (or [`NO_SLOT`] to keep walking at the target).
-///
-/// Every station (see [`slot_rings`]) scored by ally occupancy, rival claims,
-/// the arc to walk there and a per-ring penalty; lowest wins. No assignment
-/// and no capacity: two units may pick the same station and separation sorts
-/// it out.
-///
-/// A candidate needs clear line of sight from the *target* (the slot has to be
-/// somewhere the unit could actually stand and shoot from); with a target in a
-/// doorway or against a wall most candidates fail that and the unit falls back
-/// to chasing the target directly.
-#[allow(clippy::too_many_arguments)]
-fn pick_slot(
-    cdt: &CDT,
-    grid: &SpatialGrid,
-    positions: &[Vector2],
-    radii: &[f32],
-    self_i: usize,
-    pos: Vector2,
-    r_self: f32,
-    target_pos: Vector2,
-    rings: &Rings,
-    current: u16,
-    claims: &[(u16, f32)],
-    rivals: &[u32],
-    los: &mut [u8; MAX_RING_SLOTS * MAX_RINGS],
-) -> u16 {
-    // Occupancy can't see bodies still walking in, so without claims the
-    // whole swarm heads for the near side. A claim counts only if its holder
-    // is at most a body further off, so nobody holds a station from afar.
-    let mut claimed = [0u8; MAX_RING_SLOTS * MAX_RINGS];
-    let here = positions[self_i];
-    for &k in rivals {
-        let k = k as usize;
-        let (code, theirs) = claims[k];
-        if k != self_i && code != NO_SLOT {
-            let idx = slot_index(code);
-            let mine = (here - slot_point(target_pos, code, rings)).length();
-            if theirs <= mine + r_self {
-                claimed[idx] = claimed[idx].saturating_add(1);
-            }
-        }
-    }
-    // The unit's own bearing *as seen from the target*: the arc from here to a
-    // candidate is what the unit has to walk (see `orbit_step`). Measuring the
-    // turn from the unit's viewpoint instead makes the station directly behind
-    // the target look like "straight ahead" and picks it, sending the unit on
-    // a lap around the target it never needed to make.
-    let bearing = norm(pos - target_pos);
-    let turn_cost = SLOT_TURN_COST.get();
-    let outer_penalty = SLOT_OUTER_PENALTY.get();
-    let inner_penalty = SLOT_INNER_PENALTY.get();
-    // Everything but occupancy: cheap, and a floor on the full cost, since
-    // occupancy is never negative.
-    let base_of = |code: u16| -> f32 {
-        let ring = ring_of(code);
-        let dir = slot_dir(code, rings);
-        let mut cost = claimed[slot_index(code)] as f32
-            + turn_cost * (1.0 - (bearing.x * dir.x + bearing.y * dir.y));
-        // Prefer standing at reach: each ring inward is a step closer than
-        // this unit needs to be, a reserve ring can't shoot at all, and each
-        // reserve ring outward is a step further to walk in when room opens.
-        cost += if ring >= rings.inner {
-            outer_penalty + (ring - rings.inner) as f32 * inner_penalty
-        } else {
-            ring as f32 * inner_penalty
-        };
-        cost
-    };
-    // Line of sight only for what still beats `cutoff`: it's a mesh walk.
-    // `None` forces the full evaluation, for the held station below.
-    let mut cost_of = |code: u16, base: f32, cutoff: Option<f32>| -> Option<f32> {
-        let p = slot_point(target_pos, code, rings);
-        let cost = base + occupancy(grid, positions, radii, self_i, p, r_self);
-        if cutoff.is_some_and(|bc| cost >= bc) {
-            return None;
-        }
-        let seen = &mut los[slot_index(code)];
-        if *seen == 0 {
-            *seen = if clear_los(cdt, target_pos, p, r_self) {
-                1
-            } else {
-                2
-            };
-        }
-        if *seen == 2 {
-            return None;
-        }
-        Some(cost)
-    };
-
-    // Cheapest floor first, so the search usually stops within a few of up
-    // to ~200 stations.
-    let mut cands = [(0.0f32, 0u16); MAX_RINGS * MAX_RING_SLOTS];
-    let mut n_cands = 0;
-    // Outer reserve rings only while the inner ones can't hold every rival:
-    // otherwise they're just more line-of-sight walks.
-    let mut room = 0;
-    for ring in 0..rings.len {
-        if ring > rings.inner && room >= rivals.len() {
-            break;
-        }
-        room += rings.n[ring] as usize;
-        if rings.d[ring] <= 0.0 {
-            continue;
-        }
-        for k in 0..rings.n[ring] as u16 {
-            let code = ring as u16 * MAX_RING_SLOTS as u16 + k;
-            cands[n_cands] = (base_of(code), code);
-            n_cands += 1;
-        }
-    }
-    let cands = &mut cands[..n_cands];
-    cands.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let mut best: Option<(f32, u16)> = None;
-    for &(base, code) in cands.iter() {
-        let cutoff = best.map(|(bc, _)| bc);
-        if cutoff.is_some_and(|bc| base >= bc) {
-            break;
-        }
-        if let Some(cost) = cost_of(code, base, cutoff) {
-            best = Some((cost, code));
-        }
-    }
-    let Some((best_cost, best_code)) = best else {
-        return NO_SLOT; // nowhere to stand (walled-in target): chase directly
-    };
-    // Switch margin: re-scoring on the repath cadence must not turn the goal
-    // itself into a stutter source.
-    if current != NO_SLOT
-        && let Some(held) = cost_of(current, base_of(current), None)
-        && best_cost > held - SLOT_SWITCH_MARGIN.get()
-    {
-        return current;
-    }
-    best_code
-}
-
-/// Where to actually walk next on the way to a station.
-///
-/// A station on the far side of the target is not reachable in a straight
-/// line: the target's own body sits on the chord, so a unit aimed straight at
-/// it grinds into the target and stays there (paths are computed against
-/// walls, not bodies). So a unit more than 45° of bearing away from its
-/// station circles instead: one 45° arc step at a time, re-derived every
-/// repath, which reads as circling the target rather than shoving through it.
-///
-/// It circles at its own distance, clamped between `ring` and `outside` (the
-/// stationed crowd's edge): lower ploughs through the crowd, higher is the
-/// long way round.
-///
-/// 45° is the widest step whose chord still clears both bodies: the chord of a
-/// `d` ring subtends `d * cos(22.5°)` ≈ `0.92 d` at closest approach, and the
-/// ring itself starts at `r_self + r_target`. No trig at runtime — a 45°
-/// rotation is a fixed matrix built from [`SQRT_HALF`].
-fn orbit_step(
-    pos: Vector2,
-    target_pos: Vector2,
-    slot_pos: Vector2,
-    ring: f32,
-    outside: f32,
-) -> Vector2 {
-    let offset = pos - target_pos;
-    let from = norm(offset);
-    let to = norm(slot_pos - target_pos);
-    if from == Vector2::ZERO || to == Vector2::ZERO {
-        return slot_pos;
-    }
-    // Within one arc step of the station: go straight there.
-    if from.x * to.x + from.y * to.y >= SQRT_HALF {
-        return slot_pos;
-    }
-    // Rotate the unit's own bearing 45° toward the station.
-    let sin = if from.x * to.y - from.y * to.x >= 0.0 {
-        SQRT_HALF
-    } else {
-        -SQRT_HALF
-    };
-    let stepped = Vector2::new(
-        from.x * SQRT_HALF - from.y * sin,
-        from.x * sin + from.y * SQRT_HALF,
-    );
-    target_pos + stepped * ring.max(offset.length().min(outside))
-}
-
 /// Reset everything about one engagement: the post to return to, whose choice
-/// the target was, the station latch, the held station and both
-/// blocked-progress counters. Every
+/// the target was, the station latch, the steering side and the
+/// blocked/waiting counters. Every
 /// path out of a fight (a new order, a fresh target, a target dying) goes
 /// through this, so a resumed march can never inherit stale combat state.
 fn clear_combat_state(unit: &mut Unit) {
     unit.post = None;
     unit.target_commanded = false;
     unit.engaged = false;
-    unit.chase_slot = NO_SLOT;
+    unit.steer_side = 0;
+    unit.steer_free = 0;
     unit.best_gap = f32::MAX;
-    unit.hold_ticks = 0;
+    unit.blocked_ticks = 0;
+    unit.orbit = 0.0;
+    unit.waiting = false;
     unit.ally_stall = 0;
     unit.ally_min_remaining = f32::MAX;
 }
@@ -5496,6 +5149,7 @@ mod tests {
         Unit {
             pos,
             prev_pos: pos,
+            last_move: Vector2::ZERO,
             radius: 1.0,
             max_speed: 1.0,
             path: Vec::new(),
@@ -5521,9 +5175,12 @@ mod tests {
             post: None,
             target_commanded: false,
             engaged: false,
-            chase_slot: NO_SLOT,
+            steer_side: 0,
+            steer_free: 0,
             best_gap: f32::MAX,
-            hold_ticks: 0,
+            blocked_ticks: 0,
+            orbit: 0.0,
+            waiting: false,
             ally_stall: 0,
             ally_min_remaining: f32::MAX,
         }
@@ -6843,8 +6500,10 @@ mod tests {
         /// Fewest / mean attackers firing on one tick of the window.
         min_firing: usize,
         mean_firing: f32,
-        /// Distinct eighths of the compass occupied by a firing attacker.
-        sectors: usize,
+        /// Widest bearing gap, in radians, between firing attackers round the
+        /// defender, at its worst over the window: under a quarter turn is
+        /// surrounded.
+        widest_gap: f32,
     }
 
     /// Run a blob fight and measure it over `window` ticks after `warmup`.
@@ -6856,11 +6515,12 @@ mod tests {
         let (mut rev, mut moved_ticks) = (0.0f32, 0.0f32);
         let mut min_surf = f32::MAX;
         let (mut min_firing, mut sum_firing) = (usize::MAX, 0usize);
-        let mut sectors = [false; 8];
+        let mut widest_gap = 0.0f32;
         for _ in 0..window {
             sim.step(&[]);
             let dp = unit(&sim, defender).pos;
             let mut firing = 0;
+            let mut bearings = Vec::new();
             for (k, &id) in attackers.iter().enumerate() {
                 let u = unit(&sim, id);
                 let d = u.pos - u.prev_pos;
@@ -6875,17 +6535,18 @@ mod tests {
                 if u.engaged {
                     firing += 1;
                     let a = u.pos - dp;
-                    // Ring stations sit on the compass axes, so a unit on one
-                    // counts for both sides rather than for whichever the
-                    // sign of a 1e-6 offset picks.
-                    let bearing = a.y.atan2(a.x);
-                    for off in [-1e-3, 1e-3] {
-                        let eighth = (bearing + off).rem_euclid(std::f32::consts::TAU)
-                            / (std::f32::consts::TAU / 8.0);
-                        sectors[eighth as usize % 8] = true;
-                    }
+                    bearings.push(a.y.atan2(a.x));
                 }
             }
+            bearings.sort_by(f32::total_cmp);
+            let wrap = bearings.first().map_or(std::f32::consts::TAU, |&f| {
+                f + std::f32::consts::TAU - bearings.last().expect("non-empty")
+            });
+            let gap = bearings
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .fold(wrap, f32::max);
+            widest_gap = widest_gap.max(gap);
             min_firing = min_firing.min(firing);
             sum_firing += firing;
         }
@@ -6900,7 +6561,7 @@ mod tests {
             defender_moved: dist(unit(&sim, defender).pos, DEF),
             min_firing,
             mean_firing: sum_firing as f32 / window as f32,
-            sectors: sectors.iter().filter(|&&b| b).count(),
+            widest_gap,
         }
     }
 
@@ -6945,7 +6606,10 @@ mod tests {
                 "grouped={group}: dps {:.2} — the ring stopped delivering: {s:?}",
                 s.dps
             );
-            assert!(s.sectors == 8, "attackers must encircle: {s:?}");
+            assert!(
+                s.widest_gap <= std::f32::consts::FRAC_PI_2,
+                "attackers must encircle: {s:?}"
+            );
         }
     }
 
@@ -7022,32 +6686,15 @@ mod tests {
     }
 
     #[test]
-    fn test_station_keeping_never_shoves_a_bystander_enemy() {
-        // A stationed attacker knocked off its station, still within its
-        // holding slack, with an idle enemy between it and the station.
-        // Station keeping moves it after the flock's enemy clip, so it must
-        // not walk into that enemy and shove it.
+    fn test_steering_round_a_bystander_enemy_never_shoves_it() {
+        // An idle enemy stands square between an attacker and its target.
+        // The attacker has to steer round it, and no part of its motion,
+        // steering included, may push it.
         let mut sim = arena_sim(600.0, 600.0, 7);
         let defender = spawn_stats(&mut sim, DEF, 5.0, 0.0, 1, 1.0e6, 0.0, 0.0, 1);
-        let a = spawn_stats(&mut sim, v(300.0, DEF.y), 5.0, 30.0, 0, 1.0e6, 1.0, 2.0, 1);
-        sim.step(&[Command::Attack {
-            units: vec![a],
-            target: defender,
-        }]);
-        step_n(&mut sim, 200);
-        let u = unit(&sim, a);
-        assert!(
-            u.engaged && u.chase_slot != NO_SLOT,
-            "attacker never stationed"
-        );
-        let rings = slot_rings(u.radius, 5.0, u.attack_range);
-        let station = slot_point(DEF, u.chase_slot, &rings);
-        let out = norm(station - DEF);
-        let side = Vector2::new(-out.y, out.x);
-        sim.units.get_mut(a).expect("alive").pos = station + side * 4.0;
         let bystander = spawn_stats(
             &mut sim,
-            station - side * 6.5,
+            DEF - v(30.0, 0.0),
             5.0,
             10.0,
             1,
@@ -7056,15 +6703,37 @@ mod tests {
             0.0,
             1,
         );
+        let a = spawn_stats(
+            &mut sim,
+            DEF - v(80.0, 0.0),
+            5.0,
+            30.0,
+            0,
+            1.0e6,
+            1.0,
+            2.0,
+            1,
+        );
         let held = unit(&sim, bystander).pos;
-        for t in 0..60 {
+        sim.step(&[Command::Attack {
+            units: vec![a],
+            target: defender,
+        }]);
+        let mut steered = false;
+        for t in 0..200 {
             sim.step(&[]);
+            steered |= unit(&sim, a).steer_side != 0;
             assert_eq!(
                 unit(&sim, bystander).pos,
                 held,
                 "bystander shoved by tick {t}"
             );
         }
+        assert!(steered, "the attacker never had to steer");
+        assert!(
+            unit(&sim, a).engaged,
+            "the attacker never reached its target"
+        );
     }
 
     #[test]
@@ -7093,19 +6762,17 @@ mod tests {
         }
     }
 
-    /// Step 3, slot spacing: with more attackers than the inner ring holds,
-    /// the ring must still *fill*. Slots spaced under a body diameter make
-    /// every candidate read as occupied by its own neighbours and nobody moves
-    /// in — invisible to every other assertion here, so it gets its own test.
-    /// Capacity is `floor(2 pi d / 2r)` = 7 for this geometry.
+    /// With more attackers than fit round the target, the ring must still
+    /// *fill*: late arrivals have to find the gaps by steering round the
+    /// crowd, not stall behind it. Invisible to every other assertion here, so
+    /// it gets its own test. Six bodies of this size fit in reach (see
+    /// `test_blob_on_one_defender_keeps_dealing_damage`).
     #[test]
     fn test_inner_ring_fills_to_capacity() {
         let s = measure_fight(12, false, 200, 300);
-        // Measured mean 7.44 stationed, never fewer than 4 on any tick.
-        assert!(
-            s.mean_firing >= 6.5,
-            "inner ring is not filling (slots spaced under a body diameter?): {s:?}"
-        );
+        // Measured a steady 6 firing (the slot rings reported 7.44 "stationed",
+        // counting reserves standing out of reach).
+        assert!(s.mean_firing >= 5.5, "inner ring is not filling: {s:?}");
         assert!(s.min_firing >= 4, "ring collapsed on some tick: {s:?}");
     }
 
@@ -7166,9 +6833,10 @@ mod tests {
         );
     }
 
-    /// Step 3: a unit that can't reach the ring leaves for a free slot rather
-    /// than pressing (the old concede-and-freeze failure) or queueing behind
-    /// the front rank forever. Approach is from the left, so anything that
+    /// A unit that can't reach the target goes round the crowd for a gap
+    /// rather than pressing, and only stands idle behind the front rank (the
+    /// old concede-and-freeze failure) when there is no gap left: the ring is
+    /// at its capacity of six. Approach is from the left, so anything that
     /// ends up past the defender got there by going *around*.
     #[test]
     fn test_blocked_units_go_around_instead_of_pressing() {
@@ -7176,27 +6844,33 @@ mod tests {
         step_n(&mut sim, 200);
         let mut travel = vec![0.0f32; attackers.len()];
         let mut fired = vec![false; attackers.len()];
+        let mut ring_full = true;
         for _ in 0..300 {
             sim.step(&[]);
+            let mut firing = 0;
             for (k, &id) in attackers.iter().enumerate() {
                 let u = unit(&sim, id);
                 travel[k] += dist(u.pos, u.prev_pos);
                 fired[k] |= u.engaged;
+                firing += u.engaged as usize;
             }
+            ring_full &= firing >= 6;
         }
         let def_x = unit(&sim, defender).pos.x;
         let far_side = attackers
             .iter()
             .filter(|&&id| unit(&sim, id).pos.x > def_x)
             .count();
+        // Measured 2: the six that fit in reach sit a sixth of a turn apart,
+        // so two land past the defender and the rest of the ring on the poles.
         assert!(
-            far_side >= 3,
+            far_side >= 2,
             "nobody went around the defender: {far_side} of 12 on the far side"
         );
         for k in 0..attackers.len() {
             assert!(
-                fired[k] || travel[k] > 5.0,
-                "unit {k} latched in place without ever firing (travel {:.2})",
+                fired[k] || travel[k] > 5.0 || ring_full,
+                "unit {k} latched in place beside a gap in the ring (travel {:.2})",
                 travel[k]
             );
         }
@@ -7330,12 +7004,11 @@ mod tests {
         );
     }
 
-    /// Step 3, moving target: the ring is anchored to the target's *current*
-    /// position (slots are stored as a direction code, not a point), so a
-    /// kiting target drags it along. Attackers must keep landing hits and must
-    /// not thrash between slots while doing it.
+    /// Moving target: the crowd round a kiting target is re-formed every tick
+    /// by steering alone. Attackers must keep landing hits, and must not
+    /// dither between going round the crowd one way and the other.
     #[test]
-    fn test_moving_target_drags_ring_without_slot_thrash() {
+    fn test_moving_target_chase_without_side_thrash() {
         let mut sim = arena_sim(900.0, 600.0, 5);
         let kiter = spawn_stats(&mut sim, v(300.0, 300.0), 5.0, 8.0, 1, 1.0e6, 0.0, 0.0, 1);
         let mut attackers = Vec::new();
@@ -7358,9 +7031,9 @@ mod tests {
         }]);
         step_n(&mut sim, 120);
         let hp0 = unit(&sim, kiter).health;
-        let mut prev: Vec<u16> = attackers
+        let mut prev: Vec<i8> = attackers
             .iter()
-            .map(|&id| unit(&sim, id).chase_slot)
+            .map(|&id| unit(&sim, id).steer_side)
             .collect();
         let mut changes = vec![0u32; attackers.len()];
         for t in 0..300 {
@@ -7380,11 +7053,11 @@ mod tests {
             };
             sim.step(&cmds);
             for (k, &id) in attackers.iter().enumerate() {
-                let slot = unit(&sim, id).chase_slot;
-                if slot != prev[k] {
+                let side = unit(&sim, id).steer_side;
+                if prev[k] != 0 && side == -prev[k] {
                     changes[k] += 1;
-                    prev[k] = slot;
                 }
+                prev[k] = side;
             }
         }
         assert!(
@@ -7393,8 +7066,8 @@ mod tests {
         );
         let worst = *changes.iter().max().expect("non-empty");
         assert!(
-            worst < 60,
-            "slot thrash on a moving target: {changes:?} changes over 300 ticks"
+            worst < 10,
+            "side thrash on a moving target: {changes:?} reversals over 300 ticks"
         );
     }
 
@@ -7639,8 +7312,8 @@ mod tests {
     }
 
     /// Cross-cutting: a resumed march must not inherit combat state. The
-    /// units in this fight are blocked and holding slots when their target
-    /// dies, which is the state most likely to leak.
+    /// units in this fight are steering round the crowd or waiting their turn
+    /// when their target dies, which is the state most likely to leak.
     #[test]
     fn test_resumed_march_inherits_no_combat_state() {
         let mut sim = arena_sim(900.0, 600.0, 29);
@@ -7665,18 +7338,19 @@ mod tests {
             units: attackers.clone(),
             goal,
         }]);
-        // Long enough to settle into a ring with blocked units conceding onto
-        // slots — the state most likely to leak into the resumed march.
-        let mut ever_slotted = false;
+        // Long enough to settle into a ring with the overflow steering round
+        // it or waiting: the state most likely to leak into the resumed march.
+        let mut ever_blocked = false;
         for _ in 0..250 {
             sim.step(&[]);
-            ever_slotted |= attackers
-                .iter()
-                .any(|&id| unit(&sim, id).chase_slot != NO_SLOT);
+            ever_blocked |= attackers.iter().any(|&id| {
+                let u = unit(&sim, id);
+                u.target.is_some() && (u.steer_side != 0 || u.waiting)
+            });
         }
         assert!(
-            ever_slotted,
-            "scenario must actually produce slot-holding units"
+            ever_blocked,
+            "scenario must actually produce blocked attackers"
         );
         step_n(&mut sim, 800);
         assert!(sim.units().get(defender).is_none(), "defender must die");
@@ -7684,10 +7358,11 @@ mod tests {
             let u = unit(&sim, id);
             assert!(u.target.is_none(), "target must be cleared");
             assert!(!u.engaged, "engaged must be cleared");
-            assert_eq!(u.chase_slot, NO_SLOT, "slot must be released");
-            assert_eq!(u.hold_ticks, 0, "block counter must be cleared");
-            // A body looser than usual: the march resumes from reserve
-            // shells, not a packed blob.
+            assert!(!u.waiting, "wait must be cleared");
+            assert_eq!(u.blocked_ticks, 0, "block counter must be cleared");
+            assert_eq!(u.orbit, 0.0, "orbit must be cleared");
+            // A body looser than usual: the march resumes from the crowd
+            // round the target, not a packed blob.
             assert!(
                 u.parked && dist(u.pos, goal) < u.arrival_r + 3.0 * u.radius,
                 "must resume and reach the march goal"
@@ -7718,6 +7393,106 @@ mod tests {
         assert_eq!(
             move_ticks, attack_move_ticks,
             "attack-move through empty space must behave exactly like a plain move"
+        );
+    }
+    /// Surface gap from `u` to a radius-5 [`blob_fight`] defender at `d`.
+    fn blob_gap(u: &Unit, d: Vector2) -> f32 {
+        (u.pos - d).length() - u.radius - 5.0
+    }
+
+    /// A block standing still when the attack order lands walks straight at
+    /// the target. Every unit's queue-mate ahead has not moved yet, and read
+    /// as stalled that sent the whole block swerving round each other, row by
+    /// row. Worst stride off the heading in the first 20 ticks: 134° before,
+    /// 8° now.
+    #[test]
+    fn test_attack_from_rest_walks_straight_at_the_target() {
+        let (mut sim, attackers, defender) = blob_fight(40, false);
+        let d = unit(&sim, defender).pos;
+        for t in 0..20 {
+            let prev: Vec<Vector2> = attackers.iter().map(|&a| unit(&sim, a).pos).collect();
+            sim.step(&[]);
+            for (&a, &p) in attackers.iter().zip(&prev) {
+                let u = unit(&sim, a);
+                let (h, m) = (d - p, u.pos - p);
+                // Strides only, and clear of the crowd forming at the target.
+                if m.length() < 0.5 || blob_gap(u, d) < 25.0 {
+                    continue;
+                }
+                let cos = h.dot(m) / (h.length() * m.length());
+                assert!(
+                    cos > 20f32.to_radians().cos(),
+                    "tick {t}: {a:?} strode {:.0}° off the way to its target",
+                    cos.clamp(-1.0, 1.0).acos().to_degrees()
+                );
+            }
+        }
+    }
+
+    /// Overflow that can't get into reach goes round the crowd or waits; it
+    /// doesn't walk back out of the fight. Measured over forty attackers on
+    /// one defender, as outward motion while still closing on it. Before the
+    /// chase turn cap: longest walk away 34, 34 per attacker in all. Now 11
+    /// and 16, much of that separation shoving.
+    #[test]
+    fn test_overflow_never_backs_away_from_its_target() {
+        let (mut sim, attackers, defender) = blob_fight(40, false);
+        let d = unit(&sim, defender).pos;
+        let mut walk = vec![0.0f32; attackers.len()];
+        let (mut longest, mut total) = (0.0f32, 0.0f32);
+        for _ in 0..1500 {
+            let prev: Vec<Vector2> = attackers.iter().map(|&a| unit(&sim, a).pos).collect();
+            sim.step(&[]);
+            for ((&a, &p), w) in attackers.iter().zip(&prev).zip(&mut walk) {
+                let u = unit(&sim, a);
+                let out = (u.pos - d).length() - (p - d).length();
+                if !u.engaged && !u.waiting && out > 0.0 {
+                    *w += out;
+                    total += out;
+                    longest = longest.max(*w);
+                } else {
+                    *w = 0.0;
+                }
+            }
+        }
+        let per_unit = total / attackers.len() as f32;
+        assert!(
+            longest < 15.0,
+            "an attacker walked {longest:.1} away from its target in one go"
+        );
+        assert!(
+            per_unit < 20.0,
+            "attackers walked {per_unit:.1} each away from their target"
+        );
+    }
+
+    /// A crowd pressing in behind a full ring must not push the ring out of
+    /// reach. The stand hysteresis keeps a shoved unit standing, so a ring
+    /// forced open by a body wedged in would stand there hitting nothing;
+    /// contact sliding without steering did exactly that. Every unit standing
+    /// in the window is in true weapon reach (measured: all of them).
+    #[test]
+    fn test_pressing_crowd_keeps_the_ring_in_reach() {
+        let (mut sim, attackers, defender) = blob_fight(40, false);
+        step_n(&mut sim, 600);
+        let (mut standing, mut in_reach) = (0u32, 0u32);
+        for _ in 0..300 {
+            sim.step(&[]);
+            let d = unit(&sim, defender).pos;
+            for &a in &attackers {
+                let u = unit(&sim, a);
+                if u.engaged {
+                    standing += 1;
+                    in_reach += u32::from(blob_gap(u, d) <= u.attack_range + 0.05);
+                }
+            }
+        }
+        assert!(standing > 0, "nobody ever stood in reach");
+        let frac = in_reach as f32 / standing as f32;
+        assert!(
+            frac >= 0.98,
+            "only {:.1}% of standing unit-ticks were in reach",
+            frac * 100.0
         );
     }
 }

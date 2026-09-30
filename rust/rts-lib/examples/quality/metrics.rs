@@ -10,9 +10,7 @@ use std::rc::Rc;
 use godot::prelude::Vector2;
 use rts_lib::astar::{AStarScratch, find_path, find_path_abstract, path_min_clearance};
 use rts_lib::delaunay::CDT;
-use rts_lib::sim::{
-    BLOCK_TICKS, Command, DETOUR_TICKS, DT, NO_SLOT, STALL_REPATH_TICKS, Sim, UnitId,
-};
+use rts_lib::sim::{Command, DETOUR_TICKS, DT, STALL_REPATH_TICKS, Sim, UnitId};
 
 use crate::reference::Field;
 
@@ -140,10 +138,10 @@ struct Tracked {
     // stuck counters, sampled for threshold crossings
     prev_stall: u8,
     prev_ally_stall: u8,
-    prev_hold: u8,
+    prev_waiting: bool,
     stall_trips: u32,
     ally_stall_trips: u32,
-    hold_trips: u32,
+    give_ups: u32,
     // path rebuilds
     prev_path: Vec<Vector2>,
     repaths: u32,
@@ -157,10 +155,11 @@ struct Tracked {
     turn_sum: f64,
     moving_ticks: u64,
     // combat
-    /// Last station actually held. Losing one to a new order is not a change
-    /// of mind, so only walking to a *different* station counts as churn.
-    prev_slot: Option<u16>,
-    slot_changes: u32,
+    /// Last way round the crowd this unit steered. Letting go of it is not a
+    /// change of mind, so only turning to go round the *other* way counts as
+    /// churn.
+    prev_side: i8,
+    side_changes: u32,
     /// Carries a weapon. Weapon metrics are scored over armed units only,
     /// or an unarmed one scores a hard zero for having nothing to fire.
     armed: bool,
@@ -308,10 +307,10 @@ impl Run {
             arrived_tick: None,
             prev_stall: u.stall,
             prev_ally_stall: u.ally_stall,
-            prev_hold: u.hold_ticks,
+            prev_waiting: u.waiting,
             stall_trips: 0,
             ally_stall_trips: 0,
-            hold_trips: 0,
+            give_ups: 0,
             prev_path: u.path[u.path_i as usize..].to_vec(),
             repaths: 0,
             push_ally: 0.0,
@@ -320,8 +319,8 @@ impl Run {
             prev_dir: None,
             turn_sum: 0.0,
             moving_ticks: 0,
-            prev_slot: (u.chase_slot != NO_SLOT).then_some(u.chase_slot),
-            slot_changes: 0,
+            prev_side: u.steer_side,
+            side_changes: 0,
             armed,
             prev_cooldown: u.cooldown_left,
             first_shot_tick: None,
@@ -375,13 +374,14 @@ impl Run {
             let trip = |cur: u8, prev: u8, thresh: u8| cur >= thresh && prev < thresh;
             let stall_t = STALL_REPATH_TICKS.get();
             let ally_t = DETOUR_TICKS.get();
-            let hold_t = BLOCK_TICKS.get();
+
             t.stall_trips += trip(u.stall, t.prev_stall, stall_t) as u32;
             t.ally_stall_trips += trip(u.ally_stall, t.prev_ally_stall, ally_t) as u32;
-            t.hold_trips += trip(u.hold_ticks, t.prev_hold, hold_t) as u32;
+            // A wait starting is a unit giving up on reaching its target.
+            t.give_ups += (u.waiting && !t.prev_waiting) as u32;
             t.prev_stall = u.stall;
             t.prev_ally_stall = u.ally_stall;
-            t.prev_hold = u.hold_ticks;
+            t.prev_waiting = u.waiting;
 
             // A path that merely advanced is a tail of last tick's; anything
             // else is a rebuild. A fresh order counts as one.
@@ -407,12 +407,10 @@ impl Run {
                 t.prev_dir = Some(vel);
             }
 
-            if u.chase_slot != NO_SLOT {
-                if t.prev_slot.is_some_and(|prev| prev != u.chase_slot) {
-                    t.slot_changes += 1;
-                }
-                t.prev_slot = Some(u.chase_slot);
+            if t.prev_side != 0 && u.steer_side == -t.prev_side {
+                t.side_changes += 1;
             }
+            t.prev_side = u.steer_side;
             // The cooldown only ever *rises* when a shot lands (it is set to
             // `attack_cooldown_ticks - 1` on firing and counts down otherwise),
             // so a rising edge is a shot.
@@ -559,7 +557,7 @@ impl Run {
                     parked: u.parked,
                     stall: u.stall,
                     ally_stall: u.ally_stall,
-                    hold: u.hold_ticks,
+                    waiting: u.waiting,
                     engaged: u.engaged,
                     path: u.path[u.path_i as usize..]
                         .iter()
@@ -723,7 +721,8 @@ pub struct Stats {
     pub travelled: f64,
     pub stall_trips: f64,
     pub ally_stall_trips: f64,
-    pub hold_trips: f64,
+    /// Times per unit it gave up on reaching its target and stood waiting.
+    pub give_ups: f64,
     pub repaths: f64,
     /// Mean over every unit-tick of that unit's deepest overlap, in radii.
     /// Diluted by the ticks nothing is touching, which is what `overlap_frac`
@@ -781,10 +780,10 @@ pub struct Stats {
     /// keeps firing approaches 1, one that spends the fight walking approaches
     /// 0. `None` when nothing in the scenario carries a weapon.
     pub fire_efficiency: Option<f64>,
-    /// Station *switches* per attacker: times a unit walked off a station it
-    /// held to take a different one. Losing a station to a new order doesn't
-    /// count, so this reads the same whether or not the scenario spams orders.
-    pub slot_churn: f64,
+    /// Steering *reversals* per unit: times a unit going round a crowd one way
+    /// turned to go round it the other. Letting go of a side doesn't count,
+    /// so this reads the same whether or not the scenario spams orders.
+    pub side_churn: f64,
 }
 
 impl Stats {
@@ -926,7 +925,7 @@ impl Stats {
                 run.tracked.iter().map(|t| t.ally_stall_trips as f64).sum(),
                 n,
             ),
-            hold_trips: fdiv(run.tracked.iter().map(|t| t.hold_trips as f64).sum(), n),
+            give_ups: fdiv(run.tracked.iter().map(|t| t.give_ups as f64).sum(), n),
             repaths: fdiv(run.tracked.iter().map(|t| t.repaths as f64).sum(), n),
             // Already in radii, so comparable across unit and crowd sizes.
             overlap_mean: if run.unit_ticks == 0 {
@@ -982,7 +981,7 @@ impl Stats {
                     })
                     .collect::<Vec<f64>>(),
             ),
-            slot_churn: fdiv(run.tracked.iter().map(|t| t.slot_changes as f64).sum(), n),
+            side_churn: fdiv(run.tracked.iter().map(|t| t.side_changes as f64).sum(), n),
         }
     }
 }
@@ -1099,7 +1098,7 @@ struct TraceUnit {
     parked: bool,
     stall: u8,
     ally_stall: u8,
-    hold: u8,
+    waiting: bool,
     engaged: bool,
     path: Vec<[f32; 2]>,
 }

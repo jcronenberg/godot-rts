@@ -605,6 +605,8 @@ func _build_tuning_ui(layer: CanvasLayer) -> void:
 		["straight_fan_frac", 0.0, 1.0, 0.02],
 		["stall_repath_ticks", 0.0, 20.0, 1.0],
 		["stall_progress_eps", 0.0, 1.0, 0.05],
+		["steer_lookahead_radii", 0.0, 3.0, 0.05],
+		["ally_lookahead_radii", 0.0, 3.0, 0.05],
 	]
 	for t in tunables:
 		var tuning_name: String = t[0]

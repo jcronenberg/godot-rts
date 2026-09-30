@@ -18,6 +18,10 @@
 //! how far away the block spawned. With every body immortal only the ring
 //! (~6) ever fires, so it sits on the bad anchor.
 //!
+//! `retreat` is how far attackers walk *away* from the defender while still
+//! closing on it, per attacker. Going round a crowd is fine; steering so far
+//! round it that the unit walks back out reads as backing off the fight.
+//!
 //! `defender_drift` must stay 0: enemies may block but never push.
 
 use std::f32::consts::TAU;
@@ -99,8 +103,18 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
     }
     let (mut contact, mut surrounded) = (None, None);
     let (mut lean_sum, mut lean_n) = (0.0f64, 0u32);
+    let mut retreat = 0.0f64;
+    let mut before = vec![None; attackers.len()];
     for k in 0..TICKS {
+        for (b, &id) in before.iter_mut().zip(attackers) {
+            *b = closing_dist(&run.sim, defender, id);
+        }
         run.step(&[]);
+        for (&b, &id) in before.iter().zip(attackers) {
+            if let (Some(b), Some(a)) = (b, closing_dist(&run.sim, defender, id)) {
+                retreat += (a - b).max(0.0) as f64;
+            }
+        }
         if k >= TICKS / 2 {
             lean_sum += lean(&run.sim, defender, attackers) as f64;
             lean_n += 1;
@@ -134,18 +148,26 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         m("in_range", "frac", 0.115, 0.03, 3.0).or_bad(s.in_range),
         m("first_shot_p95", "ticks", 650.00, 1400.00, 2.0).or_bad(s.first_shot_p95),
         m("chase_gap", "reaches", 0.00, 0.00, 0.0).or_bad(s.chase_gap),
-        m("slot_churn", "per unit", 0.00, 20.00, 2.0).at(s.slot_churn),
-        m("hold_trips", "per unit", 0.00, 10.00, 1.0).at(s.hold_trips),
+        m("side_churn", "per unit", 0.00, 20.00, 2.0).at(s.side_churn),
+        m("give_ups", "per unit", 0.00, 10.00, 1.0).at(s.give_ups),
         m("jitter", "rad/tick", 0.10, 1.20, 1.0).at(s.jitter),
         m("push_ally", "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
         m("push_enemy", "radii/tick", 0.00, 0.00, 0.0).at(s.push_enemy),
         m("defender_drift", "units", 0.00, 10.00, 2.0).at(drift),
         m("surround", "ticks", 150.00, 700.00, 2.0).at(surround),
         m("lean", "radii", 0.00, 4.00, 2.0).at(lean_sum / lean_n.max(1) as f64),
+        m("retreat", "radii/unit", 0.00, 10.00, 2.0)
+            .at(retreat / (attackers.len() as f64 * RADIUS as f64)),
     ]
     .into_iter()
     .chain(super::overlap_readings(super::Crowding::Crush, &s))
     .collect()
+}
+
+/// How far `id` is from `defender`, while it is still closing on it.
+fn closing_dist(sim: &Sim, defender: UnitId, id: UnitId) -> Option<f32> {
+    let (u, d) = (sim.units().get(id)?, sim.units().get(defender)?);
+    (!u.engaged && !u.waiting).then(|| (u.pos - d.pos).length())
 }
 
 /// Widest bearing gap between attackers in reach of `defender`, if any.

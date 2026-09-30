@@ -233,7 +233,7 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         // its mean over variants is the bias, and the swings cancel.
         m("first_mover_edge", "hp frac", 0.00, 0.00, 0.0).at(first_edge),
         m("dead", "frac", 0.00, 0.00, 0.0).at(frac(dead, 2 * PER_SIDE as u64)),
-        m("slot_churn", "per unit", 0.00, 0.00, 0.0).at(s.slot_churn),
+        m("side_churn", "per unit", 0.00, 0.00, 0.0).at(s.side_churn),
         m("push_enemy", "radii/tick", 0.00, 0.00, 0.0).at(s.push_enemy),
         m("push_ally", "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
     ]

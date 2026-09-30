@@ -433,10 +433,9 @@ fn bench_combat_standing(c: &mut Criterion) {
 }
 
 /// The positioning path: `n` attackers converging on a handful of defenders,
-/// so most of them are blocked, scanning approach slots and detouring around
-/// allies. The other combat benches never reach that code — `combat_idle`
-/// acquires nothing and `combat_engaged` is in range from tick one — and slot
-/// scanning plus the acquisition scan is now the expensive per-tick path.
+/// so most of them are blocked, steering round the crowd or waiting behind
+/// it. The other combat benches never reach that code: `combat_idle`
+/// acquires nothing and `combat_engaged` is in range from tick one.
 fn combat_blob_sim(n: usize) -> Sim {
     let (points, constraints) = rooms_map(SIDE, SIDE);
     let mut sim = Sim::new(points, &constraints, 0xB10B);
@@ -490,7 +489,7 @@ fn combat_blob_sim(n: usize) -> Sim {
     sim
 }
 
-/// Steady-state crush: acquisition, engage, slot scanning and detours.
+/// Steady-state crush: acquisition, engage and steering round the crowd.
 fn bench_combat_blob(c: &mut Criterion) {
     let mut group = c.benchmark_group("sim/combat_blob");
     group.sample_size(20);

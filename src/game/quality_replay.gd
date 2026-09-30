@@ -30,7 +30,7 @@ const TEAM_COLORS: Array[Color] = [
 const FLAG_COLORS := {
 	"stall": Color(1.0, 0.2, 0.2),
 	"ally_stall": Color(1.0, 0.6, 0.1),
-	"hold": Color(1.0, 0.9, 0.2),
+	"waiting": Color(1.0, 0.9, 0.2),
 	"engaged": Color(1.0, 1.0, 1.0),
 	"parked": Color(0.3, 1.0, 0.4),
 }
