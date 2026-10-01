@@ -1,7 +1,8 @@
 //! A building lands in front of a marching group, mid-run.
 //!
 //! The navmesh rebuild repaths every moving unit at once, so a regression in
-//! repath cost or in group re-forming shows up here. The reference optimum is
+//! repath cost or in group re-forming shows up here, as does a group that
+//! splits to pass the building on both sides. The reference optimum is
 //! taken against *post-drop* geometry, so `detour` reads high by the distance
 //! walked before the drop, consistently run to run.
 
@@ -91,6 +92,9 @@ fn run(ctx: &Ctx) -> Vec<Reading> {
         // before tracking starts.
         m("repaths", "per unit", 2.00, 20.00, 2.0).at(s.repaths),
         m("jitter", "rad/tick", 0.05, 0.50, 1.0).at(s.jitter),
+        // A marching column reads ~1.9; a crowd that splits round both sides
+        // of the building reads 3 and up, and re-merges before the end.
+        m("spread_p95", "radii", 2.00, 3.50, 2.0).or_bad(s.spread_p95),
         m("spread_at_end", "radii", 0.00, 0.00, 0.0).or_bad(s.cohesion_final),
         m("push_ally", "radii/tick", 0.00, 0.00, 0.0).at(s.push_ally),
     ]
