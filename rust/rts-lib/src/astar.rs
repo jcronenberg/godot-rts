@@ -14,10 +14,7 @@ use godot::prelude::Vector2;
 /// reuses them with no allocation.
 pub struct AStarScratch {
     g_score: Vec<f32>,
-    /// Predecessor face or half-edge.
-    // INVARIANT: `find_path` stores the incoming half-edge, `tra_star` the
-    // predecessor face index. The two never run concurrently, so sharing the
-    // buffer is safe.
+    /// Incoming half-edge of each face reached by `channel_search`.
     came_from: Vec<u32>,
     /// `generation[f] == current_gen` iff face `f` was touched this search.
     generation: Vec<u32>,
@@ -26,61 +23,85 @@ pub struct AStarScratch {
     /// Centroid cache — rebuilt whenever the CDT's [`CDT::version`] changes
     /// (covers both face-count changes and same-count rebuilds of a new mesh).
     centroids: Vec<Vector2>,
-    /// CDT version the `centroids` cache was built for (0 = never built).
+    /// CDT version the `centroids` and `corner_r` caches were built for
+    /// (0 = never built).
     centroids_version: u64,
+    /// Per vertex: the largest radius every incident edge passes (negative
+    /// when one is a wall). A larger agent finds a blocked edge there, so its
+    /// path may bend round the vertex.
+    corner_r: Vec<f32>,
     /// Reusable portal sequence buffer for SSFA.
     portals: Vec<u32>,
     /// Reusable left/right portal-endpoint buffers, shrunk once per funnel call.
     funnel_left: Vec<Vector2>,
     funnel_right: Vec<Vector2>,
-    /// Node arena for the anytime channel refinement (TA*).
-    nodes: Vec<TaNode>,
-    /// Best (lowest) midpoint-polyline distance seen per entry half-edge.
-    edge_dom: Vec<f32>,
-    /// `edge_gen[he] == current_gen` iff `edge_dom[he]` is from this search.
-    edge_gen: Vec<u32>,
-    /// Best path found so far during refinement; cloned into the result.
+    /// The straight channel's path, then the result; cloned out.
     best_path: Vec<Vector2>,
-    /// Funnel output buffer for candidate channels during refinement.
+    /// Funnel output for the searched channel.
     cand_path: Vec<Vector2>,
-    /// Reusable generation-marked buffers for the abstraction's local searches.
-    abs_scratch: crate::abstraction::AbsScratch,
-    /// Reusable buffers for the TRA* query path. Held separately so they can be
-    /// `mem::take`n out as locals during a query — letting them coexist with a
-    /// `&mut AStarScratch` borrow without aliasing.
-    tra: TraScratch,
+    /// Node arena of the interval search.
+    nodes: Vec<INode>,
+    /// One expansion's successors, before they go to the heap.
+    succ: Vec<(u32, u32, u32)>,
+    valid: ValidMemo,
+    /// Best `g` reaching each turning point, keyed `he * 2 + end`.
+    root_g: Vec<f32>,
+    /// `root_gen[k] == current_gen` iff `root_g[k]` is from this search.
+    root_gen: Vec<u32>,
+    /// Cheapest arrival of a root on a portal's own line, keyed
+    /// `he * 3 + position` (see `interval_search`).
+    fan_g: Vec<f32>,
+    fan_gen: Vec<u32>,
 }
 
-/// Search state of the anytime refinement: one node per distinct channel
-/// prefix, keyed by the half-edge it crossed to enter `face`.
-#[derive(Clone, Copy)]
-struct TaNode {
-    face: u32,
-    /// Half-edge crossed to enter `face` (`NONE` for the start node).
-    entry_he: u32,
-    /// Arena index of the parent node (`NONE` for the start node).
-    parent: u32,
-    /// Lower bound on the true path length from `start` to `entry_he`.
-    g: f32,
-    /// Midpoint-polyline distance from `start` to `entry_he` — a cheap
-    /// true-length estimate used only for portal dominance.
-    d: f32,
-}
-
-/// Per-query work buffers for [`find_path_abstract`], pooled to keep TRA*
-/// queries allocation-free in steady state.
+/// Agent-valid range ([`CDT::portal_valid_range`]) per half-edge, memoised
+/// across queries on one mesh at one radius: both the search and the funnel
+/// ask for the same portals over and over, and each answer walks two
+/// vertex rings.
 #[derive(Default)]
-struct TraScratch {
-    /// Level-3 nodes bordering the start region.
-    start_l3s: Vec<u32>,
-    /// Level-3 nodes bordering the goal region.
-    goal_l3s: Vec<u32>,
-    /// Abstract path of level-3 faces from `tra_star`.
-    l3_path: Vec<u32>,
-    /// Full reconstructed triangle channel.
-    channel: Vec<u32>,
-    /// Scratch for individual channel segments during reconstruction.
-    seg: Vec<u32>,
+struct ValidMemo {
+    range: Vec<(f32, f32)>,
+    /// `stamp[he] == epoch` iff `range[he]` is current.
+    stamp: Vec<u32>,
+    epoch: u32,
+    /// `(CDT::version, radius bits)` the memo holds.
+    key: (u64, u32),
+}
+
+impl ValidMemo {
+    /// Point the memo at `cdt` and `radius`, dropping it if either changed.
+    fn sync(&mut self, cdt: &CDT, radius: f32) {
+        let n = cdt.num_faces() as usize * 3;
+        if self.stamp.len() < n {
+            self.range.resize(n, (0.0, 1.0));
+            self.stamp.resize(n, 0);
+        }
+        let key = (cdt.version(), radius.to_bits());
+        if self.key != key {
+            self.key = key;
+            self.epoch = self.epoch.wrapping_add(1);
+            if self.epoch == 0 {
+                self.stamp.fill(0);
+                self.epoch = 1;
+            }
+        }
+    }
+
+    /// Valid range of portal `he` at the synced radius; an empty one is
+    /// collapsed to the midpoint, as the funnel has always treated it.
+    #[inline(always)]
+    fn get(&mut self, cdt: &CDT, he: u32, radius: f32) -> (f32, f32) {
+        if radius <= 0.0 {
+            return (0.0, 1.0);
+        }
+        let i = he as usize;
+        if self.stamp[i] != self.epoch {
+            let (lo, hi) = cdt.portal_valid_range(he, radius);
+            self.range[i] = if lo > hi { (0.5, 0.5) } else { (lo, hi) };
+            self.stamp[i] = self.epoch;
+        }
+        self.range[i]
+    }
 }
 
 impl Default for AStarScratch {
@@ -99,16 +120,19 @@ impl AStarScratch {
             heap: BinaryHeap::new(),
             centroids: Vec::new(),
             centroids_version: 0,
+            corner_r: Vec::new(),
             portals: Vec::new(),
             funnel_left: Vec::new(),
             funnel_right: Vec::new(),
-            nodes: Vec::new(),
-            edge_dom: Vec::new(),
-            edge_gen: Vec::new(),
             best_path: Vec::new(),
             cand_path: Vec::new(),
-            abs_scratch: crate::abstraction::AbsScratch::default(),
-            tra: TraScratch::default(),
+            nodes: Vec::new(),
+            succ: Vec::new(),
+            valid: ValidMemo::default(),
+            root_g: Vec::new(),
+            root_gen: Vec::new(),
+            fan_g: Vec::new(),
+            fan_gen: Vec::new(),
         }
     }
 
@@ -119,14 +143,17 @@ impl AStarScratch {
             self.g_score.resize(n, 0.0);
             self.came_from.resize(n, NONE);
             self.generation.resize(n, 0);
-            self.edge_dom.resize(n * 3, 0.0);
-            self.edge_gen.resize(n * 3, 0);
+            self.root_g.resize(n * 6, 0.0);
+            self.root_gen.resize(n * 6, 0);
+            self.fan_g.resize(n * 9, 0.0);
+            self.fan_gen.resize(n * 9, 0);
         }
 
         self.current_gen = self.current_gen.wrapping_add(1);
         if self.current_gen == 0 {
             self.generation.fill(0);
-            self.edge_gen.fill(0);
+            self.root_gen.fill(0);
+            self.fan_gen.fill(0);
             self.current_gen = 1;
         }
 
@@ -141,6 +168,20 @@ impl AStarScratch {
             for f in 0..n as u32 {
                 self.centroids.push(cdt.face_centroid(f));
             }
+            self.corner_r.clear();
+            self.corner_r
+                .resize(cdt.num_vertices() as usize, f32::INFINITY);
+            for he in 0..n as u32 * 3 {
+                let pass = if cdt.he_twin(he).is_none() || cdt.he_is_constrained(he) {
+                    -1.0
+                } else {
+                    cdt.portal_radius(he)
+                };
+                for v in [cdt.he_origin(he), cdt.he_dest(he)] {
+                    let c = &mut self.corner_r[v as usize];
+                    *c = c.min(pass);
+                }
+            }
             self.centroids_version = cdt.version();
         }
     }
@@ -154,18 +195,14 @@ impl AStarScratch {
 /// width).
 ///
 /// Portals too narrow for the agent (`radius > portal_radius(he)`) are
-/// skipped during A*. The resulting triangle channel is smoothed by the
-/// Simple Stupid Funnel Algorithm; waypoints wrapping a constraint-edge
-/// corner are offset by `radius` along the bisector into free space, so the
-/// agent circle clears the wall.
+/// impassable. The chosen triangle channel is smoothed by the Simple Stupid
+/// Funnel Algorithm; waypoints wrapping a constraint-edge corner are offset
+/// by `radius` along the bisector into free space, so the agent circle
+/// clears the wall.
 ///
 /// Pipeline: a straight-segment walk first (line-of-sight queries finish
-/// immediately); otherwise a centroid-cost channel search finds a feasible
-/// channel, then an anytime TA* refinement (Demyen 2006, §5.4–5.5) funnels
-/// alternative channels by true length, picking the path by real distance
-/// rather than the centroid proxy. Refinement effort is bounded (see
-/// `refine_channel`), so the result is best-effort, not proven optimal, on
-/// very large meshes.
+/// immediately); otherwise [`interval_search`] picks the channel by the
+/// length its funnelled path will have, within [`H_WEIGHT`] of the shortest.
 ///
 /// Returns `[start, …, goal]`, or empty when either endpoint is off-mesh or
 /// no passable route exists.
@@ -189,10 +226,30 @@ pub fn find_path(
         return vec![start, goal];
     }
 
+    route(
+        cdt, start, goal, start_face, goal_face, scratch, radius, H_WEIGHT,
+    )
+}
+
+/// [`find_path`] past the endpoint checks: the straight line when it is
+/// clear, else the [`interval_search`] channel, funnelled.
+#[allow(clippy::too_many_arguments)]
+fn route(
+    cdt: &CDT,
+    start: Vector2,
+    goal: Vector2,
+    start_face: u32,
+    goal_face: u32,
+    scratch: &mut AStarScratch,
+    radius: f32,
+    weight: f32,
+) -> Vec<Vector2> {
+    scratch.valid.sync(cdt, radius);
     // Fast path: if the raw segment crosses only passable portals, its
-    // channel proves reachability and funnels to a near-tight upper bound —
-    // often the straight line itself, ending the query immediately.
-    if straight_channel(
+    // channel proves reachability and usually funnels to the straight line
+    // itself, ending the query. Near a wall it bends round the radius
+    // offsets, and another channel can be shorter.
+    let straight = straight_channel(
         cdt,
         start_face,
         goal_face,
@@ -200,33 +257,69 @@ pub fn find_path(
         goal,
         radius,
         &mut scratch.portals,
-    ) {
-        scratch.prepare(cdt); // advances the epoch and sizes edge_dom/edge_gen for refine_channel
-    } else if !channel_search(cdt, start_face, goal_face, scratch, radius) {
-        return Vec::new();
-    }
-
-    // Initial candidate: funnel the channel for a true-length upper bound
-    // that prunes the refinement.
-    {
+    );
+    let mut best_len = f32::INFINITY;
+    if straight {
         let s = &mut *scratch;
         funnel(
             cdt,
             start,
             goal,
             &s.portals,
+            &mut s.valid,
+            &mut s.funnel_left,
+            &mut s.funnel_right,
+            radius,
+            &mut s.best_path,
+        );
+        best_len = polyline_len(&s.best_path);
+        if best_len <= dist(start, goal) * 1.0001 + 1e-3 {
+            return s.best_path.clone();
+        }
+    }
+    let search = interval_search(
+        cdt, start, goal, start_face, goal_face, scratch, radius, weight,
+    );
+    if search == Search::Found {
+        let s = &mut *scratch;
+        funnel(
+            cdt,
+            start,
+            goal,
+            &s.portals,
+            &mut s.valid,
+            &mut s.funnel_left,
+            &mut s.funnel_right,
+            radius,
+            &mut s.cand_path,
+        );
+        // Copy rather than swap: swapping would ping-pong the two pooled
+        // buffers' capacities and re-allocate on later queries.
+        if polyline_len(&s.cand_path) < best_len {
+            s.best_path.clear();
+            s.best_path.extend_from_slice(&s.cand_path);
+        }
+    } else if !straight {
+        // Only after the search gave up on a degenerate blow-up: the plain
+        // search is complete.
+        if search == Search::Unreachable
+            || !channel_search(cdt, start_face, goal_face, scratch, radius)
+        {
+            return Vec::new();
+        }
+        let s = &mut *scratch;
+        funnel(
+            cdt,
+            start,
+            goal,
+            &s.portals,
+            &mut s.valid,
             &mut s.funnel_left,
             &mut s.funnel_right,
             radius,
             &mut s.best_path,
         );
     }
-    let best_len = polyline_len(&scratch.best_path);
-
-    refine_channel(
-        cdt, start, goal, start_face, goal_face, scratch, radius, best_len,
-    );
-
     scratch.best_path.clone()
 }
 
@@ -399,9 +492,10 @@ fn segment_cross_param(a: Vector2, b: Vector2, p: Vector2, q: Vector2) -> f32 {
     (pa.x * s.y - pa.y * s.x) / denom
 }
 
-/// Phase 1: face-keyed A* over centroid-to-centroid costs.  Cheap and
-/// complete, but its channel is not necessarily the shortest — the centroid
-/// polyline mis-measures real path length by up to the triangle size.
+/// Fallback channel search: face-keyed A* over centroid-to-centroid costs.
+/// Cheap and complete, but its channel is not necessarily the shortest — the
+/// centroid polyline mis-measures real path length by up to the triangle
+/// size, and on a grid of rooms ties every monotone route.
 ///
 /// Fills `scratch.portals` with the channel's half-edges (start → goal) and
 /// returns whether the goal is reachable.
@@ -448,8 +542,7 @@ fn channel_search(
             }
 
             // g(nb): centroid-to-centroid cost — a proxy for path length,
-            // good enough to find *a* channel; `refine_channel` fixes any
-            // mis-ranking against the true funneled length.
+            // good enough to find *a* channel.
             let tg = g_cur + dist(c_cur, scratch.centroids[nb as usize]);
 
             // h(nb): centroid-to-goal, consistent so each face expands once.
@@ -491,24 +584,92 @@ fn channel_search(
     true
 }
 
-/// Phase 2: anytime TA* refinement (Demyen 2006, §5.4–5.5).
+// ── Interval search (Polyanya) ────────────────────────────────────────────────
+
+/// Search node of [`interval_search`]: everything on `[t0, t1]` of portal
+/// `he` is visible from `root`, which the search reached at cost `g`.
+#[derive(Clone, Copy)]
+struct INode {
+    root: Vector2,
+    g: f32,
+    /// Portal half-edge, on the side being left; `NONE` marks the goal node.
+    he: u32,
+    t0: f32,
+    t1: f32,
+    /// The path may bend round this end (it is a radius-shrunk corner, not
+    /// the shadow edge of an earlier one).
+    turn0: bool,
+    turn1: bool,
+    parent: u32,
+}
+
+/// Weight on the interval search's heuristic. A route is accepted once no
+/// open node could beat it by more than this factor, so paths are at most
+/// that much longer than the shortest. A grid of rooms is a plateau of
+/// near-equal staircases, which the exact search (1.0) explores in full.
+pub const H_WEIGHT: f32 = 1.1;
+
+/// Slack, in portal parameter, for "this end is where the valid range clips":
+/// a shadow ray through a vertex lands on the next portal's end only up to
+/// rounding.
+const T_EPS: f32 = 1e-4;
+
+#[inline(always)]
+fn cross(a: Vector2, b: Vector2) -> f32 {
+    a.x * b.y - a.y * b.x
+}
+
+/// Narrow `[lo, hi]` to where `c0 + s * c1 >= 0`.
+#[inline(always)]
+fn clip_halfplane(c0: f32, c1: f32, lo: &mut f32, hi: &mut f32) {
+    if c1 > 0.0 {
+        *lo = lo.max(-c0 / c1);
+    } else if c1 < 0.0 {
+        *hi = hi.min(-c0 / c1);
+    } else if c0 < 0.0 {
+        *hi = f32::NEG_INFINITY;
+    }
+}
+
+/// Lower bound on the length from `root` through `[a, b]` to `goal`
+/// (Polyanya's heuristic: a goal on the root's side is mirrored across the
+/// portal line first).
+fn interval_h(root: Vector2, a: Vector2, b: Vector2, goal: Vector2) -> f32 {
+    let d = b - a;
+    let side_g = cross(d, goal - a);
+    let side_r = cross(d, root - a);
+    let goal = if side_g * side_r > 0.0 {
+        let len2 = d.x * d.x + d.y * d.y;
+        goal - Vector2::new(-d.y, d.x) * (2.0 * side_g / len2)
+    } else {
+        goal
+    };
+    let rg = goal - root;
+    let denom = cross(d, rg);
+    if denom != 0.0 {
+        let t = cross(root - a, rg) / denom;
+        if (0.0..=1.0).contains(&t) {
+            return dist(root, goal);
+        }
+    }
+    (dist(root, a) + dist(a, goal)).min(dist(root, b) + dist(b, goal))
+}
+
+/// Search for the channel whose funnelled path is shortest: Polyanya (Cui,
+/// Harabor & Grastien 2017) over the radius-shrunk portals that [`funnel`]
+/// narrows each portal to, so at weight 1 its optimum is the minimum of
+/// `funnel` over every channel.
 ///
-/// Searches channel prefixes — one node per (face, entry edge, parent chain),
-/// so a face may have several channels — ordered by `f = g + h`, both
-/// admissible Euclidean lower bounds. When the goal face is popped, its
-/// channel is funneled for true polyline length; search stops once the
-/// queue's minimum `f` can't beat the best length found. `best_len` starts at
-/// the phase-1 bound; `scratch.best_path` holds that path.
+/// A node is a root point plus the interval of one portal it sees; paths bend
+/// only at portal ends the agent cannot pass (a radius-shrunk end, or a
+/// vertex with a blocked edge). Turning points keep a best `g` (root-level
+/// pruning). The heuristic is multiplied by `weight` ([`H_WEIGHT`] outside
+/// tests), trading a bounded excess over the shortest length for a far
+/// narrower search.
 ///
-/// Two prunes stop the search exploding in open space, where loose Euclidean
-/// bounds leave many interchangeable prefixes: a portal is re-entered only by
-/// a strictly shorter midpoint distance (collapsing same-homotopy
-/// duplicates), and an adaptive node budget caps the worst case, growing
-/// only while channels keep improving so hopeless searches stop early. Both
-/// prunes can hide an alternative channel, so the result is best-effort
-/// rather than proven optimal — though never worse than phase 1.
+/// On [`Search::Found`], `scratch.portals` holds the winning channel.
 #[allow(clippy::too_many_arguments)]
-fn refine_channel(
+fn interval_search(
     cdt: &CDT,
     start: Vector2,
     goal: Vector2,
@@ -516,171 +677,288 @@ fn refine_channel(
     goal_face: u32,
     scratch: &mut AStarScratch,
     radius: f32,
-    mut best_len: f32,
-) {
-    let h0 = dist(start, goal);
-    // Near-optimal or near-collocated: refinement can't gain >0.01% or >1e-3.
-    if best_len <= h0 * 1.0001 + 1e-3 {
-        return;
-    }
-
+    weight: f32,
+) -> Search {
+    scratch.prepare(cdt);
+    scratch.valid.sync(cdt, radius);
+    let epoch = scratch.current_gen;
     let pts = cdt.points();
-    // Adaptive anytime budget: cheap by default, extended while improving.
-    let mut budget = 512usize;
-    const BUDGET_MAX: usize = 8192;
     let AStarScratch {
         heap,
         nodes,
-        edge_dom,
-        edge_gen,
-        current_gen,
-        best_path,
-        cand_path,
+        succ,
+        valid,
+        root_g,
+        root_gen,
+        fan_g,
+        fan_gen,
+        corner_r,
         portals,
-        funnel_left,
-        funnel_right,
         ..
     } = scratch;
-    let epoch = *current_gen;
-
     heap.clear();
     nodes.clear();
-    nodes.push(TaNode {
-        face: start_face,
-        entry_he: NONE,
-        parent: NONE,
-        g: 0.0,
-        d: 0.0,
-    });
-    heap.push(Reverse((h0.to_bits(), 0u32, 0u32)));
 
-    while let Some(Reverse((f_bits, _, idx))) = heap.pop() {
-        // Every unexplored channel has a prefix node in the heap, and each
-        // node's `f` lower-bounds all completions through it — so once the
-        // heap minimum can't beat `best_len`, no remaining channel can.
-        if f32::from_bits(f_bits) >= best_len || nodes.len() >= budget {
+    let corner = |v: u32| {
+        let c = corner_r[v as usize];
+        c < 0.0 || radius > c
+    };
+
+    // Push the node for `[lo, hi]` (shape-clipped, before the valid range)
+    // on portal `he`, rooted at `root`, onto `succ` as `(priority, h, idx)`.
+    let push = |nodes: &mut Vec<INode>,
+                succ: &mut Vec<(u32, u32, u32)>,
+                valid: &mut ValidMemo,
+                root: Vector2,
+                g: f32,
+                he: u32,
+                lo: f32,
+                hi: f32,
+                parent: u32| {
+        let (vlo, vhi) = valid.get(cdt, he, radius);
+        let (t0, t1) = (lo.max(0.0).max(vlo), hi.min(1.0).min(vhi));
+        // A shadow ray grazing a vertex lands on its portals as a point at
+        // the end; carried on, it would circle the vertex's fan forever. A
+        // portal whose valid range is itself that point is a real squeeze.
+        if t0 > t1 || (t1 - t0 <= T_EPS && vhi - vlo > T_EPS && (t1 <= T_EPS || t0 >= 1.0 - T_EPS))
+        {
+            return;
+        }
+        let pa = pts[cdt.he_origin(he) as usize];
+        let pb = pts[cdt.he_dest(he) as usize];
+        let a = pa + (pb - pa) * t0;
+        let b = pa + (pb - pa) * t1;
+        let h = interval_h(root, a, b, goal);
+        let idx = nodes.len() as u32;
+        nodes.push(INode {
+            root,
+            g,
+            he,
+            t0,
+            t1,
+            // An end the valid range clips: shrunk off a wall, or a vertex
+            // with a blocked edge.
+            turn0: vlo >= lo - T_EPS && (vlo > 0.0 || (t0 <= T_EPS && corner(cdt.he_origin(he)))),
+            turn1: vhi <= hi + T_EPS
+                && (vhi < 1.0 || (t1 >= 1.0 - T_EPS && corner(cdt.he_dest(he)))),
+            parent,
+        });
+        succ.push(((g + h * weight).to_bits(), h.to_bits(), idx));
+    };
+
+    let passable = |he: u32| -> bool {
+        cdt.he_twin(he).is_some()
+            && !cdt.he_is_constrained(he)
+            && !(radius > 0.0 && radius > cdt.portal_radius(he))
+    };
+
+    for he in start_face * 3..start_face * 3 + 3 {
+        if passable(he) {
+            push(nodes, succ, valid, start, 0.0, he, 0.0, 1.0, NONE);
+        }
+    }
+    heap.extend(succ.drain(..).map(Reverse));
+
+    // Safety net against a degenerate blow-up; the caller falls back to the
+    // plain channel search. Real searches stay a few nodes per face.
+    let node_cap = 16 * cdt.num_faces() as usize + 4096;
+    let mut found = NONE;
+    let mut next = heap.pop().map(|Reverse((_, _, idx))| idx);
+    while let Some(idx) = next {
+        let n = nodes[idx as usize];
+        if n.he == NONE {
+            found = idx;
             break;
         }
-        let TaNode {
-            face,
-            entry_he,
-            g,
-            d,
-            ..
-        } = nodes[idx as usize];
-
-        if face == goal_face {
-            portals.clear();
-            let mut cur = idx as usize;
-            while nodes[cur].entry_he != NONE {
-                portals.push(nodes[cur].entry_he);
-                cur = nodes[cur].parent as usize;
-            }
-            portals.reverse();
-            funnel(
-                cdt,
-                start,
-                goal,
-                portals,
-                funnel_left,
-                funnel_right,
-                radius,
-                cand_path,
-            );
-            let len = polyline_len(cand_path);
-            // Copy rather than swap: swapping would ping-pong the two pooled
-            // buffers' capacities and re-allocate on later queries.
-            if len < best_len {
-                best_len = len;
-                best_path.clear();
-                best_path.extend_from_slice(cand_path);
-                // Reward progress with more search room.
-                budget = budget.max((nodes.len() * 2).min(BUDGET_MAX));
-            }
-            continue;
+        if nodes.len() > node_cap {
+            return Search::GaveUp;
         }
+        let pa = pts[cdt.he_origin(n.he) as usize];
+        let pb = pts[cdt.he_dest(n.he) as usize];
+        let a = pa + (pb - pa) * n.t0;
+        let b = pa + (pb - pa) * n.t1;
+        let r = n.root;
+        let tw = cdt.he_twin(n.he).expect("portal");
+        let face = cdt.face_of_he(tw);
 
-        // Reference point of the portal this node entered through.
-        let prev_pt = if entry_he == NONE {
-            start
-        } else {
-            let a = pts[cdt.he_origin(entry_he) as usize];
-            let b = pts[cdt.he_dest(entry_he) as usize];
-            Vector2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5)
+        // Degenerate: a root on the portal's line. On the portal itself it is
+        // on the face's boundary and sees all of it; beyond either end it sees
+        // the portal edge-on, and only bending round the nearer end gets in.
+        let pq = pb - pa;
+        let side = cross(pq, r - pa);
+        let on_line = side.abs() <= 1e-3 * dist(pa, pb);
+        let sgn = side.signum();
+        let u = (r - pa).dot(pq) / pq.dot(pq);
+        let edge_on = on_line && !(-1e-4..=1.0 + 1e-4).contains(&u);
+        let near_end = u < 0.0;
+        let in_cone = |y: Vector2| {
+            !edge_on
+                && (on_line
+                    || (sgn * cross(a - r, y - r) >= 0.0 && sgn * cross(b - r, y - r) <= 0.0))
         };
 
-        cdt.for_each_neighbor(face, |nb, he| {
-            if nodes.len() >= budget {
-                return;
+        if face == goal_face {
+            // Straight in, or round whichever turning end the goal hides behind.
+            let reach = if in_cone(goal) {
+                Some(n.g + dist(r, goal))
+            } else if n.turn0
+                && (if edge_on {
+                    near_end
+                } else {
+                    sgn * cross(a - r, goal - r) < 0.0
+                })
+            {
+                Some(n.g + dist(r, a) + dist(a, goal))
+            } else if n.turn1
+                && (if edge_on {
+                    !near_end
+                } else {
+                    sgn * cross(b - r, goal - r) > 0.0
+                })
+            {
+                Some(n.g + dist(r, b) + dist(b, goal))
+            } else {
+                None
+            };
+            if let Some(len) = reach {
+                let gidx = nodes.len() as u32;
+                nodes.push(INode {
+                    he: NONE,
+                    parent: idx,
+                    g: len,
+                    ..n
+                });
+                heap.push(Reverse((len.to_bits(), 0, gidx)));
+                next = heap.pop().map(|Reverse((_, _, idx))| idx);
+                continue;
             }
-            if radius > 0.0 && radius > cdt.portal_radius(he) {
-                return;
-            }
+        }
 
-            let pa = pts[cdt.he_origin(he) as usize];
-            let pb = pts[cdt.he_dest(he) as usize];
-            // h: goal to the entry portal. g: max of two lower bounds on
-            // walked distance to this portal — straight line from the start,
-            // and the parent's bound (path length is monotone along a
-            // channel). Demyen's third bound (g + h - h') isn't admissible
-            // for a point-to-edge h, so it's omitted.
-            let h_nb = dist_point_seg(goal, pa, pb);
-            let g_nb = dist_point_seg(start, pa, pb).max(g);
-            let f_nb = g_nb + h_nb;
-            if f_nb >= best_len {
-                return;
+        // Turning ends still worth bending round: root-level pruning drops
+        // any whose point was already reached at no more cost. Keyed per
+        // directed portal, so every node sharing a key sheds its shadow into
+        // the same face.
+        let mut turn_at = |end: u32, p: Vector2| -> Option<f32> {
+            let g = n.g + dist(r, p);
+            let k = (n.he * 2 + end) as usize;
+            if root_gen[k] == epoch && root_g[k] <= g {
+                return None;
             }
-            // Portal dominance: when channels converge on a portal, keep only
-            // the shortest-midpoint-polyline prefix. The g-bound can't rank
-            // converging prefixes (same straight line for all); the midpoint
-            // metric tracks the walked route. Goal portals are excepted so
-            // every distinct final approach still gets funnel-evaluated.
-            let mid = Vector2::new((pa.x + pb.x) * 0.5, (pa.y + pb.y) * 0.5);
-            let d_nb = d + dist(prev_pt, mid);
-            if nb != goal_face && edge_gen[he as usize] == epoch && edge_dom[he as usize] <= d_nb {
-                return;
+            root_gen[k] = epoch;
+            root_g[k] = g;
+            Some(g)
+        };
+        let g0 = if n.turn0 && (!on_line || (edge_on && near_end)) {
+            turn_at(0, a)
+        } else {
+            None
+        };
+        let g1 = if n.turn1 && (!on_line || (edge_on && !near_end)) {
+            turn_at(1, b)
+        } else {
+            None
+        };
+
+        // A root on the portal sees all of the face; from a vertex that walk
+        // goes on round its fan. Keep it to the cheapest arrival per portal
+        // and root position (either end or inside), or a free vertex's fan
+        // would be circled forever.
+        if on_line && !edge_on {
+            let class = if u <= 1e-4 {
+                1
+            } else if u >= 1.0 - 1e-4 {
+                2
+            } else {
+                0
+            };
+            let k = (tw * 3 + class) as usize;
+            if fan_gen[k] == epoch && fan_g[k] <= n.g {
+                next = heap.pop().map(|Reverse((_, _, idx))| idx);
+                continue;
             }
-            // A shortest channel never revisits a face (Demyen Thm 4.3.4):
-            // drop children whose face is already on this node's chain.
-            let mut a = idx as usize;
-            loop {
-                if nodes[a].face == nb {
-                    return;
+            fan_gen[k] = epoch;
+            fan_g[k] = n.g;
+        }
+        let base = face * 3;
+        for k in 1..3 {
+            let e = base + (tw - base + k) % 3;
+            if !passable(e) {
+                continue;
+            }
+            let ea = pts[cdt.he_origin(e) as usize];
+            let eb = pts[cdt.he_dest(e) as usize];
+            let ed = eb - ea;
+            if on_line {
+                if !edge_on {
+                    push(nodes, succ, valid, r, n.g, e, 0.0, 1.0, idx);
+                } else if let Some(g) = g0 {
+                    push(nodes, succ, valid, a, g, e, 0.0, 1.0, idx);
+                } else if let Some(g) = g1 {
+                    push(nodes, succ, valid, b, g, e, 0.0, 1.0, idx);
                 }
-                let p = nodes[a].parent;
-                if p == NONE {
-                    break;
-                }
-                a = p as usize;
+                continue;
             }
-            // Recorded only for pushed nodes: a dominance entry from a
-            // cycle-pruned prefix could block a valid channel with no live
-            // node left at this portal.
-            edge_gen[he as usize] = epoch;
-            edge_dom[he as usize] = d_nb;
-            let nidx = nodes.len() as u32;
-            nodes.push(TaNode {
-                face: nb,
-                entry_he: he,
-                parent: idx,
-                g: g_nb,
-                d: d_nb,
-            });
-            heap.push(Reverse((f_nb.to_bits(), g_nb.to_bits(), nidx)));
-        });
+            // Signed side of `y(s) = ea + s * ed` w.r.t. the rays r→a, r→b.
+            let (ca0, ca1) = (sgn * cross(a - r, ea - r), sgn * cross(a - r, ed));
+            let (cb0, cb1) = (-sgn * cross(b - r, ea - r), -sgn * cross(b - r, ed));
+
+            let (mut lo, mut hi) = (0.0f32, 1.0f32);
+            clip_halfplane(ca0, ca1, &mut lo, &mut hi);
+            clip_halfplane(cb0, cb1, &mut lo, &mut hi);
+            push(nodes, succ, valid, r, n.g, e, lo, hi, idx);
+
+            if let Some(g) = g0 {
+                let (mut lo, mut hi) = (0.0f32, 1.0f32);
+                clip_halfplane(-ca0, -ca1, &mut lo, &mut hi);
+                push(nodes, succ, valid, a, g, e, lo, hi, idx);
+            }
+            if let Some(g) = g1 {
+                let (mut lo, mut hi) = (0.0f32, 1.0f32);
+                clip_halfplane(-cb0, -cb1, &mut lo, &mut hi);
+                push(nodes, succ, valid, b, g, e, lo, hi, idx);
+            }
+        }
+        // Intermediate pruning (Polyanya §4.3): a lone successor, mostly a
+        // view running down a corridor of triangles, is expanded at once
+        // rather than round-tripping through the heap.
+        next = if succ.len() == 1 {
+            Some(succ.pop().expect("one successor").2)
+        } else {
+            heap.extend(succ.drain(..).map(Reverse));
+            heap.pop().map(|Reverse((_, _, idx))| idx)
+        };
     }
+
+    if found == NONE {
+        return Search::Unreachable;
+    }
+    portals.clear();
+    let mut cur = nodes[found as usize].parent;
+    while cur != NONE {
+        portals.push(nodes[cur as usize].he);
+        cur = nodes[cur as usize].parent;
+    }
+    portals.reverse();
+    Search::Found
 }
 
-// ── TRA* (Triangulation-Reduced A*) ──────────────────────────────────────────
+/// How an [`interval_search`] ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Search {
+    Found,
+    /// Every reachable portal was searched.
+    Unreachable,
+    /// Hit the node cap; says nothing about reachability.
+    GaveUp,
+}
 
-/// Find the shortest path using the pre-built graph abstraction.
+// ── abstraction-assisted query ───────────────────────────────────────────────
+
+/// [`find_path`] with the pre-built [`Abstraction`] answering "different
+/// components" up front, without a search that would flood the start's
+/// whole component to prove it.
 ///
-/// Performs a fast component check, then A* over level-3 (decision-point)
-/// triangles only, reconstructs the full triangle channel, and runs
-/// the funnel for the final smooth path.
-///
-/// Falls back to [`find_path`] when the start or goal is in a region with
-/// no level-3 ancestor (dead-end tree or ring without a decision point).
+/// [`Abstraction`]: crate::abstraction::Abstraction
 pub fn find_path_abstract(
     cdt: &CDT,
     abs: &crate::abstraction::Abstraction,
@@ -706,207 +984,9 @@ pub fn find_path_abstract(
         return Vec::new();
     }
 
-    // Borrow the pooled query buffers out as locals so they can be used
-    // alongside `&mut scratch` without aliasing, then restore them.
-    let mut tra = std::mem::take(&mut scratch.tra);
-    let result = tra_query(
-        cdt, abs, start, goal, start_face, goal_face, scratch, &mut tra, radius,
-    );
-    scratch.tra = tra;
-    result
-}
-
-/// Worker for [`find_path_abstract`]: `tra` is a detached set of pooled buffers,
-/// kept separate from `scratch` so both can be mutably borrowed at once.
-#[allow(clippy::too_many_arguments)]
-fn tra_query(
-    cdt: &CDT,
-    abs: &crate::abstraction::Abstraction,
-    start: Vector2,
-    goal: Vector2,
-    start_face: u32,
-    goal_face: u32,
-    scratch: &mut AStarScratch,
-    tra: &mut TraScratch,
-    radius: f32,
-) -> Vec<Vector2> {
-    abs.find_local_l3(
-        cdt,
-        start_face,
-        &mut tra.start_l3s,
-        &mut scratch.abs_scratch,
-    );
-    abs.find_local_l3(cdt, goal_face, &mut tra.goal_l3s, &mut scratch.abs_scratch);
-
-    if tra.start_l3s.is_empty() || tra.goal_l3s.is_empty() {
-        return find_path(cdt, start, goal, scratch, radius); // ring or island
-    }
-
-    // Same corridor/region: both endpoints share a local l3 node.
-    if tra.start_l3s.iter().any(|s| tra.goal_l3s.contains(s)) {
-        return find_path(cdt, start, goal, scratch, radius);
-    }
-
-    if !tra_star(
-        cdt,
-        abs,
-        &tra.start_l3s,
-        &tra.goal_l3s,
-        &mut tra.l3_path,
-        scratch,
-        radius,
-    ) {
-        return Vec::new();
-    }
-
-    if !crate::abstraction::reconstruct_channel(
-        cdt,
-        abs,
-        start_face,
-        &tra.l3_path,
-        goal_face,
-        &mut tra.channel,
-        &mut tra.seg,
-        &mut scratch.abs_scratch,
-    ) {
-        return Vec::new();
-    }
-
-    scratch.portals.clear();
-    scratch.portals.extend(
-        tra.channel
-            .windows(2)
-            .filter_map(|w| cdt.shared_edge_between(w[0], w[1])),
-    );
-    let s = &mut *scratch;
-    funnel(
-        cdt,
-        start,
-        goal,
-        &s.portals,
-        &mut s.funnel_left,
-        &mut s.funnel_right,
-        radius,
-        &mut s.cand_path,
-    );
-    s.cand_path.clone()
-}
-
-/// Multi-source, multi-target A* restricted to level-3 (decision-point) nodes.
-///
-/// Seeds the heap with all `start_l3s` (g=0) and stops when any node in
-/// `goal_l3s` is popped.  Writes the level-3 face sequence from the chosen
-/// start to the chosen goal into `out_path` (cleared first) and returns `true`,
-/// or returns `false` when no passable route exists.
-///
-/// `scratch.came_from` stores predecessor face indices here (not half-edges).
-#[allow(clippy::too_many_arguments)]
-fn tra_star(
-    cdt: &CDT,
-    abs: &crate::abstraction::Abstraction,
-    start_l3s: &[u32],
-    goal_l3s: &[u32],
-    out_path: &mut Vec<u32>,
-    scratch: &mut AStarScratch,
-    radius: f32,
-) -> bool {
-    scratch.prepare(cdt);
-    let epoch = scratch.current_gen;
-
-    // Average goal centroid for the heuristic.
-    let goal_centroid: Vector2 = {
-        let mut gx = 0.0f32;
-        let mut gy = 0.0f32;
-        for &g in goal_l3s {
-            let c = scratch.centroids[g as usize];
-            gx += c.x;
-            gy += c.y;
-        }
-        let n = goal_l3s.len() as f32;
-        Vector2::new(gx / n, gy / n)
-    };
-
-    let h_of = |f: u32| -> f32 { dist(scratch.centroids[f as usize], goal_centroid) };
-
-    for &s in start_l3s {
-        scratch.generation[s as usize] = epoch;
-        scratch.g_score[s as usize] = 0.0;
-        scratch.came_from[s as usize] = NONE;
-        let h = h_of(s);
-        scratch.heap.push(Reverse((h.to_bits(), 0u32, s)));
-    }
-
-    let mut reached_goal = NONE;
-
-    while let Some(Reverse((_, g_bits, current))) = scratch.heap.pop() {
-        let g_cur = if scratch.generation[current as usize] == epoch {
-            scratch.g_score[current as usize]
-        } else {
-            f32::INFINITY
-        };
-        if g_bits != g_cur.to_bits() {
-            continue;
-        }
-        if goal_l3s.contains(&current) {
-            reached_goal = current;
-            break;
-        }
-
-        for slot in 0..3u32 {
-            let nb = abs.l3_neighbor(current, slot);
-            if nb == NONE {
-                continue;
-            }
-            let choke = abs.l3_choke_at(current, slot);
-            if radius > 0.0 && radius > choke {
-                continue; // corridor too narrow
-            }
-
-            let tg = g_cur
-                + dist(
-                    scratch.centroids[current as usize],
-                    scratch.centroids[nb as usize],
-                );
-            let h_nb = h_of(nb);
-
-            let g_nb = if scratch.generation[nb as usize] == epoch {
-                scratch.g_score[nb as usize]
-            } else {
-                f32::INFINITY
-            };
-            if tg < g_nb {
-                scratch.generation[nb as usize] = epoch;
-                scratch.g_score[nb as usize] = tg;
-                scratch.came_from[nb as usize] = current;
-                let f_val = tg + h_nb;
-                scratch
-                    .heap
-                    .push(Reverse((f_val.to_bits(), tg.to_bits(), nb)));
-            }
-        }
-    }
-
-    if reached_goal == NONE {
-        return false;
-    }
-
-    // Back-track to reconstruct the level-3 path.
-    out_path.clear();
-    out_path.push(reached_goal);
-    let mut cur = reached_goal;
-    loop {
-        let prev = scratch.came_from[cur as usize];
-        if prev == NONE {
-            break; // reached a start node
-        }
-        out_path.push(prev);
-        cur = prev;
-        if start_l3s.contains(&cur) {
-            break;
-        }
-    }
-    out_path.reverse();
-    true
+    route(
+        cdt, start, goal, start_face, goal_face, scratch, radius, H_WEIGHT,
+    )
 }
 
 // ── Funnel smoothing ──────────────────────────────────────────────────────────
@@ -921,21 +1001,23 @@ fn area2(o: Vector2, a: Vector2, b: Vector2) -> f32 {
 ///
 /// Runs the Simple Stupid Funnel Algorithm on portal endpoints shrunk to
 /// the agent-valid range along each portal — for radius `r`, each portal's
-/// `[t_lo, t_hi]` (from [`CDT::portal_valid_range`]) marks where the agent's
-/// centre stays `≥ r` away from every wall incident to the portal endpoints.
+/// `[t_lo, t_hi]` (from [`CDT::portal_valid_range`], through `valid`) marks
+/// where the agent's centre stays `≥ r` away from every wall incident to the
+/// portal endpoints.
 #[allow(clippy::too_many_arguments)]
 fn funnel(
     cdt: &CDT,
     start: Vector2,
     goal: Vector2,
     portals: &[u32],
+    valid: &mut ValidMemo,
     left_buf: &mut Vec<Vector2>,
     right_buf: &mut Vec<Vector2>,
     radius: f32,
     out: &mut Vec<Vector2>,
 ) {
     // Shrink each portal to its agent-valid endpoints exactly once.  `portal_valid_range`
-    // is the expensive O(degree) call; computing it per portal here (rather than per
+    // is the expensive O(degree) call; fetching it per portal here (rather than per
     // SSFA access) keeps the funnel linear even with restarts.
     let pts = cdt.points();
     left_buf.clear();
@@ -946,13 +1028,9 @@ fn funnel(
         let (left, right) = if radius <= 0.0 {
             (pa, pb)
         } else {
-            let (t_lo, t_hi) = cdt.portal_valid_range(he, radius);
-            // Empty range (corridor barely admits the agent): collapse to midpoint.
-            let (tl, tr) = if t_lo > t_hi {
-                (0.5, 0.5)
-            } else {
-                (t_lo, t_hi)
-            };
+            // An empty range (corridor barely admits the agent) comes back
+            // collapsed to its midpoint.
+            let (tl, tr) = valid.get(cdt, he, radius);
             let at = |t: f32| Vector2::new(pa.x + t * (pb.x - pa.x), pa.y + t * (pb.y - pa.y));
             (at(tl), at(tr))
         };
@@ -1053,12 +1131,6 @@ pub(crate) fn closest_on_segment(p: Vector2, a: Vector2, b: Vector2) -> Vector2 
     }
     let t = (((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / len2).clamp(0.0, 1.0);
     a + ab * t
-}
-
-/// Distance from `p` to the closest point on segment `ab`.
-#[inline(always)]
-fn dist_point_seg(p: Vector2, a: Vector2, b: Vector2) -> f32 {
-    dist(p, closest_on_segment(p, a, b))
 }
 
 /// Minimum distance between segments `p1q1` and `p2q2` — for checking that a
@@ -1341,14 +1413,24 @@ mod tests {
     #[test]
     fn test_path_length_symmetric() {
         // Shortest-path length is direction-independent; the old channel search
-        // wasn't, because its centroid costs depended on the start face.
+        // wasn't, because its centroid costs depended on the start face. The
+        // exact search (weight 1) must agree both ways; the weighted one may
+        // settle on different near-shortest routes, each within its bound.
         for map in ["test_unit_size_corridors", "non_square_walls"] {
             let cdt = crate::test_utils::build_cdt(map);
             let mut sc = scratch();
+            let exact = |sc: &mut AStarScratch, s: Vector2, g: Vector2, r: f32| {
+                let (sf, gf) = (cdt.locate_face(s).unwrap(), cdt.locate_face(g).unwrap());
+                if sf == gf {
+                    vec![s, g]
+                } else {
+                    route(&cdt, s, g, sf, gf, sc, r, 1.0)
+                }
+            };
             for (s, g) in centroid_pairs(&cdt, 8) {
                 for &r in &[0.0f32, 5.0] {
-                    let fwd = find_path(&cdt, s, g, &mut sc, r);
-                    let rev = find_path(&cdt, g, s, &mut sc, r);
+                    let fwd = exact(&mut sc, s, g, r);
+                    let rev = exact(&mut sc, g, s, r);
                     if fwd.is_empty() || rev.is_empty() {
                         continue; // reachability symmetry is tested elsewhere
                     }
@@ -1357,6 +1439,13 @@ mod tests {
                         (lf - lr).abs() <= 0.01 * lf.max(lr),
                         "[{map}] asymmetric lengths {lf:.2} vs {lr:.2} s={s:?} g={g:?} r={r}"
                     );
+                    for (a, b, exact_len) in [(s, g, lf), (g, s, lr)] {
+                        let len = polyline_len(&find_path(&cdt, a, b, &mut sc, r));
+                        assert!(
+                            len <= exact_len * H_WEIGHT + 1e-3,
+                            "[{map}] weighted {len:.2} beyond bound of exact {exact_len:.2} r={r}"
+                        );
+                    }
                 }
             }
         }
@@ -1474,11 +1563,13 @@ mod tests {
         assert_ne!(a.version(), b.version(), "distinct meshes must differ");
 
         let mut sc = AStarScratch::new();
-        // Prime the cache on mesh A (faces 0 and 1 are distinct → runs prepare()).
-        let _ = find_path(&a, a.face_centroid(0), a.face_centroid(1), &mut sc, 0.0);
-        let _ = find_path(&b, b.face_centroid(0), b.face_centroid(1), &mut sc, 0.0);
+        // Prime the cache on mesh A, then switch to B. (`find_path` itself
+        // can skip `prepare`: a clear straight line needs no search.)
+        sc.prepare(&a);
+        sc.prepare(&b);
 
         assert_eq!(sc.centroids_version, b.version());
+        assert_eq!(sc.corner_r.len(), b.num_vertices() as usize);
         for f in 0..b.num_faces() {
             assert_eq!(
                 sc.centroids[f as usize],
@@ -1567,7 +1658,7 @@ mod tests {
         }
     }
 
-    // ── Phase 4: TRA* tests ───────────────────────────────────────────────────
+    // ── abstraction-assisted query (`find_path_abstract`) ─────────────────────
 
     fn corridors_abs() -> (CDT, crate::abstraction::Abstraction) {
         let cdt = corridors_cdt();
@@ -1583,7 +1674,7 @@ mod tests {
         let path = find_path_abstract(&cdt, &abs, start, goal, &mut scratch(), 25.0);
         assert!(
             !path.is_empty(),
-            "TRA* should find path through top gap (radius 25)"
+            "abstract query should find path through top gap (radius 25)"
         );
         assert_eq!(*path.first().unwrap(), start);
         assert_eq!(*path.last().unwrap(), goal);
@@ -1592,9 +1683,9 @@ mod tests {
 
     #[test]
     fn test_tra_star_query_pooled_steady_state_allocs() {
-        // P1 regression guard: after warmup, a TRA* query must not allocate
-        // its internal scratch (l3 sets, abstract path, channel, BFS queue) —
-        // only the returned path Vec and bounded portal/funnel buffer growth.
+        // P1 regression guard: after warmup, an abstract query must not
+        // allocate its internal scratch (search nodes, heap, memo, channel) —
+        // only the returned path Vec.
         let (cdt, abs) = corridors_abs();
         let start = Vector2::new(75.0, 175.0);
         let goal = Vector2::new(325.0, 175.0);
@@ -1612,8 +1703,8 @@ mod tests {
             });
             assert_eq!(
                 allocs, 1,
-                "steady-state TRA* query should allocate exactly once (the \
-                 returned path Vec); got {allocs}"
+                "steady-state abstract query should allocate exactly once \
+                 (the returned path Vec); got {allocs}"
             );
         }
     }
@@ -1627,14 +1718,14 @@ mod tests {
         let path = find_path_abstract(&cdt, &abs, start, goal, &mut scratch(), 25.1);
         assert!(
             path.is_empty(),
-            "TRA* should return empty when all corridors too narrow"
+            "abstract query should return empty when all corridors too narrow"
         );
     }
 
     #[test]
     fn test_tra_matches_regular_astar() {
-        // TRA* and regular A* must agree on reachability; TRA*'s path must
-        // also stay clear of constraint edges.
+        // The abstract and plain queries must agree on reachability; the
+        // abstract path must also stay clear of constraint edges.
         let (cdt, abs) = corridors_abs();
         let mut sc = scratch();
         let cases = [
@@ -1653,7 +1744,7 @@ mod tests {
             let astar_empty = p_astar.is_empty();
             assert_eq!(
                 tra_empty, astar_empty,
-                "TRA* and A* disagree on passability for start={start:?} goal={goal:?} r={r}"
+                "abstract and plain queries disagree on passability for start={start:?} goal={goal:?} r={r}"
             );
             if !tra_empty {
                 assert_no_constraint_crossing(&cdt, &p_tra);
@@ -1669,21 +1760,17 @@ mod tests {
         let path = find_path_abstract(&cdt, &abs, inside, outside, &mut scratch(), 0.0);
         assert!(
             path.is_empty(),
-            "TRA* should return empty for different components"
+            "abstract query should return empty for different components"
         );
     }
 
     #[test]
     fn test_tra_is_sound_against_astar() {
-        // TRA* must be *sound* against the ground-truth full-mesh A*: whenever
-        // it returns a path, the exact search must agree one exists, and the
-        // path must not cross a constraint.
-        //
-        // It need not be *complete*: TRA* gates each corridor on its narrowest
-        // `portal_radius` (min over the whole corridor), so near the limiting
-        // radius it may deny a route the exact search threads through open
-        // space using only part of a corridor — a conservative abstraction
-        // artifact, never a false positive.
+        // The abstraction only short-circuits "different components", so the
+        // abstract query must agree with the full-mesh search on reachability
+        // both ways, and its path must not cross a constraint. (The TRA* query
+        // it replaced gated each corridor on its narrowest portal and could
+        // both deny routes and, through a collapsed portal, invent them.)
         for map in ["test_unit_size_corridors", "non_square_walls"] {
             let cdt = crate::test_utils::build_cdt(map);
             let abs = crate::abstraction::Abstraction::build(&cdt);
@@ -1697,17 +1784,17 @@ mod tests {
                     }
                     let start = cdt.face_centroid(i);
                     let goal = cdt.face_centroid(j);
-                    for &r in &[0.0f32, 1.0, 4.0, 8.0, 25.0] {
+                    for &r in &[0.0f32, 1.0, 4.0, 8.0, 12.0, 25.0] {
                         let t = find_path_abstract(&cdt, &abs, start, goal, &mut sc, r);
-                        if t.is_empty() {
-                            continue;
-                        }
                         let a = find_path(&cdt, start, goal, &mut sc, r);
-                        assert!(
-                            !a.is_empty(),
-                            "TRA* invented a path the exact search rejects: map={map} i={i} j={j} r={r}"
+                        assert_eq!(
+                            t.is_empty(),
+                            a.is_empty(),
+                            "abstract and plain queries disagree: map={map} i={i} j={j} r={r}"
                         );
-                        assert_no_constraint_crossing(&cdt, &t);
+                        if !t.is_empty() {
+                            assert_no_constraint_crossing(&cdt, &t);
+                        }
                     }
                 }
             }
@@ -2027,9 +2114,9 @@ mod tests {
 
     #[test]
     fn test_find_path_steady_state_allocs() {
-        // Companion to the TRA* allocation guard: once the scratch is warm, a
-        // find_path call's only heap allocation is the returned Vec — all search
-        // state (heap, g/came_from/generation, portals, funnel buffers) is pooled.
+        // Companion to the abstract-query allocation guard: once the scratch is
+        // warm, a find_path call's only heap allocation is the returned Vec —
+        // all search state (nodes, heap, memo, portals, funnel buffers) is pooled.
         let cdt = corridors_cdt();
         let start = Vector2::new(75.0, 175.0);
         let goal = Vector2::new(325.0, 175.0);
@@ -2047,6 +2134,135 @@ mod tests {
                 allocs, 1,
                 "steady-state find_path should allocate exactly once (the returned path Vec); got {allocs}"
             );
+        }
+    }
+
+    fn rooms(side: usize) -> CDT {
+        let (points, constraints) = crate::mapgen::rooms_map(side, side);
+        let mut cdt = CDT::from_points(points);
+        for (a, b) in constraints {
+            cdt.insert_constraint(a, b);
+        }
+        cdt.remove_super_triangle();
+        cdt.build_grid_index();
+        cdt.compute_widths();
+        cdt
+    }
+
+    /// `find_path` at weight 1: the exact minimum of the funnel over channels.
+    fn exact_path(
+        cdt: &CDT,
+        sc: &mut AStarScratch,
+        s: Vector2,
+        g: Vector2,
+        r: f32,
+    ) -> Vec<Vector2> {
+        let (sf, gf) = (cdt.locate_face(s).unwrap(), cdt.locate_face(g).unwrap());
+        if sf == gf {
+            return vec![s, g];
+        }
+        route(cdt, s, g, sf, gf, sc, r, 1.0)
+    }
+
+    #[test]
+    fn test_rooms_diagonal_takes_the_staircase() {
+        // Regression for `solo_march`: with centred doors, a door-to-door
+        // staircase from corner room to corner room is as short as the
+        // straight diagonal. The centroid channel search went down one column
+        // and along one row instead (~39% longer), and its bounded refinement
+        // never found the way out of that plateau.
+        let cdt = rooms(20);
+        let abs = crate::abstraction::Abstraction::build(&cdt);
+        let mut sc = scratch();
+        let (s, g) = (Vector2::new(50.0, 50.0), Vector2::new(1950.0, 1950.0));
+        let diagonal = dist(s, g);
+        let exact = polyline_len(&exact_path(&cdt, &mut sc, s, g, 5.0));
+        assert!(
+            exact < diagonal * 1.01,
+            "exact {exact:.1} vs diagonal {diagonal:.1}"
+        );
+        for path in [
+            find_path(&cdt, s, g, &mut sc, 5.0),
+            find_path_abstract(&cdt, &abs, s, g, &mut sc, 5.0),
+        ] {
+            assert_no_constraint_crossing(&cdt, &path);
+            let len = polyline_len(&path);
+            assert!(
+                len <= exact * H_WEIGHT,
+                "{len:.1} beyond the weight's bound of {exact:.1}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_search_beats_centroid_channel_within_weight() {
+        // The exact search minimises the funnel over every channel, so it never
+        // loses to the plain centroid channel; the weighted search used by
+        // `find_path` stays within `H_WEIGHT` of it.
+        let maps = [
+            ("rooms6", rooms(6)),
+            (
+                "test_unit_size_corridors",
+                crate::test_utils::build_cdt("test_unit_size_corridors"),
+            ),
+            (
+                "non_square_walls",
+                crate::test_utils::build_cdt("non_square_walls"),
+            ),
+        ];
+        for (map, cdt) in &maps {
+            let mut sc = scratch();
+            for (s, g) in centroid_pairs(cdt, 12) {
+                for &r in &[0.0f32, 5.0, 12.0] {
+                    let exact = exact_path(cdt, &mut sc, s, g, r);
+                    let weighted = find_path(cdt, s, g, &mut sc, r);
+                    let (sf, gf) = (cdt.locate_face(s).unwrap(), cdt.locate_face(g).unwrap());
+                    let reachable = sf == gf || channel_search(cdt, sf, gf, &mut sc, r);
+                    assert_eq!(
+                        !exact.is_empty(),
+                        reachable,
+                        "[{map}] reachability s={s:?} g={g:?} r={r}"
+                    );
+                    assert_eq!(
+                        !weighted.is_empty(),
+                        reachable,
+                        "[{map}] reachability s={s:?} g={g:?} r={r}"
+                    );
+                    if !reachable || sf == gf {
+                        continue;
+                    }
+                    let mut plain = Vec::new();
+                    {
+                        let s_ = &mut sc;
+                        s_.valid.sync(cdt, r);
+                        funnel(
+                            cdt,
+                            s,
+                            g,
+                            &s_.portals,
+                            &mut s_.valid,
+                            &mut s_.funnel_left,
+                            &mut s_.funnel_right,
+                            r,
+                            &mut plain,
+                        );
+                    }
+                    let (le, lw, lp) = (
+                        polyline_len(&exact),
+                        polyline_len(&weighted),
+                        polyline_len(&plain),
+                    );
+                    assert!(
+                        le <= lp * 1.0001 + 1e-3,
+                        "[{map}] exact {le:.2} > centroid channel {lp:.2} s={s:?} g={g:?} r={r}"
+                    );
+                    assert!(
+                        lw <= le * H_WEIGHT + 1e-3,
+                        "[{map}] weighted {lw:.2} beyond bound of {le:.2} s={s:?} g={g:?} r={r}"
+                    );
+                    assert_no_constraint_crossing(cdt, &weighted);
+                }
+            }
         }
     }
 }

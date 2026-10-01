@@ -2,12 +2,13 @@
 //! scenario adds a crowd, a wall or a fight on top. If this row moves, the
 //! change touched pathing itself rather than how units negotiate each other.
 //!
-//! It is also where `suboptimality` has real room today. `rooms_map` centres
-//! every door, making a door-to-door staircase *exactly* as long as the
-//! straight diagonal (`1900 * sqrt(2)`), which is what the reference finds.
-//! `find_path` runs down one column of doors and along one row instead, for
-//! ~39% more: the bounded-refinement limit its own docs warn about, with a
-//! number on it.
+//! It is also where `suboptimality` has real room. `rooms_map` centres every
+//! door, making a door-to-door staircase *exactly* as long as the straight
+//! diagonal (`1900 * sqrt(2)`), which is what the reference finds. Every
+//! monotone route ties on a centroid search, which once ran down one column
+//! of doors and along one row for ~39% more. The weighted interval search
+//! (`astar::H_WEIGHT`) lands within a few percent, its excess spent on a few
+//! sidesteps to the neighbouring lane of doors.
 //!
 //! `detour` sitting on top of `suboptimality` is the tell that the unit walks
 //! its plan faithfully; the two coming apart would mean the opposite.
